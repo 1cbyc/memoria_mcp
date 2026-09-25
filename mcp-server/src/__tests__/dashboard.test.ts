@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { JSDOM } from "jsdom";
 import os from "os";
 import path from "path";
 import fs from "fs";
@@ -76,6 +77,29 @@ function clientScript(html: string): string {
   return (m as RegExpMatchArray)[2];
 }
 
+type FetchCall = { url: string; init?: RequestInit };
+
+function dashboardDom(responseFor: (url: string, init?: RequestInit) => unknown): {
+  dom: JSDOM;
+  calls: FetchCall[];
+} {
+  const calls: FetchCall[] = [];
+  const dom = new JSDOM(renderDashboard().html, {
+    runScripts: "dangerously",
+    url: "http://localhost/dashboard/",
+    beforeParse(window) {
+      window.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, init });
+        return new Response(JSON.stringify(responseFor(url, init)), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as typeof fetch;
+    },
+  });
+  return { dom, calls };
+}
+
 describe("dashboard page", () => {
   it("renders the page with the Wiki tab", () => {
     const { html } = renderDashboard();
@@ -144,6 +168,84 @@ describe("dashboard XSS defences (2026-09 review, H2)", () => {
     expect(escapeHtml(undefined)).toBe("");
     expect(escapeHtml(null)).toBe("");
     expect(escapeHtml(0)).toBe("0");
+  });
+});
+
+describe("dashboard browser interactions", () => {
+  it("round-trips an escaped wiki filename through rendering and the click request", async () => {
+    const file = 'projects/a"<b>.md';
+    const { dom, calls } = dashboardDom((url) => {
+      if (url.endsWith("/wiki/index")) {
+        return { categories: { projects: [{ file, name: "Quoted project" }] }, daily: [] };
+      }
+      if (url.includes("/memory?file=")) {
+        return { file, meta: {}, html: "<p>Loaded</p>", related: [], backlinks: [] };
+      }
+      if (url.endsWith("/collector/status")) return { running: false };
+      return [];
+    });
+
+    const wikiTab = dom.window.document.querySelector<HTMLElement>('[data-tab="wiki"]');
+    wikiTab?.click();
+    await vi.waitFor(() => {
+      expect(dom.window.document.querySelector('[data-action="open-wiki"]')).not.toBeNull();
+    });
+
+    const link = dom.window.document.querySelector<HTMLElement>('[data-action="open-wiki"]');
+    expect(link?.dataset.file).toBe(file);
+    link?.click();
+
+    await vi.waitFor(() => {
+      expect(
+        calls.some((call) => call.url === `/dashboard/api/memory?file=${encodeURIComponent(file)}`),
+      ).toBe(true);
+      expect(dom.window.document.querySelector("#wiki-page")?.textContent).toContain("Loaded");
+    });
+    await vi.waitFor(() => {
+      expect(dom.window.document.querySelector("#recent-journal")?.textContent).toContain(
+        "No journal entries yet",
+      );
+    });
+    dom.window.close();
+  });
+
+  it("posts the selected journal mood and parsed tags", async () => {
+    const { dom, calls } = dashboardDom((url, init) => {
+      if (url.endsWith("/journal") && init?.method === "POST") return { success: true };
+      if (url.endsWith("/collector/status")) return { running: false };
+      return [];
+    });
+
+    dom.window.document.querySelector<HTMLElement>('[data-mood="good"]')?.click();
+    const entry = dom.window.document.querySelector<HTMLTextAreaElement>("#journal-input");
+    const tags = dom.window.document.querySelector<HTMLInputElement>("#journal-tags");
+    if (entry) entry.value = "A useful note";
+    if (tags) tags.value = "work, follow-up";
+    dom.window.document.querySelector<HTMLElement>('[data-action="save-journal"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(
+        calls.some((call) => call.url.endsWith("/journal") && call.init?.method === "POST"),
+      ).toBe(true);
+    });
+    const request = calls.find(
+      (call) => call.url.endsWith("/journal") && call.init?.method === "POST",
+    );
+    expect(JSON.parse(String(request?.init?.body))).toEqual({
+      entry: "A useful note",
+      mood: "good",
+      tags: ["work", "follow-up"],
+    });
+    await vi.waitFor(() => {
+      expect(entry?.value).toBe("");
+      expect(dom.window.document.querySelector("#journal-history")?.textContent).toContain(
+        "No entries yet",
+      );
+      expect(dom.window.document.querySelector("#recent-journal")?.textContent).toContain(
+        "No journal entries yet",
+      );
+    });
+    dom.window.close();
   });
 });
 

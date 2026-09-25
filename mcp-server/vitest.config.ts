@@ -42,7 +42,7 @@ export default defineConfig({
         branches: 38,
         // Per-file floors, buffered ~4-5pts below measured coverage.
         "src/http.ts": { lines: 52, statements: 52 },
-        "src/dashboard.ts": { lines: 40, statements: 40 },
+        "src/dashboard.ts": { lines: 47, statements: 47 },
         "src/wiki.ts": { lines: 95, statements: 95 },
         "src/tools.ts": { lines: 50, statements: 50 },
         "src/embeddings.ts": { lines: 44, statements: 44 },
