@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import type { SourceAdapter, AdapterInfo, AdapterConfig, RawEvent } from "./base.js";
 import { estimateImportance, classifyPrivacy } from "./base.js";
 import { contentHash, keyedContentHash } from "../crypto.js";
+import { normalizeTimestamp } from "../../daily-format.js";
 
 /**
  * Checkpoint for a source that collected before checkpoints existed: its
@@ -376,14 +377,9 @@ export class CustomAdapter implements SourceAdapter {
     const content = fm.content ? this.getNestedValue(item, fm.content) : JSON.stringify(item);
     if (!content) return null;
 
-    let timestamp: string;
-    if (fm.timestamp) {
-      const raw = this.getNestedValue(item, fm.timestamp);
-      const parsed = new Date(raw);
-      timestamp = isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
-    } else {
-      timestamp = new Date().toISOString();
-    }
+    const timestamp = normalizeTimestamp(
+      fm.timestamp ? this.getNestedValue(item, fm.timestamp) : undefined,
+    );
 
     // Prefer a mapped id; otherwise derive a stable id from content so repeated
     // reads of the same record dedup at the buffer instead of piling up.

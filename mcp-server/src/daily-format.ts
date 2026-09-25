@@ -23,6 +23,20 @@ export function utcTimeLabel(d: Date = new Date()): string {
 }
 
 /**
+ * Return an ISO timestamp suitable for a daily log, or `now` when the input
+ * cannot be used. Years outside 1970–9999 are implausible event timestamps;
+ * epoch microseconds passed as milliseconds otherwise land around year 56,000.
+ */
+export function normalizeTimestamp(value: unknown, now: Date = new Date()): string {
+  const date = new Date(
+    typeof value === "string" || typeof value === "number" ? value : Number.NaN,
+  );
+  const year = date.getUTCFullYear();
+  const plausible = !Number.isNaN(date.getTime()) && year >= 1970 && year <= 9999;
+  return (plausible ? date : now).toISOString();
+}
+
+/**
  * Frontmatter and title for a daily log first created by the collector
  * (ingestion or fusion). High-signal first events start the file at their
  * own importance; everything else starts at 5.

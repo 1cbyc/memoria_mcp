@@ -48,6 +48,7 @@ import {
   SERVER_DESCRIPTION,
 } from "./tools.js";
 import { createDashboardRouter } from "./dashboard.js";
+import { normalizeTimestamp } from "./daily-format.js";
 import {
   isAllowedRedirect as isAllowedRedirectFn,
   safeEqual,
@@ -1228,12 +1229,7 @@ export function sanitizeIngestMeta(meta: unknown): Record<string, string | numbe
   return out;
 }
 
-export function normalizeTimestamp(v: unknown, now: Date = new Date()): string {
-  const d = new Date(typeof v === "string" || typeof v === "number" ? v : NaN);
-  const year = d.getUTCFullYear();
-  const plausible = !Number.isNaN(d.getTime()) && year >= 1970 && year <= 9999;
-  return (plausible ? d : now).toISOString();
-}
+export { normalizeTimestamp } from "./daily-format.js";
 
 app.post(
   "/ingest",

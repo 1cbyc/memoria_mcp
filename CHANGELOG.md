@@ -11,6 +11,8 @@ existing store gets a migration note here.
 
 ## [Unreleased]
 
+- Custom collector sources now normalize implausible timestamps consistently with HTTP ingest.
+
 ## [0.3.0] — 2026-10-28
 
 Security fixes from the 2026-10 whole-repo review and the critical
