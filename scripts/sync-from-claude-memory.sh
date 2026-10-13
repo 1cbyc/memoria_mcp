@@ -2,7 +2,11 @@
 # Sync memories from Claude Code's built-in memory into Memoria's canonical store
 # This is a one-way pull: ~/.claude/projects/<project>/memory/ → $MEMORIA_DIR/memories/
 #
-# Usage: scripts/sync-from-claude-memory.sh [CLAUDE_MEMORY_DIR]
+# Usage: scripts/sync-from-claude-memory.sh [--dry-run] [CLAUDE_MEMORY_DIR]
+#
+# An existing destination is only overwritten when the source is NEWER
+# (mtime); a differing but older source is skipped, and every overwrite
+# first copies the destination to <file>.bak-<timestamp> (review M3).
 #
 #   MEMORIA_DIR        the Memoria store. Defaults to ~/.memoria, like the
 #                      server; set it if your store lives elsewhere.
@@ -17,6 +21,11 @@ set -euo pipefail
 # machine, and wrong everywhere else.
 MEMORIA_DIR="${MEMORIA_DIR:-$HOME/.memoria}"
 MEMORIES_DIR="$MEMORIA_DIR/memories"
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=1
+  shift
+fi
 CLAUDE_MEMORY_DIR="${1:-${CLAUDE_MEMORY_DIR:-}}"
 
 if [ ! -d "$MEMORIES_DIR" ]; then
@@ -84,13 +93,25 @@ for src_file in "$CLAUDE_MEMORY_DIR"/*.md; do
     if [ "$src_content" = "$dest_content" ]; then
       echo "  SKIP (identical): $basename_file"
       continue
-    else
-      echo "  UPDATE (newer content): $basename_file → $dest_dir/"
+    fi
+    # "Different" is not "newer": never let a stale machine destroy edits
+    # made in Memoria since (M3). Equal mtimes count as not-newer.
+    if [ ! "$src_file" -nt "$dest_file" ]; then
+      echo "  SKIP (destination is newer or same age): $basename_file"
+      continue
+    fi
+    echo "  UPDATE (source is newer): $basename_file → $dest_dir/"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      cp "$dest_file" "$dest_file.bak-$(date +%Y%m%d%H%M%S)-$$"
     fi
   else
     echo "  ADD (new): $basename_file → $dest_dir/"
   fi
 
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "    (dry-run: not written)"
+    continue
+  fi
   mkdir -p "$dest_dir"
   cp "$src_file" "$dest_file"
   synced=$((synced + 1))

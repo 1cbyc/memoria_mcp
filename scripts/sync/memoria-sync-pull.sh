@@ -26,8 +26,11 @@
 #   MEMORIA_SYNC_BRANCH   branch (default: the store's current branch)
 #   MEMORIA_SYNC_MIRROR   optional path to an executable that mirrors an object
 #                         store; called as `<script> pull "$MEMORIA_DIR"` before
-#                         the git merge. Default: $MEMORIA_DIR/.memoria-mirror.sh
-#                         if it exists and is executable.
+#                         the git merge. Only honoured when
+#                         MEMORIA_SYNC_ALLOW_STORE_MIRROR=true: the mirror lives
+#                         inside the synced store, so executing it by default
+#                         would let anyone who can land a file in the store run
+#                         code in your shell (review M2).
 #   MEMORIA_SYNC_LOG      log file (default: $MEMORIA_DIR/.sync.log)
 
 set -uo pipefail
@@ -69,8 +72,12 @@ if [ -n "$(git status --porcelain -- memories/ 2>/dev/null)" ]; then
 fi
 
 # 2. Optional object-storage mirror (GCS/S3/rclone/Syncthing/whatever). The
-#    script owns its own tooling; we only care about its exit code.
-if [ -x "$MIRROR" ]; then
+#    script owns its own tooling; we only care about its exit code. Opt-in
+#    only: the default path is inside the synced store (see header, M2).
+if [ "${MEMORIA_SYNC_ALLOW_STORE_MIRROR:-}" != "true" ] && [ -x "$MIRROR" ]; then
+  log "mirror at $MIRROR not run: set MEMORIA_SYNC_ALLOW_STORE_MIRROR=true to allow executing a script from the synced store"
+fi
+if [ "${MEMORIA_SYNC_ALLOW_STORE_MIRROR:-}" = "true" ] && [ -x "$MIRROR" ]; then
   if "$MIRROR" pull "$STORE" >>"$LOG_FILE" 2>&1; then
     log "mirror pull OK"
     # A mirror writes files directly into the worktree, so commit whatever it
