@@ -36,10 +36,18 @@ function minilmInstalled(): boolean {
   }
 }
 
-function detectProvider(): Provider {
-  const forced = (process.env.MEMORIA_EMBEDDINGS || "auto").toLowerCase();
-  const hasOpenAI = !!process.env.OPENAI_API_KEY;
-
+/**
+ * Pure provider selection, exported for tests. A remote provider is chosen
+ * ONLY when explicitly requested via MEMORIA_EMBEDDINGS=openai: the mere
+ * presence of OPENAI_API_KEY must never silently send memory content and
+ * search queries to a third-party API (review H4).
+ */
+export function selectProvider(
+  forcedRaw: string | undefined,
+  hasOpenAI: boolean,
+  minilmAvailable: boolean,
+): Provider {
+  const forced = (forcedRaw || "auto").toLowerCase();
   switch (forced) {
     case "openai":
       return "openai";
@@ -50,15 +58,21 @@ function detectProvider(): Provider {
       return "local";
     case "auto":
     case "":
-      if (hasOpenAI) return "openai";
-      return minilmInstalled() ? "minilm" : "local";
+      return minilmAvailable ? "minilm" : "local";
     default:
       process.stderr.write(
-        `Memoria: unknown MEMORIA_EMBEDDINGS="${forced}", falling back to auto detection\n`,
+        `Memoria: unknown MEMORIA_EMBEDDINGS="${forced}", falling back to local detection\n`,
       );
-      if (hasOpenAI) return "openai";
-      return minilmInstalled() ? "minilm" : "local";
+      return minilmAvailable ? "minilm" : "local";
   }
+}
+
+function detectProvider(): Provider {
+  return selectProvider(
+    process.env.MEMORIA_EMBEDDINGS,
+    !!process.env.OPENAI_API_KEY,
+    minilmInstalled(),
+  );
 }
 
 const provider: Provider = detectProvider();
@@ -67,7 +81,11 @@ const dimension =
 
 switch (provider) {
   case "openai":
-    process.stderr.write("Memoria: using OpenAI text-embedding-3-small (1536-dim)\n");
+    process.stderr.write(
+      "Memoria: using OpenAI text-embedding-3-small (1536-dim). WARNING: memory content and " +
+        "search queries are sent to OpenAI's API. This happens only because MEMORIA_EMBEDDINGS=openai " +
+        "was set explicitly; unset it to keep embeddings on this device.\n",
+    );
     break;
   case "minilm":
     process.stderr.write(
@@ -77,7 +95,8 @@ switch (provider) {
   case "local":
     process.stderr.write(
       "Memoria: using local n-gram hash embeddings (384-dim, lexical approximation). " +
-        "Install @huggingface/transformers or set OPENAI_API_KEY for semantic search.\n",
+        "Install @huggingface/transformers for local semantic search, or set " +
+        "MEMORIA_EMBEDDINGS=openai (with OPENAI_API_KEY) to send content to OpenAI.\n",
     );
     break;
 }

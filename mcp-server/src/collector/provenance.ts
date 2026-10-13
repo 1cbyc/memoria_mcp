@@ -20,7 +20,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { contentHash } from "./crypto.js";
+import { contentHash, decrypt, encrypt, getMasterKey, initMasterKey } from "./crypto.js";
 import type { RawEvent } from "./adapters/base.js";
 
 export interface ProvenanceRecord {
@@ -31,8 +31,19 @@ export interface ProvenanceRecord {
   /** Hash of the ORIGINAL content (stable fingerprint of the true source). */
   contentHash: string;
   privacyTier: RawEvent["privacyTier"];
-  /** Present only when policy allows (omitted entirely for local-only). */
+  /** Present only when policy allows (omitted entirely for local-only).
+   * On disk this is never stored in plaintext: see `contentEnc`. */
   content?: string;
+  /** AES-256-GCM ciphertext (base64) of `content` as stored on disk. */
+  contentEnc?: string;
+}
+
+function ensureKey(dataDir: string): void {
+  try {
+    getMasterKey();
+  } catch {
+    initMasterKey(dataDir);
+  }
 }
 
 /** Disabled only when explicitly set to "false". On by default — durability is
@@ -142,8 +153,13 @@ export function appendRawArchive(
       contentHash: contentHash(originalContent),
       privacyTier: tier,
     };
-    // local-only: store the fingerprint only, never the content.
-    if (tier !== "local-only") rec.content = safeEvent.content;
+    // local-only: store the fingerprint only, never the content. Other
+    // tiers: store content ENCRYPTED under the collector master key, so a
+    // copied volume does not yield plaintext beside the encrypted buffer.
+    if (tier !== "local-only") {
+      ensureKey(dataDir);
+      rec.contentEnc = encrypt(safeEvent.content).toString("base64");
+    }
 
     const month = /^\d{4}-\d{2}/.test(safeEvent.timestamp || "")
       ? safeEvent.timestamp.slice(0, 7)
@@ -198,9 +214,27 @@ export function readRawArchive(dataDir: string, source: string, limit = 100): Pr
     }
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
-        out.push(JSON.parse(lines[i]) as ProvenanceRecord);
+        const rec = JSON.parse(lines[i]) as ProvenanceRecord;
+        if (rec.contentEnc) {
+          // Never GENERATE a key on the read path: a fresh key cannot
+          // decrypt existing records, and minting one would mask the real
+          // problem (missing key) while dropping every record silently.
+          let keyReady = true;
+          try {
+            getMasterKey();
+          } catch {
+            keyReady =
+              !!process.env.MEMORIA_ENCRYPTION_KEY ||
+              fs.existsSync(path.join(dataDir, "collector.key"));
+            if (keyReady) initMasterKey(dataDir);
+          }
+          if (!keyReady) continue;
+          rec.content = decrypt(Buffer.from(rec.contentEnc, "base64")).toString("utf-8");
+          delete rec.contentEnc;
+        }
+        out.push(rec);
       } catch {
-        // skip a corrupt line
+        // skip a corrupt/undecryptable line
       }
       if (out.length >= limit) return out;
     }
