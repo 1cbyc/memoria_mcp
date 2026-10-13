@@ -1673,15 +1673,15 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
   // Tool 10: memory_sources — list, enable, disable, add, remove data sources
   server.tool(
     "memory_sources",
-    "Manage data sources for the sub-memory collector. List available sources, enable/disable them, add custom sources, or record user agreement.",
+    "Manage data sources for the sub-memory collector. List available sources, enable/disable them, or add custom sources. User consent for a source can only be granted in the Memoria dashboard, never through this tool.",
     {
       action: z
-        .enum(["list", "enable", "disable", "agree", "add_custom", "remove_custom", "configure"])
+        .enum(["list", "enable", "disable", "add_custom", "remove_custom", "configure"])
         .describe("Action to perform"),
       source: z
         .string()
         .optional()
-        .describe("Source ID (required for enable/disable/agree/remove/configure)"),
+        .describe("Source ID (required for enable/disable/remove/configure)"),
       config: z
         .record(z.string(), z.unknown())
         .optional()
@@ -1749,20 +1749,6 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
           const result = await registry!.disableSource(source);
           if (result.success) daemon!.syncPollTimers();
           return { content: [{ type: "text" as const, text: result.message }] };
-        }
-
-        case "agree": {
-          if (!source)
-            return { content: [{ type: "text" as const, text: "Error: source ID required" }] };
-          registry!.recordAgreement(source);
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `User agreement recorded for "${source}". You can now enable it with action "enable".`,
-              },
-            ],
-          };
         }
 
         case "add_custom": {

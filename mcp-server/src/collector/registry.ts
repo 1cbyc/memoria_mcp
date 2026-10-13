@@ -174,7 +174,7 @@ export class SourceRegistry {
           `This source will collect: ${adapter.info.description} ` +
           `Permissions needed: ${adapter.info.requiredPermissions.join(", ") || "none"}. ` +
           `All collected data is encrypted (AES-256-GCM). Only you and the Memoria agent have access. ` +
-          `Call memory_sources with action "agree" and source "${sourceId}" to consent.`,
+          `Grant consent in the Memoria dashboard (Sources tab) — consent cannot be granted through the MCP tool surface.`,
       };
     }
 
