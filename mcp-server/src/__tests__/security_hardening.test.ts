@@ -64,6 +64,9 @@ describe("H2/L1: tool inputs are bounded at the schema", () => {
     expect(parseOk("memory_ingest", { batch_size: 100000000 })).toBe(false);
     expect(parseOk("memory_ingest", { batch_size: 50 })).toBe(true);
     expect(parseOk("memory_search", { query: "x".repeat(3000) })).toBe(false);
+    expect(parseOk("memory_fuse", { hours: 10000 })).toBe(false);
+    expect(parseOk("memory_fuse", { window_minutes: 100000 })).toBe(false);
+    expect(parseOk("memory_fuse", { hours: 24, window_minutes: 30 })).toBe(true);
     expect(
       parseOk("memory_compile", {
         content: "c",

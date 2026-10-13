@@ -28,7 +28,9 @@ function makeAdapter(over: Record<string, unknown> = {}) {
   };
 }
 
-function makeDaemon(opts: { adapter?: any; bufferOver?: Record<string, unknown>; config?: any } = {}) {
+function makeDaemon(
+  opts: { adapter?: any; bufferOver?: Record<string, unknown>; config?: any } = {},
+) {
   const adapter = opts.adapter ?? makeAdapter();
   const active = new Map<string, any>([["src-a", adapter]]);
   const registry: any = {
@@ -106,9 +108,11 @@ describe("CollectorDaemon", () => {
       expect(daemon.getStatus().pollTimers[0].errors).toBeGreaterThanOrEqual(1),
     );
     expect(daemon.getStatus().pollTimers[0].inBackoff).toBe(true);
+    // A poll attempted inside the backoff window is suppressed by the gate
+    // in pollSource(), not merely left unscheduled.
     const calls = adapter.poll.mock.calls.length;
-    daemon.syncPollTimers();
-    expect(adapter.poll.mock.calls.length).toBe(calls); // timer exists; no extra immediate poll
+    await (daemon as any).pollSource("src-a");
+    expect(adapter.poll.mock.calls.length).toBe(calls);
     await daemon.stop();
   });
 

@@ -174,6 +174,11 @@ export class MemoryStore {
       this.dimension = getDimension();
       this.init();
     } catch (initErr) {
+      try {
+        this.db.close();
+      } catch {
+        // already closed / never opened cleanly
+      }
       this.releaseLock();
       throw initErr;
     }

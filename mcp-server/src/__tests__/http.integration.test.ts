@@ -685,6 +685,24 @@ describe("sanitizeIngestMeta (review M6)", () => {
       // memoria_approve (Path=/authorize), captured at login above — no
       // fresh login here, to stay under the auth rate limit.
       expect(approveCookie).toMatch(/^memoria_approve=/);
+      // Actually present it to /authorize (distinct forwarded IP, so this
+      // call gets its own auth rate-limit bucket).
+      const viaCookie = await request(app)
+        .get("/authorize")
+        .set("Cookie", approveCookie)
+        .set("X-Forwarded-For", "10.9.8.7")
+        .query({
+          redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+          code_challenge: "abc",
+          code_challenge_method: "S256",
+        });
+      expect(viaCookie.status).toBe(302);
+      // ...and the approve cookie must NOT authorize /mcp.
+      const mcp = await request(app)
+        .post("/mcp")
+        .set("Cookie", approveCookie)
+        .send({ jsonrpc: "2.0", method: "tools/list", id: 1 });
+      expect(mcp.status).toBe(401);
     } finally {
       delete process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL;
     }
