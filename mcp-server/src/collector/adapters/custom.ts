@@ -230,6 +230,16 @@ export class CustomAdapter implements SourceAdapter {
     if (stat.mtimeMs <= this.lastModified) return []; // no change
     this.lastModified = stat.mtimeMs;
 
+    // Never read an unbounded file into memory on the single instance (L5).
+    const MAX_WATCH_BYTES = 10 * 1024 * 1024;
+    if (stat.size > MAX_WATCH_BYTES) {
+      process.stderr.write(
+        `Memoria custom adapter "${this.definition.id}": watch file is ${stat.size} bytes ` +
+          `(cap ${MAX_WATCH_BYTES}); skipping this poll.\n`,
+      );
+      return [];
+    }
+
     const raw = fs.readFileSync(watchPath, "utf-8");
     return this.parseRawData(raw);
   }

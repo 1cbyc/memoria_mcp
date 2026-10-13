@@ -570,6 +570,24 @@ app.get("/authorize", (req, res) => {
     return;
   }
 
+  // Optional human approval (review M5): with
+  // MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true, issuing a code additionally
+  // requires a logged-in dashboard session or the API key, so a leaked
+  // OAuth client secret alone is not sufficient to obtain a token.
+  if (process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL === "true") {
+    const bearer = req.headers.authorization?.startsWith("Bearer ")
+      ? req.headers.authorization.slice(7)
+      : "";
+    if (!hasValidDashboardSession(req) && !(bearer && API_KEY && safeEqual(bearer, API_KEY))) {
+      res.status(401).json({
+        error: "access_denied",
+        error_description:
+          "Authorization requires operator approval: log in to the Memoria dashboard first, or set MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=false.",
+      });
+      return;
+    }
+  }
+
   // PKCE is mandatory and must be S256 — codes are useless without a verifier,
   // which (combined with client auth at /token) closes the open-dispenser hole.
   if (!codeChallenge || codeChallengeMethod !== "S256") {
@@ -621,7 +639,10 @@ function parseCookies(header: string | undefined): Record<string, string> {
 }
 
 function hasValidDashboardSession(req: express.Request): boolean {
-  const token = parseCookies(req.headers.cookie)["memoria_session"];
+  const cookies = parseCookies(req.headers.cookie);
+  // memoria_approve carries the same session token, scoped Path=/authorize
+  // so browsers present it there; memoria_session stays Path=/dashboard.
+  const token = cookies["memoria_session"] || cookies["memoria_approve"];
   if (!token) return false;
   const expiry = dashboardSessions.get(token);
   if (expiry === undefined) return false;
@@ -874,11 +895,15 @@ app.post("/dashboard/login", authLimiter, express.json(), (req, res) => {
   }
   const token = issueDashboardSession();
   const secure = req.secure || req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
-  res.setHeader(
-    "Set-Cookie",
-    `memoria_session=${token}; HttpOnly; SameSite=Strict; Path=/dashboard; ` +
-      `Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}${secure}`,
-  );
+  const attrs = `HttpOnly; SameSite=Strict; Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}${secure}`;
+  res.setHeader("Set-Cookie", [
+    `memoria_session=${token}; Path=/dashboard; ${attrs}`,
+    // Same session, scoped to /authorize only, so the approval gate there
+    // (MEMORIA_AUTHORIZE_REQUIRE_APPROVAL) can see a dashboard login in a
+    // real browser — the Path=/dashboard cookie is never sent to /authorize.
+    // Neither cookie is honoured on /mcp or /ingest (see authenticate()).
+    `memoria_approve=${token}; Path=/authorize; ${attrs}`,
+  ]);
   res.json({ ok: true });
 });
 
@@ -908,6 +933,35 @@ app.get("/health", (_req, res) => {
  * epoch microseconds sent as milliseconds land around year 56,000, which is
  * no one's intent.
  */
+/**
+ * Sanitize an /ingest event's `meta` (review M6). Meta values are
+ * interpolated into daily-log Markdown downstream, so a newline-bearing
+ * string could forge a `## TIME — source` heading. Keep only scalar values,
+ * strip control characters (including CR/LF) from strings, and bound sizes.
+ */
+export function sanitizeIngestMeta(meta: unknown): Record<string, string | number | boolean> {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return {};
+  const stripControls = (s: string, replacement: string, max: number): string =>
+    [...s]
+      .map((c) => {
+        const n = c.charCodeAt(0);
+        return n < 32 || n === 127 ? replacement : c;
+      })
+      .join("")
+      .slice(0, max);
+  const out: Record<string, string | number | boolean> = {};
+  for (const [k, v] of Object.entries(meta as Record<string, unknown>)) {
+    const key = stripControls(k, "", 50);
+    if (!key) continue;
+    if (typeof v === "string") {
+      out[key] = stripControls(v, " ", 500);
+    } else if (typeof v === "number" || typeof v === "boolean") {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
 export function normalizeTimestamp(v: unknown, now: Date = new Date()): string {
   const d = new Date(typeof v === "string" || typeof v === "number" ? v : NaN);
   const year = d.getUTCFullYear();
@@ -957,7 +1011,7 @@ app.post("/ingest", writeLimiter, authenticate, async (req, res) => {
       eventType: String(e.eventType || "external"),
       content: String(e.content),
       timestamp: normalizeTimestamp(e.timestamp),
-      meta: e.meta || {},
+      meta: sanitizeIngestMeta(e.meta),
       importanceEstimate: clampImportance(e.importance),
       privacyTier: VALID_TIERS.has(e.privacyTier) ? e.privacyTier : "send",
     }));

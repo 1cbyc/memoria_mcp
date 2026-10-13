@@ -24,7 +24,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       # Pin the public URL so OAuth discovery metadata is never derived from the
       # (attacker-influenceable) Host header. Required at boot when BIND_ALL=true.
-      - MEMORIA_PUBLIC_URL=${MEMORIA_PUBLIC_URL:-http://localhost:3100}
+      - MEMORIA_PUBLIC_URL=${MEMORIA_PUBLIC_URL:?Set MEMORIA_PUBLIC_URL in .env to the externally reachable URL (http://localhost:3100 only for purely local use)}
       - BIND_ALL=true
       - DOCKER=true
       - PORT=3100

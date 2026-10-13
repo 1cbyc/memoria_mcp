@@ -325,7 +325,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
       const today = new Date().toISOString().slice(0, 10);
       const quoted = text.split("\n").join("\n> ");
       const block = `\n\n> **Note — ${today} (via dashboard):** ${quoted}\n`;
-      fs.appendFileSync(fullPath, block, "utf-8");
+      createOrAppend(fullPath, block, block);
       bustScanCache(); // file changed on disk — invalidate now, before the index
       // rebuild (which can fail), so the wiki reflects the note
       await reindexFile(store, fullPath);

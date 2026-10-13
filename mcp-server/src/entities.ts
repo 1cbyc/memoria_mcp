@@ -279,16 +279,30 @@ export function buildEntityPages(
     // Idempotent: compare ignoring the volatile date lines so an unchanged
     // rollup doesn't rewrite the file (and churn git / the watcher) every run.
     let changed: boolean;
+    let existingBefore: string | null = null;
     try {
-      const existing = fs.readFileSync(abs, "utf-8");
-      changed = stripVolatile(existing) !== stripVolatile(page);
+      existingBefore = fs.readFileSync(abs, "utf-8");
+      changed = stripVolatile(existingBefore) !== stripVolatile(page);
     } catch {
       changed = true;
     }
     if (changed) {
       fs.mkdirSync(entitiesDir, { recursive: true });
-      writeFileAtomic(abs, page);
-      result.written.push(rel);
+      // Re-check at rename time: a human edit (or takeover) landing between
+      // the check above and the write must win, not be overwritten (L3).
+      const wrote = writeFileAtomic(abs, page, {
+        precondition: () => {
+          try {
+            const now = fs.readFileSync(abs, "utf-8");
+            if (!isGenerated(abs)) return false;
+            return existingBefore === null || now === existingBefore;
+          } catch {
+            return existingBefore === null;
+          }
+        },
+      });
+      if (wrote) result.written.push(rel);
+      else result.skipped.push(rel);
     }
   }
 
