@@ -12,6 +12,7 @@
  */
 
 import Database from "better-sqlite3";
+import { acquireStoreLock } from "./store-lock.js";
 import { Chunk } from "./chunker.js";
 import { embed, embedBatch, cosineSimilarity, getDimension, getProvider } from "./embeddings.js";
 import crypto from "crypto";
@@ -149,11 +150,16 @@ export function toFtsQuery(text: string, maxTerms = FTS_MAX_TERMS): string {
 export class MemoryStore {
   private db: Database.Database;
   private dimension: number;
+  private releaseLock: () => void;
 
   constructor(dbPath: string) {
+    // One process per store directory (review H3): fail loudly here rather
+    // than racing another server's writers and collector state.
+    this.releaseLock = acquireStoreLock(dbPath);
     try {
       this.db = new Database(dbPath);
     } catch (err: any) {
+      this.releaseLock();
       if (err.message?.includes("Could not locate") || err.code === "MODULE_NOT_FOUND") {
         throw new Error(
           `Failed to load better-sqlite3 native module. ` +
@@ -164,8 +170,13 @@ export class MemoryStore {
       }
       throw err;
     }
-    this.dimension = getDimension();
-    this.init();
+    try {
+      this.dimension = getDimension();
+      this.init();
+    } catch (initErr) {
+      this.releaseLock();
+      throw initErr;
+    }
   }
 
   needsReindex: boolean = false;
@@ -173,6 +184,9 @@ export class MemoryStore {
   private init(): void {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = NORMAL");
+    // Defence in depth behind the store lock: brief writer contention
+    // (e.g. a test or tool opening the DB) waits instead of SQLITE_BUSY.
+    this.db.pragma("busy_timeout = 5000");
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS chunks (
@@ -1047,6 +1061,10 @@ export class MemoryStore {
   }
 
   close(): void {
-    this.db.close();
+    try {
+      this.db.close();
+    } finally {
+      this.releaseLock();
+    }
   }
 }

@@ -410,15 +410,42 @@ function drainCompileQueuePeek(): string[] {
   }
 }
 
-/** Read and clear the compile queue, returning the touched source names. */
+/** Read and clear the compile queue, returning the touched source names.
+ * Claims the queue by atomic rename first, so an enqueue landing during the
+ * drain writes a fresh queue file instead of being deleted unread (H3). */
 export function drainCompileQueue(): string[] {
-  const items = drainCompileQueuePeek();
+  // Clean orphaned claim files from crashed drains (older than an hour).
   try {
-    if (fs.existsSync(compileQueuePath())) fs.rmSync(compileQueuePath());
+    for (const f of fs.readdirSync(DATA_DIR)) {
+      if (!f.startsWith(`${COMPILE_QUEUE_SIDECAR}.claim-`)) continue;
+      const p = path.join(DATA_DIR, f);
+      try {
+        if (Date.now() - fs.statSync(p).mtimeMs > 3600_000) fs.rmSync(p, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
   } catch {
     // best-effort
   }
-  return items;
+  const claim = `${compileQueuePath()}.claim-${process.pid}-${Date.now()}`;
+  try {
+    fs.renameSync(compileQueuePath(), claim);
+  } catch {
+    return [];
+  }
+  try {
+    const arr = JSON.parse(fs.readFileSync(claim, "utf-8"));
+    return Array.isArray(arr) ? arr.map(String) : [];
+  } catch {
+    return [];
+  } finally {
+    try {
+      fs.rmSync(claim, { force: true });
+    } catch {
+      // best-effort
+    }
+  }
 }
 
 // ─── Tool registration ──────────────────────────────────────

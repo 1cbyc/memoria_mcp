@@ -195,6 +195,7 @@ try {
   );
 }
 tokenDb.pragma("journal_mode = WAL");
+tokenDb.pragma("busy_timeout = 5000");
 
 tokenDb.exec(`
   CREATE TABLE IF NOT EXISTS tokens (
