@@ -108,6 +108,24 @@ export function isInstallableName(name: string): boolean {
 }
 
 /**
+ * Exact versions installed on demand (review M4). An unpinned install would
+ * fetch whatever "latest" is that day and then execute it via dynamic
+ * import, so every adapter dependency must be pinned here; an unknown name
+ * is refused rather than installed unpinned. Bump deliberately, with a
+ * changelog note, like any other dependency.
+ */
+export const PINNED_ADAPTER_VERSIONS: Record<string, string> = {
+  imapflow: "2.4.0",
+  googleapis: "185.0.0",
+};
+
+/** `name@pinnedVersion`, or null when the name has no pin. */
+export function pinnedInstallSpec(name: string): string | null {
+  const v = PINNED_ADAPTER_VERSIONS[name];
+  return v ? `${name}@${v}` : null;
+}
+
+/**
  * Where npm's own CLI script sits relative to a Node binary: beside it on
  * Windows (C:\Program Files\nodejs\node_modules\npm), under ../lib on
  * POSIX installs and the official Docker images (/usr/local/lib/node_modules).
@@ -168,6 +186,14 @@ export async function installDependencies(
       message: `Refusing to install invalid dependency name(s): ${invalid.join(", ")}`,
     };
   }
+  const unpinned = missing.filter((n) => pinnedInstallSpec(n) === null);
+  if (unpinned.length > 0) {
+    return {
+      success: false,
+      message: `Refusing to install unpinned dependency name(s): ${unpinned.join(", ")}. Pin an exact version in PINNED_ADAPTER_VERSIONS (deps.ts) first.`,
+    };
+  }
+  const specs = missing.map((n) => pinnedInstallSpec(n)!);
   if (!modulesDir) {
     return { success: false, message: "No adapter-modules directory is configured." };
   }
@@ -191,8 +217,8 @@ export async function installDependencies(
     );
   }
 
-  process.stderr.write(`Memoria: installing adapter dependencies: ${missing.join(", ")}\n`);
-  const command = npmInstallCommand(missing);
+  process.stderr.write(`Memoria: installing adapter dependencies: ${specs.join(", ")}\n`);
+  const command = npmInstallCommand(specs);
   if (!command) {
     return {
       success: false,
