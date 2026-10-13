@@ -16,7 +16,39 @@ Memoria is an [MCP](https://modelcontextprotocol.io) server that gives Claude Co
 - **Multi-device without a service.** Keep the store in a private git repo; daily logs are append-only and merge with git's union driver, so two machines writing the same day never clobber each other ([Multi-device sync](#multi-device-sync)).
 - **Agentic self-maintenance.** Write-time dedup, reflection, contradiction lint, decay/promotion, and a deterministic "compile, don't retrieve" loop that rolls the daily firehose into linked entity pages.
 - **Spec-complete remote transport.** OAuth 2.1 with PKCE, client credentials, dynamic client registration and metadata discovery — works as a claude.ai custom connector out of the box.
-- **Honest about search.** Three embedding providers (OpenAI → local MiniLM → n-gram fallback), three-signal scoring, and every result reports its scan coverage.
+- **Honest about search.** Three embedding providers (local MiniLM → n-gram fallback, plus OpenAI as an explicit opt-in), three-signal scoring, and every result reports its scan coverage.
+
+## Recent updates — security hardening (unreleased)
+
+A whole-repo review hardened the server, the collector, and the sync scripts.
+Full details are in [CHANGELOG.md](CHANGELOG.md) (Unreleased) and
+[SECURITY.md](SECURITY.md). The changes most likely to affect you:
+
+- **Collector consent is dashboard-only.** The `memory_sources` `agree`
+  action was removed: an MCP caller (including a prompt-injected one) can
+  no longer consent on your behalf. Grant consent in the dashboard's
+  Sources tab, then enable the source as before.
+- **Remote embeddings are opt-in.** Setting `OPENAI_API_KEY` no longer
+  sends memory content and search queries to OpenAI by itself; only
+  `MEMORIA_EMBEDDINGS=openai` does. `auto` now stays on this device.
+- **One server per store.** A second process opening the same store now
+  fails at startup with a clear message instead of racing the first
+  (SQLite also waits on contention, and compile-queue drains are atomic).
+- **Sync scripts are safer.** The pull hook executes a mirror script from
+  inside the synced store only with `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true`,
+  and `sync-from-claude-memory.sh` overwrites only newer files, backing up
+  whatever it replaces (`--dry-run` previews changes).
+- **Pinned, bounded, encrypted.** On-demand adapter installs use exact
+  pinned versions, tool inputs (`days`, `batch_size`, query length, …)
+  are bounded, and the provenance archive stores content encrypted rather
+  than plaintext. Optional: `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true`
+  requires a dashboard login or the API key before `/authorize` issues a
+  code. docker-compose now also requires `MEMORIA_PUBLIC_URL` in `.env`
+  (the `.env.example` localhost value covers purely local use).
+
+Under the hood, the collector daemon gained a dedicated test suite (which
+also caught that its first poll on startup never ran — now fixed), and
+behavioural tests now cover the sync scripts and the Python ingestion hook.
 
 ## Architecture
 
