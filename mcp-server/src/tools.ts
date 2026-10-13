@@ -446,7 +446,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
     "memory_search",
     "Semantic + keyword hybrid search across all memories. Uses three-signal scoring: 0.2·recency + 0.3·importance + 0.5·relevance.",
     {
-      query: z.string().describe("Search query"),
+      query: z.string().min(1).max(2000).describe("Search query (max 2000 characters)"),
       max_results: z
         .number()
         .int()
@@ -795,7 +795,14 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
     "memory_reflect",
     "Read recent daily logs and return their content for the agent to synthesize reflections.",
     {
-      days: z.number().optional().default(7).describe("Number of days of daily logs to read"),
+      days: z
+        .number()
+        .int()
+        .min(1)
+        .max(365)
+        .optional()
+        .default(7)
+        .describe("Number of days of daily logs to read (1-365)"),
     },
     async ({ days }) => {
       const dailyDir = path.join(MEMORIES_DIR, "daily");
@@ -975,15 +982,19 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
       type: z
         .enum(["user", "project", "decision", "feedback", "reference", "reflection", "pattern"])
         .describe("Memory type — determines subdirectory"),
-      tags: z.array(z.string()).describe("Tags for categorization"),
+      tags: z
+        .array(z.string().max(100))
+        .max(50)
+        .describe("Tags for categorization (max 50, each max 100 characters)"),
       related: z
-        .array(z.string())
+        .array(z.string().max(500))
+        .max(50)
         .optional()
-        .describe("Related memory file paths (e.g., ['user/profile.md'])"),
+        .describe("Related memory file paths (e.g., ['user/profile.md']) (max 50)"),
     },
     async ({ content: bodyContent, name: memName, type: memType, tags, related }) => {
-      // Size cap (matches memory_write)
-      if (bodyContent.length > 100 * 1024) {
+      // Size cap (matches memory_write; BYTES, not UTF-16 code units)
+      if (Buffer.byteLength(bodyContent, "utf8") > 100 * 1024) {
         return {
           content: [{ type: "text" as const, text: "Error: content exceeds 100KB limit" }],
         };
@@ -1151,8 +1162,22 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
       "Use this to compress the firehose of automated events into compounding " +
       "knowledge — call memory_compile with the synthesized output.",
     {
-      days: z.number().optional().default(7).describe("Number of recent daily logs to compact"),
-      max_chars: z.number().optional().default(15000).describe("Max characters of output context"),
+      days: z
+        .number()
+        .int()
+        .min(1)
+        .max(365)
+        .optional()
+        .default(7)
+        .describe("Number of recent daily logs to compact (1-365)"),
+      max_chars: z
+        .number()
+        .int()
+        .min(1)
+        .max(100000)
+        .optional()
+        .default(15000)
+        .describe("Max characters of output context (1-100000)"),
     },
     async ({ days, max_chars }) => {
       const dailyDir = path.join(MEMORIES_DIR, "daily");
@@ -1789,7 +1814,14 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
     "memory_ingest",
     "Manually trigger ingestion of buffered events into core memory. Useful after enabling a new source or for testing.",
     {
-      batch_size: z.number().optional().default(50).describe("Max events to ingest"),
+      batch_size: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .default(50)
+        .describe("Max events to ingest (1-500)"),
       source_filter: z.string().optional().describe("Only ingest events from this source"),
     },
     async ({ batch_size, source_filter }) => {
@@ -1853,8 +1885,22 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
     "memory_fuse",
     "Detect patterns across data sources by correlating events within time windows. Creates higher-level activity records.",
     {
-      hours: z.number().optional().default(24).describe("Look back this many hours"),
-      window_minutes: z.number().optional().default(30).describe("Fusion time window in minutes"),
+      hours: z
+        .number()
+        .int()
+        .min(1)
+        .max(720)
+        .optional()
+        .default(24)
+        .describe("Look back this many hours (1-720)"),
+      window_minutes: z
+        .number()
+        .int()
+        .min(1)
+        .max(1440)
+        .optional()
+        .default(30)
+        .describe("Fusion time window in minutes (1-1440)"),
     },
     async ({ hours, window_minutes }) => {
       await ensureCollector(store);
