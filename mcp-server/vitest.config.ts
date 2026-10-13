@@ -51,7 +51,9 @@ export default defineConfig({
         "src/lint.ts": { lines: 72, statements: 69 },
         "src/collector/ingestion.ts": { lines: 85, statements: 85 },
         "src/collector/buffer.ts": { lines: 74, statements: 74 },
-        "src/collector/daemon.ts": { lines: 31, statements: 28 },
+        // Daemon floor raised 31/28 -> 90/84 after daemon.test.ts (2026-10)
+        // measured 95.9 lines / 89.4 statements on the full suite.
+        "src/collector/daemon.ts": { lines: 90, statements: 84 },
         "src/collector/provenance.ts": { lines: 80, statements: 80 },
       },
     },

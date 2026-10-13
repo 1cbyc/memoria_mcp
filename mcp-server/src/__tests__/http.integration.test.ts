@@ -321,6 +321,8 @@ describe("prod-posture fail-closed gating (C2/C8)", () => {
   });
 });
 
+let approveCookie = "";
+
 describe("dashboard httpOnly cookie session (C6)", () => {
   it("rejects a wrong key at /dashboard/login -> 401, no cookie", async () => {
     const r = await request(app).post("/dashboard/login").send({ key: "wrong" });
@@ -341,6 +343,10 @@ describe("dashboard httpOnly cookie session (C6)", () => {
   it("the session cookie authorizes /dashboard/api without a bearer token", async () => {
     const login = await request(app).post("/dashboard/login").send({ key: KEY });
     const cookie = login.headers["set-cookie"][0].split(";")[0];
+    approveCookie = (login.headers["set-cookie"] as unknown as string[])
+      .map((c: string) => c.split(";")[0])
+      .find((c: string) => c.startsWith("memoria_approve="))!;
+    expect(approveCookie).toBeTruthy();
     const r = await request(app).get("/dashboard/api/stats").set("Cookie", cookie);
     expect(r.status).toBe(200);
   });
@@ -638,6 +644,50 @@ describe("/ingest timestamps (2026-09 re-review)", () => {
     const today = new Date().toISOString().slice(0, 10);
     const log = fs.readFileSync(path.join(ROOT, "memories", "daily", `${today}.md`), "utf-8");
     expect(log.match(/## \d{2}:\d{2} UTC — http-test/g)).toHaveLength(2);
+  });
+});
+
+describe("sanitizeIngestMeta (review M6)", () => {
+  it("strips control characters and drops nested values", async () => {
+    const { sanitizeIngestMeta } = await import("../http.js");
+    const out = sanitizeIngestMeta({
+      from: "mallory\n## 09:00 — forged",
+      nested: { a: 1 },
+      list: [1],
+      count: 3,
+      ok: true,
+    });
+    expect(out.from).not.toContain("\n");
+    expect(out.nested).toBeUndefined();
+    expect(out.list).toBeUndefined();
+    expect(out.count).toBe(3);
+    expect(out.ok).toBe(true);
+    expect(sanitizeIngestMeta(null)).toEqual({});
+    expect(sanitizeIngestMeta("x")).toEqual({});
+  });
+
+  it("/authorize refuses without approval when MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true (M5)", async () => {
+    process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL = "true";
+    try {
+      const r = await request(app).get("/authorize").query({
+        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+        code_challenge: "abc",
+        code_challenge_method: "S256",
+      });
+      expect(r.status).toBe(401);
+      const ok = await request(app).get("/authorize").set(auth).query({
+        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+        code_challenge: "abc",
+        code_challenge_method: "S256",
+      });
+      expect(ok.status).toBe(302);
+      // A dashboard login also satisfies the gate in a real browser via
+      // memoria_approve (Path=/authorize), captured at login above — no
+      // fresh login here, to stay under the auth rate limit.
+      expect(approveCookie).toMatch(/^memoria_approve=/);
+    } finally {
+      delete process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL;
+    }
   });
 });
 

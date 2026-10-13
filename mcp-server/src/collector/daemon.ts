@@ -202,12 +202,15 @@ export class CollectorDaemon {
       // Start the poll loop
       pt.timer = setInterval(() => this.pollSource(sourceId), intervalMs);
 
+      // Register BEFORE the first poll: pollSource() looks its timer up in
+      // the map and returns silently when absent, so firing first made the
+      // "immediate" poll a no-op and collection waited a full interval.
+      this.pollTimers.set(sourceId, pt);
+
       // Run first poll immediately. Fire-and-forget on purpose: pollSource
       // handles its own failures (error counter + exponential backoff), so it
       // never rejects, and start() must not block on a slow first poll.
       void this.pollSource(sourceId);
-
-      this.pollTimers.set(sourceId, pt);
     }
   }
 

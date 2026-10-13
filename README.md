@@ -186,8 +186,9 @@ For a durable cloud deployment see [`deploy/gcp/README.md`](deploy/gcp/README.md
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MEMORIA_API_KEY` | *(required for HTTP)* | Bearer token for HTTP transport authentication (`/mcp`, `/ingest`, `/dashboard/api`). Distinct from the OAuth client secret below. |
-| `OPENAI_API_KEY` | *(none)* | Enables OpenAI text-embedding-3-small (1536-dim). When unset, falls back to the local MiniLM model (see `MEMORIA_EMBEDDINGS`). |
-| `MEMORIA_EMBEDDINGS` | `auto` | Embedding provider: `auto` (OpenAI if key, else local MiniLM if installed, else hash), `openai`, `minilm` (local all-MiniLM-L6-v2, 384-dim, true semantic), or `hash` (n-gram lexical fallback, 384-dim). |
+| `OPENAI_API_KEY` | *(none)* | API key for OpenAI embeddings. On its own it does **not** enable remote embeddings (see `MEMORIA_EMBEDDINGS`); when remote embeddings are enabled, memory content and search queries are sent to OpenAI. |
+| `MEMORIA_EMBEDDINGS` | `auto` | Embedding provider: `auto` (local MiniLM if installed, else hash — never remote), `openai` (explicit opt-in: sends content to OpenAI), `minilm` (local all-MiniLM-L6-v2, 384-dim, true semantic), or `hash` (n-gram lexical fallback, 384-dim). |
+| `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL` | `false` | When `true`, `/authorize` additionally requires a dashboard session or the API key, so a leaked OAuth client secret alone cannot obtain a token. |
 | `MEMORIA_MODEL_CACHE` | *(package default)* | Directory for the cached MiniLM model. The Docker image pre-bakes it at `/app/mcp-server/.models`; the build fails if the download does, unless you pass `--build-arg PREFETCH_MODEL=false` (for OpenAI or hash embeddings, or offline builds). |
 | `MEMORIA_MODEL_OFFLINE` | `false` | Set to `true` to forbid model downloads (use only the cached/pre-baked model). |
 | `MEMORIA_OAUTH_CLIENT_SECRET` | *(required when `BIND_ALL=true`)* | OAuth client secret. Keep it distinct from the API key so rotating one doesn't rotate the other. Locally (loopback) it falls back to the API key with a warning. |
@@ -296,7 +297,8 @@ The three Google adapters share a single set of OAuth 2.0 credentials:
 **3. Enable the adapters:**
 
 ```
-memory_sources action="agree" source="google-gmail"
+# First grant consent in the Memoria dashboard (Sources tab) — consent
+# cannot be granted through the MCP tool surface.
 memory_sources action="enable" source="google-gmail" config={
   "google_client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
   "google_client_secret": "YOUR_CLIENT_SECRET",
@@ -391,7 +393,8 @@ All events are classified into privacy tiers before leaving the device:
 
 ```
 1. memory_sources action="list"                    # See available sources
-2. memory_sources action="agree" source="imessage" # Record user consent
+2. In the Memoria dashboard (Sources tab), grant consent for "imessage"
+   # Consent is dashboard-only by design: an MCP caller cannot grant it.
 3. memory_sources action="enable" source="imessage" # Enable + auto-install deps
 4. memory_priority action="status"                 # Verify it's collecting
 ```

@@ -11,7 +11,56 @@ existing store gets a migration note here.
 
 ## [Unreleased]
 
-Nothing yet.
+Security fixes from the 2026-10 whole-repo review. The memory file format
+is unchanged.
+
+**Breaking changes:**
+
+- **Collector consent can no longer be granted through MCP.** The
+  `memory_sources` `agree` action is removed; grant consent in the
+  dashboard (Sources tab) instead. An MCP caller — including a
+  prompt-injected one — can no longer consent on your behalf.
+- **An OpenAI key no longer selects remote embeddings by itself.** Only
+  `MEMORIA_EMBEDDINGS=openai` sends memory content and search queries to
+  OpenAI; `auto` now stays local. Set it explicitly if you rely on OpenAI
+  embeddings.
+- **docker-compose now requires `MEMORIA_PUBLIC_URL`** in `.env` (the
+  `.env.example` localhost value covers purely local use), so a remote
+  deploy cannot silently pin OAuth discovery to a loopback issuer.
+
+### Fixed
+
+- Bounded `memory_reflect`/`memory_compact` `days` and `max_chars`,
+  `memory_ingest` `batch_size`, `memory_search` query length, and
+  `memory_compile` tags/related; the compile size cap now measures bytes.
+- One server process per store: a second process opening the same store
+  fails at startup (store lock file, stale locks reclaimed), SQLite waits
+  on `busy_timeout`, and the compile queue drains by atomic rename so an
+  enqueue during a drain is no longer deleted unread.
+- The provenance archive stores non-`local-only` content encrypted under
+  the collector master key instead of plaintext (older plaintext records
+  still read back).
+- `scripts/sync/memoria-sync-pull.sh` no longer executes
+  `$STORE/.memoria-mirror.sh` unless `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true`.
+- `scripts/sync-from-claude-memory.sh` only overwrites a destination when
+  the source is newer, backs up whatever it replaces, and supports
+  `--dry-run`. First behavioural tests for both scripts live in
+  `scripts/tests/`.
+- On-demand adapter installs are pinned to exact versions
+  (`imapflow@2.4.0`, `googleapis@185.0.0`); unpinned names are refused.
+- `/ingest` event `meta` is sanitized (control characters stripped,
+  nested values dropped) so it cannot forge daily-log headings.
+- Optional `/authorize` approval gate:
+  `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true` requires a dashboard session
+  or the API key before a code is issued.
+- Dashboard annotations use the atomic append helper; entity-page
+  regeneration re-checks for human edits at write time; the custom
+  file-watcher skips files over 10 MB instead of reading them whole.
+- The collector daemon's first poll on (re)start never ran: the poll timer
+  was registered only after the immediate poll fired, and the poll looks
+  its timer up in the registry, so collection silently waited a full
+  interval. Registration now happens first. The daemon also gained its
+  first dedicated test suite, and its coverage floor rose accordingly.
 
 ## [0.2.1] — 2026-09-24
 

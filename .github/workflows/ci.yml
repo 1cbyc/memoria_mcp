@@ -72,12 +72,15 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m compileall -q integrations
+      - run: pip install -q pytest
+      - run: python -m pytest integrations/test_orchestrator_hook.py -q
 
   shell:
     name: Shellcheck (scripts)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/tests/sync_scripts_test.sh
       - run: shellcheck --severity=warning scripts/*.sh scripts/sync/*.sh deploy/gcp/*.sh
 
   docker:

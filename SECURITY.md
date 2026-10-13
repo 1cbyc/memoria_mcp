@@ -28,7 +28,7 @@ what they are.
 |------|---------|
 | **Network perimeter** | By default the HTTP server binds to `127.0.0.1`. Every shipped Docker / Cloud Run config sets `BIND_ALL=true` and the reference Cloud Run service is `--allow-unauthenticated` at the platform level — so in those deployments **the network is open and bearer auth is the only access control**. |
 | **Authentication** | Static bearer token (`MEMORIA_API_KEY`) on `/mcp`, `/ingest`, `/dashboard/api`; OAuth 2.1 (`authorization_code` + mandatory PKCE S256, `client_credentials`) minting 24 h tokens. Token comparison is timing-safe. Issued tokens and authorization codes are stored only as SHA-256 hashes, in an owner-only (`0600`) `tokens.sqlite`. |
-| **`/authorize` auto-approves** | There is **no consent screen and no user login**. `/authorize` issues a code to any *allow-listed* `redirect_uri` (`MEMORIA_ALLOWED_REDIRECT_HOSTS`, default claude.ai / claude.com / anthropic.com / localhost) as long as a PKCE challenge is present. The code is only useful to a client that can then present the **client secret** at `/token` — so secrecy of `MEMORIA_OAUTH_CLIENT_SECRET` is what gates access, not the authorize step. Keep it distinct from the API key; rotating one must not rotate the other. |
+| **`/authorize` auto-approves** | There is **no consent screen and no user login**. `/authorize` issues a code to any *allow-listed* `redirect_uri` (`MEMORIA_ALLOWED_REDIRECT_HOSTS`, default claude.ai / claude.com / anthropic.com / localhost) as long as a PKCE challenge is present. The code is only useful to a client that can then present the **client secret** at `/token` — so secrecy of `MEMORIA_OAUTH_CLIENT_SECRET` is what gates access, not the authorize step. Keep it distinct from the API key; rotating one must not rotate the other. Set `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true` to additionally require a dashboard session or the API key before a code is issued, so a leaked client secret alone is not sufficient. |
 | **Dynamic registration** | `/register` (RFC 7591) returns the single static client. It does not create new principals. |
 | **Discovery metadata** | Derived from `MEMORIA_PUBLIC_URL` when set. **Set it** in any network-exposed deployment (the server refuses to start with `BIND_ALL=true` without it); otherwise the issuer URL is derived from request headers, which an attacker can influence. |
 | **Rate limits** | Per client IP: `/mcp` 30/min, auth endpoints 20/min, `/ingest` + `/dashboard/api` 120/min, global 300/min. Trusts one proxy hop for the client IP. |
@@ -52,10 +52,12 @@ commands. It is shipped because it is the feature that makes Memoria more than
 a notes folder, but it has had **far less adversarial testing** than the
 server core. Concretely:
 
-- **Consent is enforced in code**: a source cannot be enabled until
-  `memory_sources action="agree"` has been recorded for it. That is a guard
-  against an agent enabling sources behind your back, not a substitute for
-  you deciding what to collect.
+- **Consent is enforced in code, and granted only in the dashboard**: a
+  source cannot be enabled until consent has been recorded for it through
+  the authenticated dashboard (Sources tab). The MCP tool surface cannot
+  grant consent — an earlier design let the same agent that enables a
+  source also record the agreement, so a prompt injection could consent
+  on your behalf. That action was removed from `memory_sources`.
 - **Privacy tiers** (`send` / `summarize` / `local-only`) are applied before
   content leaves the device, with value-pattern detection for secrets (Luhn,
   SSN, `sk-`/`AKIA`/JWT/PEM) and re-enforced at the write sink. Pattern
@@ -74,8 +76,13 @@ server core. Concretely:
   password, Google refresh token). Use app-specific passwords and read-only
   scopes; never reuse a primary password.
 - The provenance archive (`data/raw/`, on by default) stores ingested events
-  durably (`local-only` events as hashes only). It is runtime state; keep it
+  durably (`local-only` events as hashes only; other tiers encrypted under
+  the collector master key, never plaintext). It is runtime state; keep it
   out of version control (the shipped `.gitignore` does).
+- **Embeddings**: remote embeddings are opt-in only. Setting
+  `OPENAI_API_KEY` alone never sends anything anywhere; only
+  `MEMORIA_EMBEDDINGS=openai` selects OpenAI, and then memory content and
+  search queries leave the device regardless of collector privacy tiers.
 
 If you are unsure, run the server without enabling any sources. Everything
 else (MCP tools, dashboard, daily logs, search) works without the collector.
