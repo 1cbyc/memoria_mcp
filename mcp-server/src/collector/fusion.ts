@@ -19,6 +19,7 @@
  */
 
 import type { RawEvent } from "./adapters/base.js";
+import { enforceEventPrivacy } from "./adapters/base.js";
 import { utcTimeLabel } from "../daily-format.js";
 
 // ── Types ──────────────────────────────────────────────────
@@ -82,10 +83,19 @@ export class TemporalFusion {
    * Events should be from the same rough time period (e.g., today's events).
    */
   fuse(events: RawEvent[]): FusedActivity[] {
-    if (events.length < this.config.minEvents) return [];
+    // Privacy gate (H-02/H-03): fused activities are written to the synced
+    // daily log, so fusion must apply the same sink-side enforcement as
+    // ingestion. Enforce every event's effective tier first, then drop
+    // local-only events entirely — their content, label, tags, and meta
+    // must never reach a fused activity. Summarize-tier content arrives
+    // already truncated by enforceEventPrivacy.
+    const safeEvents = events
+      .map((e) => enforceEventPrivacy(e))
+      .filter((e) => e.privacyTier !== "local-only");
+    if (safeEvents.length < this.config.minEvents) return [];
 
     // Sort by timestamp
-    const sorted = [...events].sort(
+    const sorted = [...safeEvents].sort(
       (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
     );
 

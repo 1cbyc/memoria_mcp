@@ -61,6 +61,14 @@ is unchanged.
   its timer up in the registry, so collection silently waited a full
   interval. Registration now happens first. The daemon also gained its
   first dedicated test suite, and its coverage floor rose accordingly.
+- Cross-source temporal fusion (daemon and `memory_fuse`) wrote raw event
+  content to the synced daily log without the sink-side privacy enforcement
+  ingestion applies, so a `local-only` event clustered with any second
+  source leaked verbatim. Fusion now enforces the same privacy tiers
+  (shared `enforceEventPrivacy` in `adapters/base.ts`) and drops
+  `local-only` events before clustering; the meta screen also classifies
+  non-scalar values (arrays/objects) so a shaped `meta.subject` cannot
+  smuggle a secret into a fused label.
 
 ## [0.2.1] — 2026-09-24
 

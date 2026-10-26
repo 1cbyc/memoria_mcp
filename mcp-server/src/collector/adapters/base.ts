@@ -218,3 +218,52 @@ export function mostRestrictiveTier(
 ): RawEvent["privacyTier"] {
   return (TIER_RANK[a] ?? 0) >= (TIER_RANK[b] ?? 0) ? a : b;
 }
+
+/** Max chars retained for a `summarize`-tier event before truncation. */
+export const SUMMARIZE_MAX_CHARS = 200;
+export const LOCAL_ONLY_REDACTION =
+  "[redacted — local-only: content classified as sensitive and withheld from the synced/embedded store]";
+
+/**
+ * Apply the effective privacy tier to an event before it is persisted to a
+ * synced/embedded store (daily log, fused activity). Returns a copy with
+ * content redacted or truncated as required. The effective tier is the most
+ * restrictive of the adapter-supplied tier and a fresh content
+ * re-classification, so a mislabeled or caller-supplied "send" cannot leak
+ * sensitive content. Shared by the ingestion sink and temporal fusion.
+ */
+export function enforceEventPrivacy(event: RawEvent): RawEvent {
+  const reclassified = classifyPrivacy(event.content, event.meta);
+  const tier = mostRestrictiveTier(event.privacyTier ?? "send", reclassified);
+
+  // Meta is a leak vector of its own (locations, senders, attendee emails).
+  // Classify the stringified meta VALUES separately; if anything in meta
+  // trips the classifier, drop meta entirely rather than persist it.
+  let meta = event.meta ?? {};
+  if (Object.keys(meta).length > 0) {
+    // Coerce every value (arrays/objects included) the way consumers such
+    // as String(meta.subject) would render it, so a non-scalar meta value
+    // cannot smuggle unclassified text past this screen.
+    const metaText = Object.values(meta)
+      .map((v) =>
+        typeof v === "string" || typeof v === "number" ? String(v) : (JSON.stringify(v) ?? ""),
+      )
+      .filter(Boolean)
+      .join(" ");
+    if (metaText && classifyPrivacy(String(metaText), {}) !== "send") {
+      meta = {};
+    }
+  }
+
+  if (tier === "local-only") {
+    return { ...event, privacyTier: tier, content: LOCAL_ONLY_REDACTION, meta: {} };
+  }
+
+  if (tier === "summarize" && event.content.length > SUMMARIZE_MAX_CHARS) {
+    const truncated =
+      event.content.slice(0, SUMMARIZE_MAX_CHARS).trimEnd() + " … [truncated for privacy]";
+    return { ...event, privacyTier: tier, content: truncated, meta };
+  }
+
+  return { ...event, privacyTier: tier, meta };
+}

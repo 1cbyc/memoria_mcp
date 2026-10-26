@@ -16,14 +16,12 @@ import { contentHash } from "./crypto.js";
 import { collectorDailyHeader, utcTimeLabel } from "../daily-format.js";
 import { createOrAppend, writeFileAtomic } from "../atomic-fs.js";
 import { getProvider } from "../embeddings.js";
-import { classifyPrivacy, mostRestrictiveTier } from "./adapters/base.js";
+import { enforceEventPrivacy } from "./adapters/base.js";
 import { appendRawArchive, flushRawArchive, rawArchiveEnabled } from "./provenance.js";
 import type { RawEvent } from "./adapters/base.js";
 
-/** Max chars retained for a `summarize`-tier event before truncation. */
-const SUMMARIZE_MAX_CHARS = 200;
-const LOCAL_ONLY_REDACTION =
-  "[redacted — local-only: content classified as sensitive and withheld from the synced/embedded store]";
+/** Privacy enforcement lives in adapters/base.ts (`enforceEventPrivacy`),
+ * shared with temporal fusion so both sinks apply the same tiers. */
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -384,37 +382,7 @@ export class IngestionPipeline {
    * mislabeled or caller-supplied "send" cannot leak sensitive content.
    */
   private enforcePrivacy(event: RawEvent): RawEvent {
-    const reclassified = classifyPrivacy(event.content, event.meta);
-    const tier = mostRestrictiveTier(event.privacyTier ?? "send", reclassified);
-
-    // Meta is a leak vector of its own (locations, senders, attendee emails —
-    // and daily-log formatting writes meta.from/location verbatim). Classify
-    // the stringified meta VALUES separately; if anything in meta trips the
-    // classifier, drop meta entirely rather than persist it. Content keeps its
-    // own tier — a sensitive meta field shouldn't redact an innocuous body.
-    let meta = event.meta ?? {};
-    if (Object.keys(meta).length > 0) {
-      const metaText = Object.values(meta)
-        .filter((v) => typeof v === "string" || typeof v === "number")
-        .join(" ");
-      if (metaText && classifyPrivacy(String(metaText), {}) !== "send") {
-        meta = {};
-      }
-    }
-
-    if (tier === "local-only") {
-      // Never persist the content (or potentially-revealing meta) to the
-      // synced/embedded store. Keep a redacted stub so the timeline is intact.
-      return { ...event, privacyTier: tier, content: LOCAL_ONLY_REDACTION, meta: {} };
-    }
-
-    if (tier === "summarize" && event.content.length > SUMMARIZE_MAX_CHARS) {
-      const truncated =
-        event.content.slice(0, SUMMARIZE_MAX_CHARS).trimEnd() + " … [truncated for privacy]";
-      return { ...event, privacyTier: tier, content: truncated, meta };
-    }
-
-    return { ...event, privacyTier: tier, meta };
+    return enforceEventPrivacy(event);
   }
 
   // ── Stage 5: Writing ───────────────────────────────────────
