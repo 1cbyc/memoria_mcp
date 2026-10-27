@@ -77,8 +77,14 @@ else
   log "push rejected or failed (diverged? offline?) — will retry next session"
 fi
 
-# 4. Optional object-storage mirror.
-if [ -x "$MIRROR" ]; then
+# 4. Optional object-storage mirror. Opt-in only, exactly as in the pull
+#    hook (review M2/H-01): the default path is inside the synced store, so
+#    executing it by default would let anyone who can land a file in the
+#    store run code in your shell.
+if [ "${MEMORIA_SYNC_ALLOW_STORE_MIRROR:-}" != "true" ] && [ -x "$MIRROR" ]; then
+  log "mirror at $MIRROR not run: set MEMORIA_SYNC_ALLOW_STORE_MIRROR=true to allow executing a script from the synced store"
+fi
+if [ "${MEMORIA_SYNC_ALLOW_STORE_MIRROR:-}" = "true" ] && [ -x "$MIRROR" ]; then
   if "$MIRROR" push "$STORE" >>"$LOG_FILE" 2>&1; then
     log "mirror push OK"
   else

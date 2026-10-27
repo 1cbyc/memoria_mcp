@@ -89,6 +89,7 @@ down has failed at its job.
 | `MEMORIA_SYNC_BRANCH` | current branch | Branch to sync |
 | `MEMORIA_SYNC_INTERVAL_S` | `900` | Minimum seconds between pushes; `0` pushes every time. Local commits are never rate-limited. |
 | `MEMORIA_SYNC_MIRROR` | `$MEMORIA_DIR/.memoria-mirror.sh` | Optional object-storage hook (below) |
+| `MEMORIA_SYNC_ALLOW_STORE_MIRROR` | *(unset)* | Set to `true` to let either sync script execute the mirror above. The mirror lives inside the synced store, so it never runs by default. |
 | `MEMORIA_SYNC_LOG` | `$MEMORIA_DIR/.sync.log` | Where the scripts log |
 
 ## Why daily logs never conflict
@@ -124,7 +125,10 @@ look at it.
 
 If you also run a hosted instance backed by a bucket (Cloud Run + GCS FUSE, a
 VPS with S3, whatever), git alone will not see those writes. Drop an executable
-at `$MEMORIA_DIR/.memoria-mirror.sh` and both scripts will call it:
+at `$MEMORIA_DIR/.memoria-mirror.sh`. Neither script will execute it until
+you opt in with `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true` — the script lives
+inside the synced store, so running it by default would let anyone who can
+land a file in the store run code in your shell:
 
 ```bash
 #!/usr/bin/env bash

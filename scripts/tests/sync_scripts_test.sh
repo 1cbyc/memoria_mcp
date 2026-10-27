@@ -53,4 +53,15 @@ check "M2: store mirror not executed by default" test ! -f "$STORE/mirror-ran"
 MEMORIA_DIR="$STORE" MEMORIA_SYNC_ALLOW_STORE_MIRROR=true bash "$REPO_ROOT/scripts/sync/memoria-sync-pull.sh" >"$TMP/out5" 2>&1
 check "M2: store mirror runs only with explicit opt-in" test -f "$STORE/mirror-ran"
 
+# ── H-01: the push hook must apply the same mirror gate as pull ──
+# Push reaches the mirror step when it has committed something (no remote
+# is configured here, so the git push itself fails soft and step 4 runs).
+rm -f "$STORE/mirror-ran"
+echo y >> "$STORE/memories/a.md"
+MEMORIA_DIR="$STORE" MEMORIA_SYNC_INTERVAL_S=0 bash "$REPO_ROOT/scripts/sync/memoria-sync-push.sh" >"$TMP/out6" 2>&1
+check "H-01: store mirror not executed by push by default" test ! -f "$STORE/mirror-ran"
+echo z >> "$STORE/memories/a.md"
+MEMORIA_DIR="$STORE" MEMORIA_SYNC_INTERVAL_S=0 MEMORIA_SYNC_ALLOW_STORE_MIRROR=true bash "$REPO_ROOT/scripts/sync/memoria-sync-push.sh" >"$TMP/out7" 2>&1
+check "H-01: store mirror runs on push only with explicit opt-in" test -f "$STORE/mirror-ran"
+
 if [ "$fail" -eq 0 ]; then echo "all sync script tests passed"; else echo "FAILURES"; exit 1; fi

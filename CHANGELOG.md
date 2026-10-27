@@ -42,6 +42,9 @@ is unchanged.
   still read back).
 - `scripts/sync/memoria-sync-pull.sh` no longer executes
   `$STORE/.memoria-mirror.sh` unless `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true`.
+  The push hook applied no such gate and executed the store-resident
+  mirror on any publish-eligible Stop-hook run; it now uses the same
+  opt-in as pull.
 - `scripts/sync-from-claude-memory.sh` only overwrites a destination when
   the source is newer, backs up whatever it replaces, and supports
   `--dry-run`. First behavioural tests for both scripts live in
