@@ -64,6 +64,14 @@ is unchanged.
   its timer up in the registry, so collection silently waited a full
   interval. Registration now happens first. The daemon also gained its
   first dedicated test suite, and its coverage floor rose accordingly.
+- Overlapping ingestion could write an event twice: the daemon's
+  ingestion timer had no in-flight guard, so a cycle slower than the
+  interval re-fetched the same unsynced batch, and the shared ingestion
+  pipeline checked the dedup hash before recording it, so concurrent
+  `ingest()` calls (daemon, `memory_ingest`, `/ingest`) could both pass
+  and both write. Cycles now join the in-flight cycle instead of
+  starting a second one (`stop()` awaits it, then flushes once more),
+  and pipeline calls are serialized in arrival order.
 - Cross-source temporal fusion (daemon and `memory_fuse`) wrote raw event
   content to the synced daily log without the sink-side privacy enforcement
   ingestion applies, so a `local-only` event clustered with any second

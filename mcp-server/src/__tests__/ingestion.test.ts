@@ -135,6 +135,30 @@ describe("IngestionPipeline — M3: daily-log importance only bumps for high-sig
   });
 });
 
+describe("IngestionPipeline — H-05: concurrent ingest() calls cannot both write", () => {
+  it("writes an identical event once when two ingest() calls overlap", async () => {
+    const sharedContent = "Concurrent health check body that must be written exactly once.";
+    const pipeline = new IngestionPipeline({
+      memoriesDir,
+      // Async search is the window where the second call used to check the
+      // dedup map before the first call recorded the hash.
+      searchMemories: async () => {
+        await Promise.resolve();
+        return [];
+      },
+    });
+    const event = ev({ id: "conc-1", content: sharedContent });
+    const [r1, r2] = await Promise.all([
+      pipeline.ingest([event]),
+      pipeline.ingest([{ ...event, id: "conc-2" }]),
+    ]);
+    expect(r1.written + r2.written).toBe(1);
+    expect(r1.deduplicated + r2.deduplicated).toBe(1);
+    const daily = fs.readFileSync(todayDailyPath(), "utf-8");
+    expect(daily.split(sharedContent).length - 1).toBe(1);
+  });
+});
+
 describe("IngestionPipeline — an unparsable timestamp (2026-09 re-review)", () => {
   it("still writes the event, labelled with the ingest time", async () => {
     // utcTimeLabel threw on an Invalid Date, so the event failed every ingest

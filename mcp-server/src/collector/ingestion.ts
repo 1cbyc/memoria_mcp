@@ -122,10 +122,27 @@ export class IngestionPipeline {
     this.loadDedupState();
   }
 
+  /** Serializes ingest() calls (H-05): the dedup hash is checked in stage 3
+   *  but only recorded after the write, so two overlapping calls could both
+   *  pass the check and both write. All callers share this one pipeline
+   *  instance (daemon, memory_ingest, /ingest), so chaining here closes
+   *  the race for every caller. */
+  private ingestChain: Promise<void> = Promise.resolve();
+
   /**
-   * Process a batch of events through the full pipeline.
+   * Process a batch of events through the full pipeline. Calls are
+   * serialized in arrival order; a failed batch does not jam the queue.
    */
   async ingest(events: RawEvent[]): Promise<IngestionResult> {
+    const run = this.ingestChain.then(() => this.doIngest(events));
+    this.ingestChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async doIngest(events: RawEvent[]): Promise<IngestionResult> {
     const result: IngestionResult = {
       processed: events.length,
       written: 0,

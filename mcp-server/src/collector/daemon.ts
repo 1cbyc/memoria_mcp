@@ -60,6 +60,12 @@ export class CollectorDaemon {
   private ingestionTimer: ReturnType<typeof setInterval> | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  /** The currently running ingestion cycle, if any — a cycle slower than
+   *  the interval must not overlap the next one, or both fetch and process
+   *  the identical unsynced batch (H-04). Tracked as a promise so stop()
+   *  can await quiescence before its final flush instead of returning
+   *  while a cycle is still writing. */
+  private ingestionPromise: Promise<void> | null = null;
   private lastBackpressureLog = 0;
   private onIngest?: (events: RawEvent[]) => Promise<IngestionResult | void>;
 
@@ -152,8 +158,18 @@ export class CollectorDaemon {
       this.cleanupTimer = null;
     }
 
-    // Final ingestion flush
+    // Final ingestion flush. runIngestion() joins an in-flight cycle
+    // rather than starting a second one, so when a cycle was running the
+    // first await only reaches quiescence and a second, fresh cycle
+    // flushes whatever its batch did not cover. With nothing in flight
+    // the first await IS the flush — running another would re-fetch
+    // errored rows and count a second failed attempt against them
+    // during shutdown, dead-lettering some a cycle early.
+    const joinedInFlight = this.ingestionPromise !== null;
     await this.runIngestion();
+    if (joinedInFlight) {
+      await this.runIngestion();
+    }
 
     // Save registry checkpoints
     this.registry.saveCheckpoints();
@@ -297,15 +313,34 @@ export class CollectorDaemon {
 
   // ── Ingestion ──────────────────────────────────────────────
 
-  /** Run one ingestion cycle now. Public so tests and operators can drive a
-   *  cycle deterministically; the interval timer calls this too. */
+  /** Run one ingestion cycle now, or join the cycle already in flight
+   *  (no fresh cycle is started in that case). Public so tests and
+   *  operators can drive a cycle deterministically; the interval timer
+   *  calls this too. */
   async runIngestionOnce(): Promise<void> {
     return this.runIngestion();
   }
 
-  private async runIngestion(): Promise<void> {
-    if (!this.onIngest) return;
+  private runIngestion(): Promise<void> {
+    if (!this.onIngest) return Promise.resolve();
+    // Join a cycle that is already running instead of starting a second
+    // one: the buffer rows are not claimed at fetch time, so an
+    // overlapping cycle would re-fetch and re-process the same batch
+    // (H-04). Callers that need a fresh cycle (stop's final flush) call
+    // again after the joined promise settles.
+    if (this.ingestionPromise) return this.ingestionPromise;
+    this.ingestionPromise = (async () => {
+      try {
+        await this.doRunIngestion();
+      } finally {
+        this.ingestionPromise = null;
+      }
+    })();
+    return this.ingestionPromise;
+  }
 
+  private async doRunIngestion(): Promise<void> {
+    if (!this.onIngest) return;
     try {
       // Per-source-fair fetch: one backlogged/deferred source cannot occupy the
       // whole batch and starve the others.
@@ -366,7 +401,11 @@ export class CollectorDaemon {
           `\n`,
       );
     } catch (err: any) {
-      process.stderr.write(`Memoria: ingestion error: ${err.message}\n`);
+      // A handler can throw a non-Error (even null); formatting the log
+      // line must not itself throw and reject the cycle wrapper.
+      process.stderr.write(
+        `Memoria: ingestion error: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
       // Events remain unsynced — will retry next cycle
     }
   }

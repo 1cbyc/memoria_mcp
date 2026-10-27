@@ -171,6 +171,87 @@ describe("CollectorDaemon", () => {
     expect(buffer.markSynced).toHaveBeenCalledWith([7]);
   });
 
+  it("does not run overlapping ingestion cycles (H-04)", async () => {
+    const rows = [{ rowid: 11, event: ev("e11") }];
+    const { daemon, buffer } = makeDaemon({
+      bufferOver: { fetchUnsyncedFair: vi.fn(() => rows) },
+    });
+    daemons.push(daemon);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const handler = vi.fn(async () => {
+      await gate;
+      return undefined; // legacy whole-batch sync
+    });
+    daemon.onIngestion(handler);
+    const first = daemon.runIngestionOnce();
+    const second = daemon.runIngestionOnce();
+    // Let both cycles reach the handler gate.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(handler).toHaveBeenCalledTimes(1);
+    release();
+    await Promise.all([first, second]);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(buffer.markSynced).toHaveBeenCalledTimes(1);
+    expect(buffer.markSynced).toHaveBeenCalledWith([11]);
+  });
+
+  it("stop() awaits an in-flight cycle, then flushes once more (H-04)", async () => {
+    const rows = [{ rowid: 12, event: ev("e12") }];
+    const { daemon, buffer } = makeDaemon({
+      bufferOver: { fetchUnsyncedFair: vi.fn(() => rows) },
+    });
+    daemons.push(daemon);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let first = true;
+    const handler = vi.fn(async () => {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return undefined; // legacy whole-batch sync
+    });
+    daemon.onIngestion(handler);
+    daemon.start();
+    const cycle = daemon.runIngestionOnce();
+    let stopped = false;
+    const stopping = daemon.stop().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(stopped).toBe(false);
+    release();
+    await Promise.all([cycle, stopping]);
+    expect(stopped).toBe(true);
+    // Joined cycle + one final flush cycle.
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(buffer.markSynced).toHaveBeenCalledWith([12]);
+  });
+
+  it("stop() flushes exactly once when no cycle is in flight (H-04)", async () => {
+    const rows = [{ rowid: 13, event: ev("e13") }];
+    const { daemon, buffer } = makeDaemon({
+      bufferOver: { fetchUnsyncedFair: vi.fn(() => rows) },
+    });
+    daemons.push(daemon);
+    const handler = vi.fn(async () => undefined);
+    daemon.onIngestion(handler);
+    daemon.start();
+    await daemon.stop();
+    // The single stop flush is the one cycle; a redundant second cycle
+    // would re-fetch errored rows and count another failed attempt.
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(buffer.markSynced).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps events unsynced when the ingestion handler throws", async () => {
     const rows = [{ rowid: 9, event: ev("e9") }];
     const { daemon, buffer } = makeDaemon({
