@@ -51,8 +51,9 @@ changes most likely to affect you:
   pinned versions, tool inputs (`days`, `batch_size`, query length, …)
   are bounded, and the provenance archive stores content encrypted rather
   than plaintext. Optional: `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true`
-  requires a dashboard login or the API key before `/authorize` issues a
-  code, and disables the `client_credentials` grant. docker-compose now
+  requires the API key, or a dashboard login plus a click on a consent
+  page, before `/authorize` issues a code, and disables the
+  `client_credentials` grant. docker-compose now
   also requires `MEMORIA_PUBLIC_URL` in `.env` (the `.env.example`
   localhost value covers purely local use).
 
@@ -231,7 +232,7 @@ For a durable cloud deployment see [`deploy/gcp/README.md`](deploy/gcp/README.md
 | `OPENAI_API_KEY` | *(none)* | API key for OpenAI embeddings. On its own it does **not** enable remote embeddings (see `MEMORIA_EMBEDDINGS`); when remote embeddings are enabled, memory content and search queries are sent to OpenAI. |
 | `MEMORIA_EMBEDDINGS` | `auto` | Embedding provider: `auto` (local MiniLM if installed, else hash — never remote), `openai` (explicit opt-in: sends content to OpenAI), `minilm` (local all-MiniLM-L6-v2, 384-dim, true semantic), or `hash` (n-gram lexical fallback, 384-dim). |
 | `MEMORIA_LOCK_TAKEOVER` | `false` | When `true`, a server takes over a store lock held by a live server on another host instead of waiting for it to stop. Only for deployments that overlap instances on one shared store by design, such as a Cloud Run rollout (set in `deploy/gcp/cloudbuild.yaml`). |
-| `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL` | `false` | When `true`, `/authorize` additionally requires a dashboard session (log in to the dashboard in the same browser first) or the API key, and the `client_credentials` grant is disabled, so a leaked OAuth client secret alone cannot obtain a token. |
+| `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL` | `false` | When `true`, `/authorize` additionally requires the operator: the API key, or a dashboard login in the same browser followed by a click on a consent page. The `client_credentials` grant is disabled. A leaked OAuth client secret alone cannot obtain a token. |
 | `MEMORIA_MODEL_CACHE` | *(package default)* | Directory for the cached MiniLM model. The Docker image pre-bakes it at `/app/mcp-server/.models`; the build fails if the download does, unless you pass `--build-arg PREFETCH_MODEL=false` (for OpenAI or hash embeddings, or offline builds). |
 | `MEMORIA_MODEL_OFFLINE` | `false` | Set to `true` to forbid model downloads (use only the cached/pre-baked model). |
 | `MEMORIA_OAUTH_CLIENT_SECRET` | *(required when `BIND_ALL=true`)* | OAuth client secret. Keep it distinct from the API key so rotating one doesn't rotate the other. Locally (loopback) it falls back to the API key with a warning. |

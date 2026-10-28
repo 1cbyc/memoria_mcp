@@ -12,7 +12,7 @@
  */
 
 import { Router } from "express";
-import type { Response } from "express";
+import type { NextFunction, Response } from "express";
 import { randomBytes, randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
@@ -337,6 +337,20 @@ export function createDashboardRouter(store: MemoryStore): Router {
 
   // ── API: Data sources ────────────────────────────────────
 
+  // Consent, credentials and what a source reads are the operator's to set:
+  // a dashboard session or the API key. An OAuth token issued to an MCP
+  // client authenticates /dashboard/api too, but a leaked or prompt-driven
+  // client must not grant itself consent or redirect stored credentials.
+  const operatorOnly = (_req: unknown, res: Response, next: NextFunction): void => {
+    if (res.locals.authKind === "oauth") {
+      res.status(403).json({
+        error: "Source settings and consent need a dashboard login or the API key.",
+      });
+      return;
+    }
+    next();
+  };
+
   router.get("/api/sources", async (_req, res) => {
     try {
       const { registry } = await getCollector(store);
@@ -347,7 +361,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.post("/api/sources/:id/agree", async (req, res) => {
+  router.post("/api/sources/:id/agree", operatorOnly, async (req, res) => {
     try {
       const { registry } = await getCollector(store);
       registry.recordAgreement(req.params.id);
@@ -357,7 +371,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.post("/api/sources/:id/enable", async (req, res) => {
+  router.post("/api/sources/:id/enable", operatorOnly, async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
       const result = await registry.enableSource(req.params.id, req.body, "user");
@@ -379,7 +393,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.post("/api/sources/:id/configure", async (req, res) => {
+  router.post("/api/sources/:id/configure", operatorOnly, async (req, res) => {
     try {
       const { registry } = await getCollector(store);
       const result = registry.updateSourceConfig(req.params.id, req.body, "user");
@@ -389,7 +403,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.post("/api/sources/custom", async (req, res) => {
+  router.post("/api/sources/custom", operatorOnly, async (req, res) => {
     try {
       const { registry } = await getCollector(store);
       const result = registry.addCustomSource(req.body);
@@ -399,7 +413,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.delete("/api/sources/custom/:id", async (req, res) => {
+  router.delete("/api/sources/custom/:id", operatorOnly, async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
       const result = await registry.removeCustomSource(req.params.id);

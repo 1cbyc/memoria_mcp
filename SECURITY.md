@@ -28,7 +28,7 @@ what they are.
 |------|---------|
 | **Network perimeter** | By default the HTTP server binds to `127.0.0.1`. Every shipped Docker / Cloud Run config sets `BIND_ALL=true` and the reference Cloud Run service is `--allow-unauthenticated` at the platform level — so in those deployments **the network is open and bearer auth is the only access control**. |
 | **Authentication** | Static bearer token (`MEMORIA_API_KEY`) on `/mcp`, `/ingest`, `/dashboard/api`; OAuth 2.1 (`authorization_code` + mandatory PKCE S256, `client_credentials`) minting 24 h tokens. Token comparison is timing-safe. Issued tokens and authorization codes are stored only as SHA-256 hashes, in an owner-only (`0600`) `tokens.sqlite`. |
-| **`/authorize` auto-approves** | There is **no consent screen and no user login**. `/authorize` issues a code to any *allow-listed* `redirect_uri` (`MEMORIA_ALLOWED_REDIRECT_HOSTS`, default claude.ai / claude.com / anthropic.com / localhost) as long as a PKCE challenge is present. The code is only useful to a client that can then present the **client secret** at `/token` — so secrecy of `MEMORIA_OAUTH_CLIENT_SECRET` is what gates access, not the authorize step. Keep it distinct from the API key; rotating one must not rotate the other. Set `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true` to additionally require a dashboard session or the API key before a code is issued; this also disables the `client_credentials` grant (which would otherwise mint a token from the secret alone), so a leaked client secret alone is not sufficient. |
+| **`/authorize` auto-approves** | There is **no consent screen and no user login**. `/authorize` issues a code to any *allow-listed* `redirect_uri` (`MEMORIA_ALLOWED_REDIRECT_HOSTS`, default claude.ai / claude.com / anthropic.com / localhost) as long as a PKCE challenge is present. The code is only useful to a client that can then present the **client secret** at `/token` — so secrecy of `MEMORIA_OAUTH_CLIENT_SECRET` is what gates access, not the authorize step. Keep it distinct from the API key; rotating one must not rotate the other. Set `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true` to additionally require the operator before a code is issued (the API key, or a dashboard login plus a click on a same-origin consent page); this also disables the `client_credentials` grant (which would otherwise mint a token from the secret alone), so a leaked client secret alone is not sufficient. |
 | **Dynamic registration** | `/register` (RFC 7591) returns the single static client. It does not create new principals. |
 | **Discovery metadata** | Derived from `MEMORIA_PUBLIC_URL` when set. **Set it** in any network-exposed deployment (the server refuses to start with `BIND_ALL=true` without it); otherwise the issuer URL is derived from request headers, which an attacker can influence. |
 | **Rate limits** | Per client IP: `/mcp` 30/min, auth endpoints 20/min, `/ingest` + `/dashboard/api` 120/min, global 300/min. Trusts one proxy hop for the client IP. |
@@ -57,7 +57,13 @@ server core. Concretely:
   the authenticated dashboard (Sources tab). The MCP tool surface cannot
   grant consent — an earlier design let the same agent that enables a
   source also record the agreement, so a prompt injection could consent
-  on your behalf. That action was removed from `memory_sources`.
+  on your behalf. That action was removed from `memory_sources`. Consent
+  is also bound to what you agreed to: through MCP an agent can change only
+  a source's schedule (poll interval, importance threshold), never its
+  hosts, credentials, paths or labels; removing a custom source, or
+  disabling a source in the dashboard, withdraws its consent; and the
+  dashboard's consent and settings routes refuse OAuth tokens issued to
+  MCP clients (a dashboard login or the API key is required).
 - **Privacy tiers** (`send` / `summarize` / `local-only`) are applied before
   content leaves the device, with value-pattern detection for secrets (Luhn,
   SSN, `sk-`/`AKIA`/JWT/PEM) and re-enforced at the write sink. Pattern

@@ -668,35 +668,61 @@ describe("sanitizeIngestMeta (review M6)", () => {
 
   it("/authorize refuses without approval when MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true (M5)", async () => {
     process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL = "true";
+    const q = {
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "st-1",
+    };
     try {
-      const r = await request(app).get("/authorize").query({
-        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
-        code_challenge: "abc",
-        code_challenge_method: "S256",
-      });
+      const r = await request(app).get("/authorize").query(q);
       expect(r.status).toBe(401);
-      const ok = await request(app).get("/authorize").set(auth).query({
-        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
-        code_challenge: "abc",
-        code_challenge_method: "S256",
-      });
+      // The API key approves programmatically.
+      const ok = await request(app).get("/authorize").set(auth).query(q);
       expect(ok.status).toBe(302);
-      // A dashboard login also satisfies the gate in a real browser via
-      // memoria_approve (Path=/authorize), captured at login above — no
-      // fresh login here, to stay under the auth rate limit.
+      // A dashboard login is NOT approval by itself: browsers send the Lax
+      // cookie on any cross-site navigation, so a page could otherwise
+      // trigger a code without the operator. It gets a consent page.
       expect(approveCookie).toMatch(/^memoria_approve=/);
-      // Actually present it to /authorize (distinct forwarded IP, so this
-      // call gets its own auth rate-limit bucket).
-      const viaCookie = await request(app)
+      const page = await request(app)
         .get("/authorize")
         .set("Cookie", approveCookie)
         .set("X-Forwarded-For", "10.9.8.7")
-        .query({
-          redirect_uri: "https://claude.ai/api/mcp/auth_callback",
-          code_challenge: "abc",
-          code_challenge_method: "S256",
-        });
-      expect(viaCookie.status).toBe(302);
+        .query(q);
+      expect(page.status).toBe(200);
+      expect(page.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+      expect(page.text).toContain("https://claude.ai");
+      const csrf = /name="csrf" value="([0-9a-f]+)"/.exec(page.text)![1];
+
+      const approve = (over: Record<string, string>, headers: Record<string, string> = {}) =>
+        request(app)
+          .post("/authorize")
+          .set("Cookie", approveCookie)
+          .set("X-Forwarded-For", "10.9.8.3")
+          .set(headers)
+          .type("form")
+          .send({ ...q, csrf, ...over });
+
+      // Cross-origin, missing or mismatched token, or tampered parameters fail.
+      expect((await approve({}, { Origin: "https://evil.example" })).status).toBe(403);
+      expect((await approve({ csrf: "" })).status).toBe(403);
+      expect((await approve({ redirect_uri: "https://claude.ai/other" })).status).toBe(403);
+      expect((await approve({ state: "attacker-state" })).status).toBe(403);
+      const noCookie = await request(app)
+        .post("/authorize")
+        .set("X-Forwarded-For", "10.9.8.2")
+        .type("form")
+        .send({ ...q, csrf });
+      expect(noCookie.status).toBe(403);
+
+      // The operator's click issues the code.
+      const done = await approve({});
+      expect(done.status).toBe(303);
+      const loc = new URL(done.headers.location);
+      expect(loc.origin + loc.pathname).toBe(q.redirect_uri);
+      expect(loc.searchParams.get("code")).toBeTruthy();
+      expect(loc.searchParams.get("state")).toBe("st-1");
+
       // ...and the approve cookie must NOT authorize /mcp.
       const mcp = await request(app)
         .post("/mcp")
@@ -709,6 +735,41 @@ describe("sanitizeIngestMeta (review M6)", () => {
     } finally {
       delete process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL;
     }
+  });
+
+  it("rejects a malformed PKCE challenge before storing anything", async () => {
+    const r = await request(app)
+      .get("/authorize")
+      .set("X-Forwarded-For", "10.9.8.1")
+      .query({
+        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+        code_challenge: "x".repeat(10_000),
+        code_challenge_method: "S256",
+      });
+    expect(r.status).toBe(400);
+  });
+
+  it("an OAuth token cannot change source consent or settings on the dashboard API", async () => {
+    const tok = await request(app)
+      .post("/token")
+      .set("X-Forwarded-For", "10.9.7.1")
+      .type("form")
+      .send({
+        grant_type: "client_credentials",
+        client_id: "memoria",
+        client_secret: OAUTH_SECRET,
+      });
+    const bearer = { Authorization: `Bearer ${tok.body.access_token}` };
+    // Reading still works with the token...
+    expect((await request(app).get("/dashboard/api/stats").set(bearer)).status).toBe(200);
+    // ...but consent and credentials are the operator's.
+    const agree = await request(app).post("/dashboard/api/sources/email/agree").set(bearer);
+    expect(agree.status).toBe(403);
+    const cfg = await request(app)
+      .post("/dashboard/api/sources/email/configure")
+      .set(bearer)
+      .send({ host: "attacker.example", secure: false });
+    expect(cfg.status).toBe(403);
   });
 
   it("the approval gate also closes client_credentials, and stops advertising it", async () => {

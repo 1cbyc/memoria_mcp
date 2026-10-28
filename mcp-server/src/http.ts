@@ -565,13 +565,30 @@ app.post("/register", (_req, res) => {
   });
 });
 
-// Authorization endpoint — auto-approves and redirects with code
-// (needed for authorization_code flow that claude.ai may use)
-app.get("/authorize", (req, res) => {
+// Authorization endpoint. Without the approval gate it auto-approves and
+// redirects with a code (the client secret, required at /token, is what
+// gates access). With MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true it requires
+// the operator: the API key (programmatic), or a dashboard login AND an
+// explicit click on a same-origin consent page. A login cookie alone is not
+// approval: it is sent on any cross-site navigation, so any page could
+// otherwise trigger a code for the attacker's own pending flow.
+
+interface AuthorizeRequest {
+  redirectUri: string;
+  state: string | undefined;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+}
+
+/** Validate authorize parameters; on failure the response has been sent. */
+function readAuthorizeRequest(
+  source: Record<string, unknown>,
+  res: express.Response,
+): AuthorizeRequest | null {
   // A repeated parameter (?state=a&state=b) arrives as an array; treat it as
   // absent rather than letting an array reach new URL() or a SQLite bind.
   const param = (name: string): string | undefined => {
-    const v = req.query[name];
+    const v = source[name];
     return typeof v === "string" ? v : undefined;
   };
   const redirectUri = param("redirect_uri");
@@ -581,7 +598,7 @@ app.get("/authorize", (req, res) => {
 
   if (!redirectUri) {
     res.status(400).json({ error: "missing redirect_uri" });
-    return;
+    return null;
   }
 
   // Only deliver codes to allowlisted redirect targets (prevents code exfil).
@@ -589,21 +606,128 @@ app.get("/authorize", (req, res) => {
     res
       .status(400)
       .json({ error: "invalid_request", error_description: "redirect_uri not allowed" });
-    return;
+    return null;
   }
 
-  // Optional human approval (review M5): with
-  // MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true, issuing a code additionally
-  // requires a logged-in dashboard session or the API key, so a leaked
-  // OAuth client secret alone is not sufficient to obtain a token.
+  // PKCE is mandatory and must be S256 — codes are useless without a verifier,
+  // which (combined with client auth at /token) closes the open-dispenser hole.
+  // A real S256 challenge is 43 base64url characters; bound it so an
+  // unauthenticated caller cannot store arbitrary blobs.
+  if (
+    !codeChallenge ||
+    codeChallengeMethod !== "S256" ||
+    !/^[A-Za-z0-9_-]{43,128}$/.test(codeChallenge)
+  ) {
+    res.status(400).json({
+      error: "invalid_request",
+      error_description: "code_challenge with code_challenge_method=S256 is required",
+    });
+    return null;
+  }
+  if (state !== undefined && state.length > 1024) {
+    res.status(400).json({ error: "invalid_request", error_description: "state too long" });
+    return null;
+  }
+  return { redirectUri, state, codeChallenge, codeChallengeMethod };
+}
+
+function issueAuthorizationCode(
+  res: express.Response,
+  ar: AuthorizeRequest,
+  status: 302 | 303 = 302,
+): void {
+  // Generate an authorization code and store it with the PKCE challenge (persisted)
+  const code = randomUUID();
+  codeOps.set(code, {
+    redirectUri: ar.redirectUri,
+    codeChallenge: ar.codeChallenge,
+    codeChallengeMethod: ar.codeChallengeMethod,
+    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
+  });
+
+  const url = new URL(ar.redirectUri);
+  url.searchParams.set("code", code);
+  if (ar.state) url.searchParams.set("state", ar.state);
+  res.redirect(status, url.toString());
+}
+
+function approvalSessionToken(req: express.Request): string | null {
+  const token = parseCookies(req.headers.cookie)["memoria_approve"];
+  return token && hasValidDashboardSession(req, "memoria_approve") ? token : null;
+}
+
+function hasApiKeyBearer(req: express.Request): boolean {
+  const bearer = req.headers.authorization?.startsWith("Bearer ")
+    ? req.headers.authorization.slice(7)
+    : "";
+  return !!bearer && !!API_KEY && safeEqual(bearer, API_KEY);
+}
+
+/** Binds a consent form to the session and to exactly these parameters. */
+function consentCsrf(sessionToken: string, ar: AuthorizeRequest): string {
+  return createHash("sha256")
+    .update(
+      ["memoria-consent", sessionToken, ar.redirectUri, ar.codeChallenge, ar.state ?? ""].join(
+        "\n",
+      ),
+    )
+    .digest("hex");
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderConsentPage(res: express.Response, ar: AuthorizeRequest, csrf: string): void {
+  const target = new URL(ar.redirectUri);
+  const hidden = (name: string, value: string) =>
+    `<input type="hidden" name="${name}" value="${escapeHtml(value)}">`;
+  // form-action must allow the redirect target too: Chrome applies it to the
+  // redirect that follows the form submission.
+  res
+    .status(200)
+    .set({
+      "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${target.origin}; frame-ancestors 'none'; base-uri 'none'`,
+      "X-Frame-Options": "DENY",
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+    })
+    .type("html").send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize access to Memoria</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem}code{word-break:break-all}button{font:inherit;padding:.5rem 1.25rem}</style>
+</head><body>
+<h1>Authorize access to Memoria?</h1>
+<p>An application wants full access to this Memoria server (read and write every memory). The authorization will be sent to:</p>
+<p><code>${escapeHtml(target.origin)}</code></p>
+<p>Approve only if you started this connection yourself just now.</p>
+<form method="post" action="/authorize">
+${hidden("redirect_uri", ar.redirectUri)}
+${hidden("code_challenge", ar.codeChallenge)}
+${hidden("code_challenge_method", ar.codeChallengeMethod)}
+${ar.state !== undefined ? hidden("state", ar.state) : ""}
+${hidden("csrf", csrf)}
+<button type="submit">Approve</button>
+</form>
+</body></html>`);
+}
+
+app.get("/authorize", (req, res) => {
+  const ar = readAuthorizeRequest(req.query as Record<string, unknown>, res);
+  if (!ar) return;
+
   if (approvalRequired()) {
-    const bearer = req.headers.authorization?.startsWith("Bearer ")
-      ? req.headers.authorization.slice(7)
-      : "";
-    if (
-      !hasValidDashboardSession(req, "memoria_approve") &&
-      !(bearer && API_KEY && safeEqual(bearer, API_KEY))
-    ) {
+    if (hasApiKeyBearer(req)) {
+      issueAuthorizationCode(res, ar);
+      return;
+    }
+    const session = approvalSessionToken(req);
+    if (!session) {
       res.status(401).json({
         error: "access_denied",
         error_description:
@@ -611,31 +735,37 @@ app.get("/authorize", (req, res) => {
       });
       return;
     }
-  }
-
-  // PKCE is mandatory and must be S256 — codes are useless without a verifier,
-  // which (combined with client auth at /token) closes the open-dispenser hole.
-  if (!codeChallenge || codeChallengeMethod !== "S256") {
-    res.status(400).json({
-      error: "invalid_request",
-      error_description: "code_challenge with code_challenge_method=S256 is required",
-    });
+    renderConsentPage(res, ar, consentCsrf(session, ar));
     return;
   }
 
-  // Generate an authorization code and store it with the PKCE challenge (persisted)
-  const code = randomUUID();
-  codeOps.set(code, {
-    redirectUri,
-    codeChallenge,
-    codeChallengeMethod,
-    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
-  });
+  issueAuthorizationCode(res, ar);
+});
 
-  const url = new URL(redirectUri);
-  url.searchParams.set("code", code);
-  if (state) url.searchParams.set("state", state);
-  res.redirect(url.toString());
+// The consent page's Approve button. The memoria_approve cookie is
+// SameSite=Lax, which browsers withhold from cross-site POSTs; the Origin
+// check and the session-bound CSRF token make that independent of browser
+// behaviour.
+app.post("/authorize", (req, res) => {
+  if (!approvalRequired()) {
+    res.status(405).json({ error: "invalid_request" });
+    return;
+  }
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== new URL(getBaseUrl(req)).origin) {
+    res.status(403).json({ error: "access_denied", error_description: "cross-origin approval" });
+    return;
+  }
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const ar = readAuthorizeRequest(body, res);
+  if (!ar) return;
+  const session = approvalSessionToken(req);
+  const csrf = typeof body.csrf === "string" ? body.csrf : "";
+  if (!session || !csrf || !safeEqual(csrf, consentCsrf(session, ar))) {
+    res.status(403).json({ error: "access_denied", error_description: "approval not verified" });
+    return;
+  }
+  issueAuthorizationCode(res, ar, 303);
 });
 
 // ─── Dashboard browser sessions (httpOnly cookie) ───────────
@@ -726,6 +856,7 @@ function authenticate(
     const reqPath = req.originalUrl.split("?")[0];
     const onDashboard = reqPath === "/dashboard" || reqPath.startsWith("/dashboard/");
     if (onDashboard && hasValidDashboardSession(req, "memoria_session")) {
+      res.locals.authKind = "session";
       next();
       return;
     }
@@ -760,7 +891,10 @@ function authenticate(
         });
       return;
     }
-    // Valid OAuth token
+    // Valid OAuth token. Recorded so operator-only dashboard routes (source
+    // consent, credentials) can refuse it: a token issued to an MCP client
+    // is not the operator.
+    res.locals.authKind = "oauth";
     next();
     return;
   }
@@ -781,6 +915,7 @@ function authenticate(
     return;
   }
 
+  res.locals.authKind = "apikey";
   next();
 }
 
@@ -933,9 +1068,9 @@ app.post("/dashboard/login", authLimiter, express.json(), (req, res) => {
     // SameSite=Lax, not Strict: the OAuth flow reaches /authorize by a
     // top-level navigation from claude.ai, and browsers withhold Strict
     // cookies on cross-site navigations, so a Strict cookie could never
-    // satisfy the gate. Lax is still withheld from cross-site subresource
-    // and POST requests, and /authorize can only deliver a code to an
-    // allow-listed redirect_uri. Neither cookie is honoured on /mcp or
+    // satisfy the gate. Because Lax IS sent on any cross-site GET, the
+    // cookie only unlocks a consent page; the code is issued by its
+    // same-origin, CSRF-bound POST. Neither cookie is honoured on /mcp or
     // /ingest (see authenticate()).
     `memoria_approve=${token}; Path=/authorize; SameSite=Lax; ${attrs}`,
   ]);

