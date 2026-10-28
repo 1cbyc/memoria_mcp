@@ -1669,29 +1669,48 @@ export function rebuildMarkdownIndex(): string {
 const FUSED_SIDECAR = ".fused-events.json";
 const FUSED_WINDOW_MS = 3 * 24 * 3600 * 1000;
 
-/**
- * Write fused activities to today's daily log, skipping any whose events
- * were all fused already. memory_fuse fuses unsynced events that the daemon
- * later ingests and fuses again, so the same activity was written twice.
- * Returns the activities written.
- */
-export function writeFusedActivities(activities: FusedActivity[]): FusedActivity[] {
-  if (activities.length === 0) return [];
-  const sidecar = path.join(DATA_DIR, FUSED_SIDECAR);
+function fusedEventKey(e: { source: string; id: string }): string {
+  return createHash("sha256").update(`${e.source}:${e.id}`).digest("hex").slice(0, 24);
+}
+
+function loadFusedEvents(): Record<string, number> {
   const now = Date.now();
   let seen: Record<string, number> = {};
   try {
-    seen = JSON.parse(fs.readFileSync(sidecar, "utf-8")) as Record<string, number>;
+    seen = JSON.parse(fs.readFileSync(path.join(DATA_DIR, FUSED_SIDECAR), "utf-8")) as Record<
+      string,
+      number
+    >;
   } catch {
     // none yet, or unreadable: start fresh
   }
   for (const [k, t] of Object.entries(seen)) {
     if (typeof t !== "number" || now - t > FUSED_WINDOW_MS) delete seen[k];
   }
-  const keyOf = (e: { source: string; id: string }) =>
-    createHash("sha256").update(`${e.source}:${e.id}`).digest("hex").slice(0, 24);
+  return seen;
+}
 
-  const fresh = activities.filter((a) => a.sourceEvents.some((e) => !(keyOf(e) in seen)));
+/**
+ * The events not yet part of a written fused activity. Fusion runs over
+ * these only: memory_fuse fuses unsynced events that the daemon later
+ * ingests and fuses again (with its own window), so clusters overlapped
+ * and the shared events were written into a second activity.
+ */
+export function unfusedEvents<T extends { source: string; id: string }>(events: T[]): T[] {
+  const seen = loadFusedEvents();
+  return events.filter((e) => !(fusedEventKey(e) in seen));
+}
+
+/**
+ * Write fused activities to today's daily log and record their events as
+ * fused (3-day window). An activity made only of already-fused events is
+ * skipped. Returns the activities written.
+ */
+export function writeFusedActivities(activities: FusedActivity[]): FusedActivity[] {
+  if (activities.length === 0) return [];
+  const seen = loadFusedEvents();
+  const now = Date.now();
+  const fresh = activities.filter((a) => a.sourceEvents.some((e) => !(fusedEventKey(e) in seen)));
   if (fresh.length > 0) {
     const today = new Date().toISOString().slice(0, 10);
     const dailyDir = path.join(MEMORIES_DIR, "daily");
@@ -1702,12 +1721,12 @@ export function writeFusedActivities(activities: FusedActivity[]): FusedActivity
     for (const activity of fresh) {
       const entry = formatFusedActivity(activity);
       createOrAppend(dailyFile, collectorDailyHeader(today) + entry, `\n${entry}`);
-      for (const e of activity.sourceEvents) seen[keyOf(e)] = now;
+      for (const e of activity.sourceEvents) seen[fusedEventKey(e)] = now;
     }
   }
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    writeFileAtomic(sidecar, JSON.stringify(seen));
+    writeFileAtomic(path.join(DATA_DIR, FUSED_SIDECAR), JSON.stringify(seen));
   } catch {
     // best effort: worst case a later run writes an activity twice
   }
@@ -1793,7 +1812,7 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
         .filter((o) => o.outcome === "written")
         .map((o) => `${o.source}:${o.id}`),
     );
-    const fusable = events.filter((e) => written.has(`${e.source}:${e.id}`));
+    const fusable = unfusedEvents(events.filter((e) => written.has(`${e.source}:${e.id}`)));
     if (fusion && fusable.length >= 2) {
       try {
         writeFusedActivities(fusion.fuse(fusable));
@@ -2090,7 +2109,7 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
         windowMs: window_minutes * 60_000,
       });
 
-      const activities = writeFusedActivities(fusionEngine.fuse(recentEvents));
+      const activities = writeFusedActivities(fusionEngine.fuse(unfusedEvents(recentEvents)));
 
       if (activities.length === 0) {
         return {

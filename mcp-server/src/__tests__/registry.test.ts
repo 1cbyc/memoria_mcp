@@ -398,14 +398,24 @@ describe("custom sources emit only new records (review 2026-10)", () => {
 
   async function watcher(file: string, format: "lines" | "json" = "lines") {
     const { CustomAdapter } = await import("../collector/adapters/custom.js");
-    const a = new CustomAdapter(def({ id: "w", watchPath: file, fileFormat: format }), {
-      dataDir,
-    });
+    const a = new CustomAdapter(
+      def({
+        id: "w",
+        watchPath: file,
+        fileFormat: format,
+        fieldMap: { id: "id", content: "content" },
+      }),
+      { dataDir },
+    );
     await a.init({ enabled: true, pollIntervalSec: 60, importanceThreshold: 1, settings: {} });
     return a;
   }
+  // Strictly increasing mtimes: the watcher skips a file whose mtime has
+  // not moved past the last read.
+  let tick = 0;
   const bump = (file: string) => {
-    const t = new Date(Date.now() + Math.random() * 1000 + 1000);
+    tick += 1;
+    const t = new Date(Date.now() + tick * 2000);
     fs.utimesSync(file, t, t);
   };
 
@@ -431,6 +441,61 @@ describe("custom sources emit only new records (review 2026-10)", () => {
     const b = await watcher(file);
     b.setCheckpoint(a.getCheckpoint());
     expect(await b.poll()).toEqual([]);
+  });
+
+  it("a source past the tracking cap emits only appended records, not its oldest again", async () => {
+    const file = path.join(root, "big.txt");
+    const lines = Array.from({ length: 60_000 }, (_, i) => `record number ${i} decided`);
+    fs.writeFileSync(file, lines.join("\n") + "\n");
+    const a = await watcher(file);
+    expect(await a.poll()).toHaveLength(60_000);
+    fs.appendFileSync(file, "record number 60000 decided\n");
+    bump(file);
+    const next = await a.poll();
+    expect(next.map((e) => e.content)).toEqual(["record number 60000 decided"]);
+    // ...and across a restart, through the (capped) checkpoint.
+    const b = await watcher(file);
+    b.setCheckpoint(a.getCheckpoint());
+    fs.appendFileSync(file, "record number 60001 decided\n");
+    bump(file);
+    expect((await b.poll()).map((e) => e.content)).toEqual(["record number 60001 decided"]);
+  }, 30_000);
+
+  it("a skipped read does not use up an upgrade's baseline", async () => {
+    const file = path.join(root, "log.txt");
+    fs.writeFileSync(file, "Decided to migrate the queue to Redis\n");
+    const { CUSTOM_BASELINE } = await import("../collector/adapters/custom.js");
+    const a = await watcher(file);
+    a.setCheckpoint(CUSTOM_BASELINE);
+    // The file is briefly missing (rotated, say): no read happens.
+    fs.renameSync(file, file + ".tmp");
+    expect(await a.poll()).toEqual([]);
+    expect(a.getCheckpoint()).toBe(CUSTOM_BASELINE);
+    fs.renameSync(file + ".tmp", file);
+    bump(file);
+    expect(await a.poll()).toEqual([]); // the baseline read: records only
+    fs.appendFileSync(file, "Shipped the release on Friday\n");
+    bump(file);
+    expect((await a.poll()).map((e) => e.content)).toEqual(["Shipped the release on Friday"]);
+  });
+
+  it("a half-written JSON file (parse error) is not mistaken for an empty one", async () => {
+    const file = path.join(root, "data.json");
+    fs.writeFileSync(file, JSON.stringify([{ id: "a", content: "Decided to ship on Friday" }]));
+    const a = await watcher(file, "json");
+    expect(await a.poll()).toHaveLength(1);
+    fs.writeFileSync(file, '[{"id": "a", "content": "Decided'); // mid-write
+    bump(file);
+    expect(await a.poll()).toEqual([]);
+    fs.writeFileSync(
+      file,
+      JSON.stringify([
+        { id: "a", content: "Decided to ship on Friday" },
+        { id: "b", content: "Postmortem written for the outage" },
+      ]),
+    );
+    bump(file);
+    expect((await a.poll()).map((e) => e.content)).toEqual(["Postmortem written for the outage"]);
   });
 
   it("a source upgraded from 0.2.x records its existing file without re-emitting it", async () => {

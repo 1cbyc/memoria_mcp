@@ -397,13 +397,20 @@ describe("CalendarAdapter collection", () => {
     expect(await a.poll()).toEqual([]);
   });
 
-  it("upgrading from a modification-date cursor emits only what changed since it", async () => {
+  it("upgrading from a modification-date cursor skips only what it provably collected", async () => {
     const db = calendarDb();
-    addEvent(db, "Planning meeting old", 2, nowCore() - 86400);
-    addEvent(db, "Planning meeting new", 3, nowCore() - 60);
+    addEvent(db, "Planning meeting old", 2, nowCore() - 86400); // seen by v1
+    addEvent(db, "Planning meeting new", 3, nowCore() - 60); // after the cursor
+    addEvent(db, "Planning meeting undated", 4, null); // v1 could miss it
+    // Modified 30 days ago, 20 days before it entered the 7-day window: v1 missed it.
+    addEvent(db, "Planning offsite", 24 * 3, nowCore() - 86400 * 30);
     const a = calendarAdapter(db);
     a.setCheckpoint(new Date(Date.now() - 3600_000).toISOString()); // a v1 cursor
-    expect(titles(await a.poll())).toEqual(["Planning meeting new"]);
+    expect(titles(await a.poll())).toEqual([
+      "Planning meeting new",
+      "Planning meeting undated",
+      "Planning offsite",
+    ]);
     expect(a.getCheckpoint()).toMatch(/^v2:/);
     expect(await a.poll()).toEqual([]);
   });

@@ -247,3 +247,29 @@ describe("writeFusedActivities (review 2026-10)", () => {
     expect(log.match(/Fused standup A/g)).toHaveLength(1);
   });
 });
+
+describe("unfusedEvents (re-review 2026-10)", () => {
+  it("an overlapping cluster is not written again through its shared events", async () => {
+    const { writeFusedActivities, unfusedEvents } = await import("../tools.js");
+    const ev = (key: string) => ({ source: key.split(":")[0], id: key.split(":")[1] });
+    const activity = {
+      id: "x",
+      label: "Fused review C",
+      description: "fused activity",
+      startTime: "2026-10-28T10:00:00.000Z",
+      endTime: "2026-10-28T10:30:00.000Z",
+      sourceEvents: ["calendar:o1", "email:o2", "slack:o3"].map((k) => ({
+        ...ev(k),
+        content: "x",
+        timestamp: "2026-10-28T10:00:00.000Z",
+      })),
+      sourceCount: 3,
+      importance: 6,
+      tags: [],
+    };
+    writeFusedActivities([activity] as never);
+    // The daemon later sees two of those events plus a new one.
+    const next = unfusedEvents([ev("calendar:o1"), ev("email:o2"), ev("chat:o4")]);
+    expect(next).toEqual([ev("chat:o4")]); // one event left: nothing to fuse
+  });
+});

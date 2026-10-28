@@ -228,12 +228,13 @@ export class CustomAdapter implements SourceAdapter {
 
   // ── File watcher mode ──────────────────────────────────────
 
-  private pollFile(): RawEvent[] {
+  /** null when no read happened (unchanged, missing or oversized file). */
+  private pollFile(): RawEvent[] | null {
     const watchPath = this.definition.watchPath;
-    if (!watchPath || !fs.existsSync(watchPath)) return [];
+    if (!watchPath || !fs.existsSync(watchPath)) return null;
 
     const stat = fs.statSync(watchPath);
-    if (stat.mtimeMs <= this.lastModified) return []; // no change
+    if (stat.mtimeMs <= this.lastModified) return null; // no change
     this.lastModified = stat.mtimeMs;
 
     // Never read an unbounded file into memory on the single instance (L5).
@@ -243,7 +244,7 @@ export class CustomAdapter implements SourceAdapter {
         `Memoria custom adapter "${this.definition.id}": watch file is ${stat.size} bytes ` +
           `(cap ${MAX_WATCH_BYTES}); skipping this poll.\n`,
       );
-      return [];
+      return null;
     }
 
     const raw = fs.readFileSync(watchPath, "utf-8");
@@ -252,8 +253,9 @@ export class CustomAdapter implements SourceAdapter {
 
   // ── Shell command mode ─────────────────────────────────────
 
-  private pollCommand(): RawEvent[] {
-    if (!this.definition.command) return [];
+  /** null when no read happened (disabled, failed or empty command). */
+  private pollCommand(): RawEvent[] | null {
+    if (!this.definition.command) return null;
 
     // Defense in depth: refuse to execute unless explicitly opted in, even if a
     // shell_command definition was persisted before this guard existed.
@@ -262,14 +264,14 @@ export class CustomAdapter implements SourceAdapter {
         `Memoria custom adapter "${this.definition.id}": shell_command execution is disabled ` +
           `(set MEMORIA_ALLOW_SHELL_SOURCES=true to allow). Skipping.\n`,
       );
-      return [];
+      return null;
     }
 
     try {
       // Split command into executable + args to avoid shell injection
       const parts = this.definition.command.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
       const [cmd, ...args] = parts.map((p) => p.replace(/^"|"$/g, ""));
-      if (!cmd) return [];
+      if (!cmd) return null;
 
       const output = execFileSync(cmd, args, {
         encoding: "utf-8",
@@ -281,7 +283,7 @@ export class CustomAdapter implements SourceAdapter {
       process.stderr.write(
         `Memoria custom adapter "${this.definition.id}" command error: ${err.message}\n`,
       );
-      return [];
+      return null;
     }
   }
 
@@ -292,7 +294,7 @@ export class CustomAdapter implements SourceAdapter {
   /** Called by the HTTP server when a webhook POST arrives */
   pushWebhookEvent(body: unknown): void {
     const events = this.parseRawData(typeof body === "string" ? body : JSON.stringify(body));
-    this.webhookQueue.push(...events);
+    this.webhookQueue.push(...(events ?? []));
   }
 
   private drainWebhookQueue(): RawEvent[] {
@@ -303,7 +305,8 @@ export class CustomAdapter implements SourceAdapter {
 
   // ── Data parsing ───────────────────────────────────────────
 
-  private parseRawData(raw: string): RawEvent[] {
+  /** null on a parse error: a half-written file is not "no records". */
+  private parseRawData(raw: string): RawEvent[] | null {
     const format = this.definition.fileFormat ?? "json";
     const events: RawEvent[] = [];
 
@@ -358,6 +361,7 @@ export class CustomAdapter implements SourceAdapter {
       process.stderr.write(
         `Memoria custom adapter "${this.definition.id}" parse error: ${err.message}\n`,
       );
+      return null;
     }
 
     // Apply importance filter
@@ -433,25 +437,35 @@ export class CustomAdapter implements SourceAdapter {
     return contentHash(id).slice(0, 12);
   }
 
+  /** The previous read had more than MAX_TRACKED records; only its newest are known. */
+  private seenCapped = false;
+
   /**
-   * Keep the records the previous read did not have. Bounded: past
-   * MAX_TRACKED records only the newest (last read) are remembered, which
-   * for an append-only file are the ones that matter.
+   * Keep the records the previous read did not have. `null` means no read
+   * happened (unchanged, missing or oversized file, a failed or disabled
+   * command, a parse error): nothing is learned and nothing is reset, so a
+   * skipped read can neither forget what was collected nor use up an
+   * upgrade's baseline.
+   *
+   * Bounded: past MAX_TRACKED records only the newest are remembered. When
+   * the previous read was capped, records before the first remembered one
+   * in this read are older than that window (a log keeps its order) and are
+   * treated as collected, instead of all being emitted again.
    */
-  private onlyNew(events: RawEvent[]): RawEvent[] {
+  private onlyNew(events: RawEvent[] | null): RawEvent[] {
     const MAX_TRACKED = 50_000;
-    // Skipped reads (unchanged file, oversized file, command error) return
-    // [] without a read having happened; they must not reset the set.
-    if (events.length === 0 && this.seenIds !== null) return events;
+    if (events === null) return [];
     const previous = this.seenIds ?? new Set<string>();
-    const current = new Set<string>();
-    const fresh: RawEvent[] = [];
-    for (const e of events) {
-      const fp = CustomAdapter.fingerprint(String(e.id));
-      current.add(fp);
-      if (!previous.has(fp)) fresh.push(e);
+    const fps = events.map((e) => CustomAdapter.fingerprint(String(e.id)));
+    let firstNew = 0;
+    if (this.seenCapped) {
+      const firstKnown = fps.findIndex((fp) => previous.has(fp));
+      if (firstKnown > 0) firstNew = firstKnown;
     }
-    this.seenIds = current.size > MAX_TRACKED ? new Set([...current].slice(-MAX_TRACKED)) : current;
+    const current = new Set<string>(fps);
+    const fresh = events.filter((_, i) => i >= firstNew && !previous.has(fps[i]));
+    this.seenCapped = current.size > MAX_TRACKED;
+    this.seenIds = this.seenCapped ? new Set([...current].slice(-MAX_TRACKED)) : current;
     if (this.baselineOnly) {
       this.baselineOnly = false;
       return [];
@@ -461,15 +475,20 @@ export class CustomAdapter implements SourceAdapter {
 
   getCheckpoint(): string {
     if (this.seenIds === null) return this.baselineOnly ? CUSTOM_BASELINE : "";
-    return `v2:${[...this.seenIds].join("")}`;
+    return `${this.seenCapped ? "v2c:" : "v2:"}${[...this.seenIds].join("")}`;
   }
 
   setCheckpoint(cursor: string): void {
     this.checkpoint = cursor;
     this.seenIds = null;
+    this.seenCapped = cursor.startsWith("v2c:");
     this.baselineOnly = cursor === CUSTOM_BASELINE;
-    if (cursor.startsWith("v2:")) {
-      const packed = cursor.slice(3);
+    const packed = cursor.startsWith("v2:")
+      ? cursor.slice(3)
+      : cursor.startsWith("v2c:")
+        ? cursor.slice(4)
+        : null;
+    if (packed !== null) {
       const ids = new Set<string>();
       for (let i = 0; i + 12 <= packed.length; i += 12) ids.add(packed.slice(i, i + 12));
       this.seenIds = ids;

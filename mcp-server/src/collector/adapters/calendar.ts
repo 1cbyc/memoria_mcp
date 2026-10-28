@@ -137,10 +137,19 @@ export class CalendarAdapter implements SourceAdapter {
       const fingerprint = `${row.modified ?? ""}|${row.start_date}|${row.title ?? ""}`;
       seen[key] = fingerprint;
       if (previous[key] === fingerprint) continue;
-      // Upgrading from a modification-date cursor: what was modified before
-      // it was collected then; only record it.
+      // Upgrading from a modification-date cursor: record without emitting
+      // only what that cursor provably collected, i.e. an event last
+      // modified before the cursor while it was already inside the
+      // look-ahead window. Events with no modification date, and events
+      // modified while still beyond the window, are exactly what the old
+      // cursor could miss, so they are emitted (an event it did collect
+      // after all is caught by the buffer and ingestion dedup if recent).
       if (legacyCutoff !== null && Number.isFinite(legacyCutoff)) {
-        if (row.modified == null || row.modified < legacyCutoff) continue;
+        const provablySeen =
+          row.modified != null &&
+          row.modified < legacyCutoff &&
+          row.modified >= row.start_date - lookAhead * 86400;
+        if (provablySeen) continue;
       }
 
       if (!row.title) continue;
