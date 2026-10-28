@@ -1729,7 +1729,25 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
     return result;
   });
 
+  // Resume the sources left enabled before a restart, then start polling.
+  await registry.restoreEnabledSources();
   daemon.start();
+}
+
+/**
+ * Start the collector at server startup when it has been used before, so
+ * enabled sources resume collecting without waiting for a collector tool,
+ * the dashboard or /ingest to initialise it. A store that never used the
+ * collector has no config file, and starting it would create a master key
+ * for nothing.
+ */
+export async function resumeCollectorIfConfigured(store: MemoryStore): Promise<void> {
+  if (!fs.existsSync(path.join(DATA_DIR, "collector-config.enc"))) return;
+  try {
+    await ensureCollector(store);
+  } catch (err) {
+    process.stderr.write(`Memoria: collector did not start: ${(err as Error).message}\n`);
+  }
 }
 
 /**

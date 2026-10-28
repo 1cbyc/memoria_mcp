@@ -549,6 +549,42 @@ export class SourceRegistry {
   }
 
   /**
+   * Persist one active adapter's cursor (after its events reached the buffer).
+   */
+  saveCheckpoint(sourceId: string): void {
+    const adapter = this.activeAdapters.get(sourceId);
+    if (!adapter) return;
+    const cursor = adapter.getCheckpoint();
+    if (this.state.checkpoints[sourceId] === cursor) return;
+    this.state.checkpoints[sourceId] = cursor;
+    this.saveState();
+  }
+
+  /**
+   * Re-initialise every source the user left enabled, after a restart.
+   * Nothing did this before: the dashboard kept showing "Enabled" while no
+   * adapter ran, so collection silently stopped at every restart. A source
+   * whose consent is gone is switched off; one that fails to start keeps
+   * its enabled flag and shows the error, and is retried on the next start.
+   */
+  async restoreEnabledSources(): Promise<void> {
+    for (const [sourceId, config] of Object.entries(this.state.configs)) {
+      if (!config?.enabled || this.activeAdapters.has(sourceId)) continue;
+      if (!this.adapters.has(sourceId)) continue;
+      if (!this.hasAgreement(sourceId)) {
+        config.enabled = false;
+        this.saveState();
+        continue;
+      }
+      const result = await this.enableSource(sourceId);
+      if (!result.success) {
+        this.errors.set(sourceId, result.message);
+        process.stderr.write(`Memoria: could not resume source ${sourceId}: ${result.message}\n`);
+      }
+    }
+  }
+
+  /**
    * Save checkpoints for all active adapters.
    */
   saveCheckpoints(): void {

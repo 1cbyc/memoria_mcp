@@ -21,11 +21,20 @@ function ev(id: string, source = "src-a") {
 }
 
 function makeAdapter(over: Record<string, unknown> = {}) {
-  return {
+  const adapter: any = {
     info: { id: "src-a", defaultConfig: { pollIntervalSec: 10 } },
-    poll: vi.fn(async () => [ev("e1")]),
+    cursor: "c0",
+    poll: vi.fn(async () => {
+      adapter.cursor = "c1";
+      return [ev("e1")];
+    }),
+    getCheckpoint: () => adapter.cursor,
+    setCheckpoint: (c: string) => {
+      adapter.cursor = c;
+    },
     ...over,
   };
+  return adapter;
 }
 
 function makeDaemon(
@@ -38,6 +47,7 @@ function makeDaemon(
     getEffectiveConfig: () => ({ pollIntervalSec: 10 }),
     recordEvents: vi.fn(),
     saveCheckpoints: vi.fn(),
+    saveCheckpoint: vi.fn(),
   };
   const buffer: any = {
     unsyncedCount: () => 0,
@@ -113,6 +123,51 @@ describe("CollectorDaemon", () => {
     const calls = adapter.poll.mock.calls.length;
     await (daemon as any).pollSource("src-a");
     expect(adapter.poll.mock.calls.length).toBe(calls);
+    await daemon.stop();
+  });
+
+  it("persists the cursor once the polled events are in the buffer", async () => {
+    // Checkpoints used to be saved only on a clean shutdown, so a crash
+    // rewound every source to when it was enabled.
+    const { daemon, registry, adapter } = makeDaemon();
+    daemons.push(daemon);
+    daemon.start();
+    await vi.waitFor(() => expect(registry.saveCheckpoint).toHaveBeenCalledWith("src-a"));
+    expect(adapter.cursor).toBe("c1");
+    await daemon.stop();
+  });
+
+  it("restores the cursor when the poll fails after advancing it", async () => {
+    const adapter = makeAdapter();
+    adapter.poll = vi.fn(async () => {
+      adapter.cursor = "c-advanced";
+      throw new Error("connection dropped mid-fetch");
+    });
+    const { daemon, registry } = makeDaemon({ adapter });
+    daemons.push(daemon);
+    daemon.start();
+    await vi.waitFor(() =>
+      expect(daemon.getStatus().pollTimers[0].errors).toBeGreaterThanOrEqual(1),
+    );
+    expect(adapter.cursor).toBe("c0");
+    expect(registry.saveCheckpoint).not.toHaveBeenCalled();
+    await daemon.stop();
+  });
+
+  it("restores the cursor when the buffer write fails", async () => {
+    const { daemon, adapter } = makeDaemon({
+      bufferOver: {
+        pushBatch: vi.fn(() => {
+          throw new Error("disk full");
+        }),
+      },
+    });
+    daemons.push(daemon);
+    daemon.start();
+    await vi.waitFor(() =>
+      expect(daemon.getStatus().pollTimers[0].errors).toBeGreaterThanOrEqual(1),
+    );
+    expect(adapter.cursor).toBe("c0");
     await daemon.stop();
   });
 

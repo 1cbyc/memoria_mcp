@@ -273,6 +273,11 @@ export class CollectorDaemon {
     const adapter = this.registry.getActiveAdapters().get(sourceId);
     if (!adapter) return;
 
+    // Adapters advance their cursor while polling. Until the events are in
+    // the buffer that advance is a promise, not a fact: if the poll or the
+    // buffer write fails, put the cursor back so the same range is read
+    // again instead of being skipped for good.
+    const cursorBefore = adapter.getCheckpoint();
     try {
       const events = await adapter.poll();
 
@@ -289,11 +294,17 @@ export class CollectorDaemon {
         }
       }
 
+      // The events are durable; persist the cursor now. It used to be saved
+      // only on a clean shutdown, so a crash or forced exit rewound it to
+      // when the source was enabled and replayed weeks of history.
+      this.registry.saveCheckpoint(sourceId);
+
       // Reset error state on success
       pt.consecutiveErrors = 0;
       pt.backoffUntil = 0;
       pt.lastPoll = Date.now();
     } catch (err: any) {
+      adapter.setCheckpoint(cursorBefore);
       pt.consecutiveErrors++;
 
       // Exponential backoff with jitter

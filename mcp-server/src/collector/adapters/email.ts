@@ -41,23 +41,40 @@ export class EmailAdapter implements SourceAdapter {
   async init(config: AdapterConfig): Promise<void> {
     this.config = config;
 
-    const { host, port, secure, user, password } = config.settings as Record<string, any>;
+    const { host, user, password } = config.settings as Record<string, any>;
 
     if (!host || !user || !password) {
       throw new Error("Email adapter requires host, user, and password in settings.");
     }
 
+    await this.connect();
+  }
+
+  /**
+   * (Re)connect. imapflow does not reconnect on its own: once the server
+   * drops an idle connection the client stays unusable, and every later
+   * poll failed until the source was disabled and re-enabled.
+   */
+  private async connect(): Promise<void> {
+    const { host, port, secure, user, password } = this.config.settings as Record<string, any>;
+    if (this.client) {
+      const stale = this.client;
+      this.client = null;
+      await Promise.resolve(stale.logout?.()).catch(() => {});
+    }
     try {
       const { ImapFlow } = await importDependency<typeof import("imapflow")>("imapflow");
-      this.client = new ImapFlow({
+      const client = new ImapFlow({
         host,
         port: port ?? 993,
         secure: secure !== false,
         auth: { user, pass: password },
         logger: false,
       });
-
-      await this.client.connect();
+      // An 'error' event with no listener would crash the process.
+      client.on?.("error", () => {});
+      await client.connect();
+      this.client = client;
     } catch (err: any) {
       throw new Error(
         `Email connection failed: ${err.message}. ` +
@@ -68,26 +85,40 @@ export class EmailAdapter implements SourceAdapter {
   }
 
   async poll(): Promise<RawEvent[]> {
-    if (!this.client) return [];
+    if (!this.config) return [];
+    if (!this.client || this.client.usable === false) await this.connect();
 
     const mailbox = (this.config.settings?.mailbox as string) ?? "INBOX";
     const maxFetch = (this.config.settings?.maxFetch as number) ?? 50;
 
     const events: RawEvent[] = [];
 
+    // Errors propagate: the daemon backs off, records the error, and
+    // restores the cursor this poll advanced. Swallowing them here made a
+    // dead connection look like an empty mailbox forever.
     try {
       const lock = await this.client.getMailboxLock(mailbox);
 
       try {
-        // Fetch messages with UID greater than checkpoint
-        const query = this.checkpoint > 0 ? `${this.checkpoint + 1}:*` : `*`;
+        // Messages with a UID above the checkpoint. The range is only read
+        // as UIDs when `uid: true` is in the third (options) argument; in the
+        // query object it merely asks for the UID attribute, and the stored
+        // UID was matched against sequence numbers instead (a large UID
+        // matched nothing, or only the newest message). With no checkpoint,
+        // "*" is the newest message: collection starts from now rather than
+        // ingesting the whole mailbox.
+        const range = this.checkpoint > 0 ? `${this.checkpoint + 1}:*` : `*`;
 
-        for await (const message of this.client.fetch(query, {
-          uid: true,
-          envelope: true,
-          bodyStructure: true,
-          source: { maxBytes: 1024 }, // first 1KB of body only
-        })) {
+        for await (const message of this.client.fetch(
+          range,
+          {
+            uid: true,
+            envelope: true,
+            bodyStructure: true,
+            source: { maxBytes: 1024 }, // first 1KB of body only
+          },
+          { uid: true },
+        )) {
           if (message.uid <= this.checkpoint && this.checkpoint > 0) continue;
           this.checkpoint = Math.max(this.checkpoint, message.uid);
 
@@ -147,7 +178,9 @@ export class EmailAdapter implements SourceAdapter {
         lock.release();
       }
     } catch (err: any) {
-      process.stderr.write(`Memoria email poll error: ${err.message}\n`);
+      // Force a fresh connection next time; the daemon handles the error.
+      if (this.client && this.client.usable === false) this.client = null;
+      throw new Error(`email poll failed: ${err.message}`, { cause: err });
     }
 
     return events;

@@ -42,6 +42,7 @@ import {
   registerCollectorTools,
   destroyCollector,
   getCollectorPipeline,
+  resumeCollectorIfConfigured,
   SERVER_DESCRIPTION,
 } from "./tools.js";
 import { createDashboardRouter } from "./dashboard.js";
@@ -1151,6 +1152,8 @@ async function main(): Promise<void> {
   const host = process.env.BIND_ALL === "true" ? "0.0.0.0" : "127.0.0.1";
   httpServer = app.listen(PORT, host, () => {
     process.stderr.write(`Memoria HTTP server listening on http://${host}:${PORT}/mcp\n`);
+    // Resume enabled collector sources; errors are logged inside.
+    void resumeCollectorIfConfigured(store);
   });
 }
 

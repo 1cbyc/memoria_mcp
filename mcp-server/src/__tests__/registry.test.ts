@@ -233,3 +233,55 @@ describe("custom source consent is bound to the definition", () => {
     expect(reg.getActiveAdapters().get("custom-w")).toBeDefined();
   });
 });
+
+describe("enabled sources resume after a restart (review 2026-10)", () => {
+  beforeEach(() => {
+    process.env.MEMORIA_FILE_WATCHER_ROOTS = root;
+    fs.writeFileSync(path.join(root, "a.json"), "[]");
+  });
+
+  it("re-initialises a consented, enabled source in a new registry", async () => {
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+    expect((await reg.enableSource("custom-w", undefined, "user")).success).toBe(true);
+    await reg.destroy();
+
+    const after = new SourceRegistry(dataDir);
+    expect(after.getActiveAdapters().has("custom-w")).toBe(false);
+    await after.restoreEnabledSources();
+    expect(after.getActiveAdapters().has("custom-w")).toBe(true);
+    await after.destroy();
+  });
+
+  it("switches off an enabled source whose consent is gone", async () => {
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+    expect((await reg.enableSource("custom-w", undefined, "user")).success).toBe(true);
+    reg.revokeAgreement("custom-w");
+    await reg.destroy();
+
+    const after = new SourceRegistry(dataDir);
+    await after.restoreEnabledSources();
+    expect(after.getActiveAdapters().has("custom-w")).toBe(false);
+    expect(after.listSources().find((s) => s.id === "custom-w")!.enabled).toBe(false);
+    await after.destroy();
+  });
+
+  it("persists one source's cursor on demand", async () => {
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+    await reg.enableSource("custom-w", undefined, "user");
+    const adapter = reg.getActiveAdapters().get("custom-w")!;
+    adapter.setCheckpoint("cursor-42");
+    reg.saveCheckpoint("custom-w");
+    const reread = new SourceRegistry(dataDir);
+    expect((reread as any).state.checkpoints["custom-w"]).toBe("cursor-42");
+    await reg.destroy();
+  });
+});

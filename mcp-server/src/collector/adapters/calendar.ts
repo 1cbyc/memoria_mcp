@@ -52,11 +52,10 @@ export class CalendarAdapter implements SourceAdapter {
 
     try {
       const Database = (await import("better-sqlite3")).default;
+      // No checkpoint is set here: the first poll returns the whole window
+      // (see poll). Setting it to "now" made the first poll return only
+      // events modified after enabling, contradicting that design.
       this.db = new Database(cachePath, { readonly: true });
-
-      if (!this.checkpoint) {
-        this.checkpoint = new Date().toISOString();
-      }
     } catch (err: any) {
       throw new Error(
         `Cannot open Calendar database: ${err.message}. ` +
@@ -81,41 +80,40 @@ export class CalendarAdapter implements SourceAdapter {
     const endCoreData = endDate.getTime() / 1000 - CORE_DATA_EPOCH;
 
     // Incremental filter. On the first poll (no checkpoint) this is null, so the
-    // WHERE clause `(? IS NULL OR ZMODIFIEDDATE > ?)` returns every event in the
-    // window — including never-modified ones whose ZMODIFIEDDATE is NULL (which
-    // a bare `ZMODIFIEDDATE > x` would drop). Afterwards it returns only events
-    // modified since the last poll. We checkpoint to poll-START (`now`, captured
-    // above) below: conservative, so an event modified during the query is
-    // simply re-seen next poll and deduped — never missed.
+    // WHERE clause `(? IS NULL OR ZMODIFIEDDATE >= ?)` returns every event in
+    // the window — including never-modified ones whose ZMODIFIEDDATE is NULL
+    // (which a bare comparison would drop). Afterwards it returns only events
+    // modified since the cursor. `>=` re-sees an event modified exactly at
+    // the cursor; the buffer dedupes it by id, which beats missing it.
     const modifiedSinceCoreData = this.checkpoint
       ? new Date(this.checkpoint).getTime() / 1000 - CORE_DATA_EPOCH
       : null;
 
-    let rows: any[];
-    try {
-      rows = this.db
-        .prepare(
-          `SELECT
-            ci.ZSTARTDATE as start_date,
-            ci.ZENDDATE as end_date,
-            ci.ZSUMMARY as title,
-            ci.ZLOCATION as location,
-            ci.ZNOTES as notes,
-            ci.ZALLDAY as all_day,
-            ci.ZMODIFIEDDATE as modified,
-            c.ZTITLE as calendar_name
-          FROM ZCALENDARITEM ci
-          LEFT JOIN ZCALENDAR c ON ci.ZCALENDAR = c.Z_PK
-          WHERE ci.ZSTARTDATE BETWEEN ? AND ?
-            AND (? IS NULL OR ci.ZMODIFIEDDATE > ?)
-          ORDER BY ci.ZSTARTDATE ASC
-          LIMIT 200`,
-        )
-        .all(startCoreData, endCoreData, modifiedSinceCoreData, modifiedSinceCoreData) as any[];
-    } catch {
-      // Table structure might differ between macOS versions
-      return [];
-    }
+    // Oldest modification first, so a page cut off by the LIMIT ends at a
+    // known point and the next poll resumes there. Ordered by start date
+    // with the cursor jumping to "now", every row past the 200th was lost.
+    // A query error (the schema differs between macOS versions) propagates
+    // to the daemon instead of looking like an empty calendar.
+    const LIMIT = 200;
+    const rows = this.db
+      .prepare(
+        `SELECT
+          ci.ZSTARTDATE as start_date,
+          ci.ZENDDATE as end_date,
+          ci.ZSUMMARY as title,
+          ci.ZLOCATION as location,
+          ci.ZNOTES as notes,
+          ci.ZALLDAY as all_day,
+          ci.ZMODIFIEDDATE as modified,
+          c.ZTITLE as calendar_name
+        FROM ZCALENDARITEM ci
+        LEFT JOIN ZCALENDAR c ON ci.ZCALENDAR = c.Z_PK
+        WHERE ci.ZSTARTDATE BETWEEN ? AND ?
+          AND (? IS NULL OR ci.ZMODIFIEDDATE >= ?)
+        ORDER BY ci.ZMODIFIEDDATE ASC, ci.ZSTARTDATE ASC
+        LIMIT ${LIMIT}`,
+      )
+      .all(startCoreData, endCoreData, modifiedSinceCoreData, modifiedSinceCoreData) as any[];
 
     const events: RawEvent[] = [];
 
@@ -162,7 +160,27 @@ export class CalendarAdapter implements SourceAdapter {
       });
     }
 
-    this.checkpoint = now.toISOString();
+    // A full page: resume after the last modification actually returned.
+    // Otherwise everything modified before this poll started has been seen,
+    // so the cursor moves to poll start (an event modified during the query
+    // is re-seen next time and deduped, never missed). A full page that did
+    // not advance (200+ events sharing one timestamp) would repeat forever,
+    // so it moves on and says what it skipped.
+    const last = rows[rows.length - 1];
+    const lastModifiedMs =
+      last?.modified != null ? (last.modified + CORE_DATA_EPOCH) * 1000 : undefined;
+    const previousMs = this.checkpoint ? new Date(this.checkpoint).getTime() : -Infinity;
+    if (rows.length >= LIMIT && lastModifiedMs !== undefined && lastModifiedMs > previousMs) {
+      this.checkpoint = new Date(lastModifiedMs).toISOString();
+    } else {
+      if (rows.length >= LIMIT) {
+        process.stderr.write(
+          `Memoria calendar: more than ${LIMIT} events share one modification time; ` +
+            "some were skipped.\n",
+        );
+      }
+      this.checkpoint = now.toISOString();
+    }
     return events;
   }
 

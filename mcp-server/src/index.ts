@@ -18,6 +18,7 @@ import {
   registerTools,
   registerCollectorTools,
   destroyCollector,
+  resumeCollectorIfConfigured,
   SERVER_DESCRIPTION,
 } from "./tools.js";
 
@@ -57,6 +58,10 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // After connecting, so a slow source (an IMAP login) never delays the
+  // client's handshake. Errors are logged inside.
+  void resumeCollectorIfConfigured(store);
 }
 
 main().catch((err) => {
