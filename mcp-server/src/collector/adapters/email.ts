@@ -114,14 +114,30 @@ export class EmailAdapter implements SourceAdapter {
         }
         if (validity) this.uidValidity = validity;
 
-        // Messages with a UID above the checkpoint. The range is only read
-        // as UIDs when `uid: true` is in the third (options) argument; in the
-        // query object it merely asks for the UID attribute, and the stored
-        // UID was matched against sequence numbers instead (a large UID
-        // matched nothing, or only the newest message). With no checkpoint,
-        // "*" is the newest message: collection starts from now rather than
-        // ingesting the whole mailbox.
-        const range = this.checkpoint > 0 ? `${this.checkpoint + 1}:*` : `*`;
+        // Messages with a UID above the checkpoint. Ranges are only read as
+        // UIDs when `uid: true` is in the options argument; in the fetch
+        // query object it merely asks for the UID attribute. With no
+        // checkpoint, "*" is the newest message: collection starts from now
+        // rather than ingesting the whole mailbox.
+        //
+        // The new UIDs are found with UID SEARCH first and at most maxFetch
+        // of them fetched. Fetching "N:*" directly downloaded headers and
+        // 1KB of every newer message on each poll, however far behind the
+        // cursor was, only to stop after maxFetch events.
+        let range = "*";
+        if (this.checkpoint > 0) {
+          const found = (await this.client.search(
+            { uid: `${this.checkpoint + 1}:*` },
+            { uid: true },
+          )) as number[] | false | undefined;
+          // "N:*" also matches the newest message when nothing is newer.
+          const fresh = (found || [])
+            .filter((uid) => uid > this.checkpoint)
+            .sort((a, b) => a - b)
+            .slice(0, maxFetch);
+          if (fresh.length === 0) return events;
+          range = fresh.join(",");
+        }
 
         for await (const message of this.client.fetch(
           range,

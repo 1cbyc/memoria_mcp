@@ -18,6 +18,7 @@ const imap = {
   instances: [] as any[],
   messages: [] as FakeMessage[],
   fetchCalls: [] as Array<{ range: string; query: any; options: any }>,
+  searchCalls: [] as Array<{ query: any; options: any }>,
   failLock: false,
   uidValidity: 1,
 };
@@ -42,20 +43,28 @@ class FakeImapFlow {
     this.mailbox = { uidValidity: imap.uidValidity };
     return { release() {} };
   }
-  // Mirrors IMAP: "N:*" by UID when options.uid, else by sequence number;
-  // "*" alone is the newest message.
+  // Mirrors IMAP: "N:*" by UID when options.uid, else by sequence number
+  // ("*" always matches the newest); "a,b,c" is an explicit set.
+  select(range: string, key: "uid" | "seq") {
+    const sorted = [...imap.messages].sort((a, b) => a[key] - b[key]);
+    if (range === "*") return sorted.slice(-1);
+    if (range.includes(",")) {
+      const want = new Set(range.split(",").map(Number));
+      return sorted.filter((m) => want.has(m[key]));
+    }
+    const from = parseInt(range, 10);
+    const selected = range.endsWith(":*")
+      ? sorted.filter((m) => m[key] >= from)
+      : sorted.filter((m) => m[key] === from);
+    return selected.length ? selected : sorted.slice(-1);
+  }
+  async search(query: { uid: string }, options: any = {}) {
+    imap.searchCalls.push({ query, options });
+    return this.select(query.uid, "uid").map((m) => m.uid);
+  }
   async *fetch(range: string, query: any, options: any = {}) {
     imap.fetchCalls.push({ range, query, options });
-    const key = options.uid ? "uid" : "seq";
-    const sorted = [...imap.messages].sort((a, b) => a[key] - b[key]);
-    let selected: FakeMessage[];
-    if (range === "*") selected = sorted.slice(-1);
-    else {
-      const from = parseInt(range, 10);
-      selected = sorted.filter((m) => m[key] >= from);
-      if (selected.length === 0) selected = sorted.slice(-1); // "*" always matches
-    }
-    for (const m of selected) {
+    for (const m of this.select(range, options.uid ? "uid" : "seq")) {
       yield {
         uid: m.uid,
         envelope: { from: [{ name: "Alice" }], to: [], subject: `Project update ${m.uid}` },
@@ -88,6 +97,7 @@ function emailConfig() {
 beforeEach(() => {
   imap.instances = [];
   imap.fetchCalls = [];
+  imap.searchCalls = [];
   imap.failLock = false;
   imap.uidValidity = 1;
   // A long-lived mailbox: UIDs far above sequence numbers.
@@ -100,7 +110,8 @@ describe("EmailAdapter", () => {
     await a.init(emailConfig());
     a.setCheckpoint("120001");
     const events = await a.poll();
-    expect(imap.fetchCalls[0].range).toBe("120002:*");
+    expect(imap.searchCalls[0]).toEqual({ query: { uid: "120002:*" }, options: { uid: true } });
+    expect(imap.fetchCalls[0].range).toBe("120002,120003,120004");
     expect(imap.fetchCalls[0].options).toEqual({ uid: true });
     expect(events.map((e) => e.id)).toEqual(["email-120002", "email-120003", "email-120004"]);
     expect(a.getCheckpoint()).toBe("1:120004");
@@ -114,6 +125,28 @@ describe("EmailAdapter", () => {
     const events = await a.poll();
     expect(events.map((e) => e.id)).toEqual(["email-120004"]);
     expect(a.getCheckpoint()).toBe("2:120004");
+  });
+
+  it("fetches only one batch of a long backlog, and the next poll continues", async () => {
+    // Fetching "N:*" downloaded every newer message each poll.
+    imap.messages = Array.from({ length: 500 }, (_, i) => ({ uid: 1_000 + i, seq: 1 + i }));
+    const a = new EmailAdapter();
+    await a.init({ ...emailConfig(), settings: { ...emailConfig().settings, maxFetch: 20 } });
+    a.setCheckpoint("1:999");
+    const first = await a.poll();
+    expect(first).toHaveLength(20);
+    expect(imap.fetchCalls[0].range.split(",")).toHaveLength(20);
+    const second = await a.poll();
+    expect(second[0].id).toBe("email-1020");
+    expect(a.getCheckpoint()).toBe("1:1039");
+  });
+
+  it("does not fetch at all when nothing is new", async () => {
+    const a = new EmailAdapter();
+    await a.init(emailConfig());
+    a.setCheckpoint("1:120004");
+    expect(await a.poll()).toEqual([]);
+    expect(imap.fetchCalls).toHaveLength(0);
   });
 
   it("starts from the newest message when there is no cursor", async () => {

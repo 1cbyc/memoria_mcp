@@ -13,6 +13,8 @@ declare module "imapflow" {
      * just asks for the UID attribute.
      */
     fetch(range: string, query: any, options?: { uid?: boolean }): AsyncIterable<any>;
+    /** With `options.uid`, a UID SEARCH returning UIDs. */
+    search(query: any, options?: { uid?: boolean }): Promise<number[] | false | undefined>;
     logout(): Promise<void>;
   }
 }
