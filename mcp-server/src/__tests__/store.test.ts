@@ -386,3 +386,52 @@ describe("index format version (review 2026-10)", () => {
     expect(store.needsReindex).toBe(false);
   });
 });
+
+describe("access history survives rebuilds and edits count as touches (re-review 2026-10)", () => {
+  const DAY = 24 * 3600 * 1000;
+  const daysAgo = (n: number) => new Date(Date.now() - n * DAY).toISOString().split("T")[0];
+  const old = `---\nname: N\nimportance: 5\nupdated: ${daysAgo(400)}\n---\nA note about quantum widgets.`;
+
+  it("a provider change or index-version rebuild keeps access counts and last read", async () => {
+    await store.indexChunks(chunkMarkdown(old, "a.md"), 5, old, { contentDate: daysAgo(400) });
+    for (let i = 0; i < 12; i++) store.trackAccess("a.md");
+    (store as any).db.prepare("DELETE FROM store_meta WHERE key = 'index_version'").run();
+    store.close();
+    store = new MemoryStore(dbPath);
+    expect(store.needsReindex).toBe(true);
+    await store.indexChunks(chunkMarkdown(old, "a.md"), 5, old, { contentDate: daysAgo(400) });
+    expect(store.getAccessCount("a.md")).toBe(12);
+    const [r] = await store.search("quantum widgets", 1);
+    expect(r.recencyScore).toBeGreaterThan(0.95); // read today
+    expect(store.findStale(90, 5).map((s) => s.file)).not.toContain("a.md");
+  });
+
+  it("an edit refreshes last_accessed, so a just-edited memory is not stale", async () => {
+    await store.indexChunks(chunkMarkdown(old, "e.md"), 3, old, { contentDate: daysAgo(400) });
+    expect(store.findStale(90, 5).map((s) => s.file)).toContain("e.md");
+    const edited = old + "\nEdited today.";
+    await store.indexChunks(chunkMarkdown(edited, "e.md"), 3, edited, { mtimeMs: Date.now() });
+    expect(store.findStale(90, 5).map((s) => s.file)).not.toContain("e.md");
+  });
+
+  it("an empty or non-ISO `updated` falls through to `created`", async () => {
+    for (const [file, updated] of [
+      ["x.md", ""],
+      ["y.md", "January 5"],
+      ["z.md", "1"],
+    ] as const) {
+      const c = `---\nname: N\n---\nA note about quantum widgets ${file}.`;
+      await store.indexChunks(chunkMarkdown(c, file), 5, c, {
+        contentDate: [updated, "2023-06-01"],
+      });
+    }
+    const rows = (store as any).db
+      .prepare("SELECT DISTINCT file, updated_at FROM chunks ORDER BY file")
+      .all();
+    expect(rows.map((r: { updated_at: string }) => r.updated_at)).toEqual([
+      "2023-06-01",
+      "2023-06-01",
+      "2023-06-01",
+    ]);
+  });
+});

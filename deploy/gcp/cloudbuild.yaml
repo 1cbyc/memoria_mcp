@@ -76,7 +76,11 @@ steps:
       # (one append per source per ingest cycle, not per event) and rotates at
       # 5MB parts, so FUSE full-object-rewrite appends are amortized and
       # bounded. Default is on; no env var needed.
-      - "BIND_ALL=true,DOCKER=true,MEMORIA_DIR=/data/memoria,MEMORIA_EMBEDDINGS=minilm,MEMORIA_REQUIRE_ENCRYPTION_KEY=true,MEMORIA_TOKEN_DB_DIR=/tmp/memoria,MEMORIA_AUTO_COMPILE=true,MEMORIA_PUBLIC_URL=${_PUBLIC_URL}"
+      # MEMORIA_LOCK_TAKEOVER=true: a rollout starts the new revision while
+      # the old one still holds the store lock on the shared GCS mount, so the
+      # new instance must take it over rather than wait; max-instances=1 keeps
+      # the overlap to the rollout itself.
+      - "BIND_ALL=true,DOCKER=true,MEMORIA_DIR=/data/memoria,MEMORIA_EMBEDDINGS=minilm,MEMORIA_REQUIRE_ENCRYPTION_KEY=true,MEMORIA_TOKEN_DB_DIR=/tmp/memoria,MEMORIA_AUTO_COMPILE=true,MEMORIA_LOCK_TAKEOVER=true,MEMORIA_PUBLIC_URL=${_PUBLIC_URL}"
       # MEMORIA_API_KEY: bearer token for /mcp, /ingest, /dashboard/api.
       # MEMORIA_OAUTH_CLIENT_SECRET: DISTINCT from the API key (own secret), so a
       # leaked/rotated API key doesn't also mint OAuth tokens. Create once:

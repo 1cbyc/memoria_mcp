@@ -199,7 +199,7 @@ export async function reindexFile(store: MemoryStore, filePath: string): Promise
     // raced with a delete; the index date falls back to now
   }
   await store.indexChunks(chunks, importance, content, {
-    contentDate: metadata.updated ?? metadata.created,
+    contentDate: [metadata.updated, metadata.created],
     mtimeMs,
   });
   return chunks.length;

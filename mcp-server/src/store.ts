@@ -157,8 +157,11 @@ const INDEX_VERSION = "2";
 
 /** When a memory was indexed: the inputs for its recency date. */
 export interface IndexDates {
-  /** The memory's own date (frontmatter `updated`, else `created`). */
-  contentDate?: unknown;
+  /**
+   * The memory's own date candidates, best first (frontmatter `updated`,
+   * then `created`); the first one that parses as an ISO date wins.
+   */
+  contentDate?: unknown | unknown[];
   /** The file's mtime, in epoch ms. */
   mtimeMs?: number;
 }
@@ -167,9 +170,17 @@ function toDay(ms: number): string {
   return new Date(ms).toISOString().split("T")[0];
 }
 
+// ISO dates only: V8's Date parser also accepts "January 5" (as 2001) or
+// "1", which would silently misdate a memory.
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+
 function parseDateMs(value: unknown): number | undefined {
-  if (typeof value !== "string" && !(value instanceof Date)) return undefined;
-  const ms = new Date(value).getTime();
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+  if (typeof value !== "string" || !ISO_DATE.test(value.trim())) return undefined;
+  const ms = new Date(value.trim()).getTime();
   return Number.isFinite(ms) ? ms : undefined;
 }
 
@@ -336,7 +347,11 @@ export class MemoryStore {
       } catch {
         /* FTS5 not available */
       }
-      this.db.prepare("DELETE FROM file_meta").run();
+      // Forget the content hashes so every file is re-embedded, but keep the
+      // access history: file_meta is the only record of access_count and
+      // last_accessed, and wiping it made every memory look never-read
+      // (stale, decayed, recency 0) after an upgrade or provider switch.
+      this.db.prepare("UPDATE file_meta SET content_hash = NULL").run();
       this.needsReindex = true;
     }
 
@@ -372,20 +387,22 @@ export class MemoryStore {
     content: string,
     importance: number,
     updatedAt: string,
+    lastAccessed: string,
   ): void {
     const hash = crypto.createHash("sha256").update(content).digest("hex");
-    // A new row's last_accessed is the memory's own date, not "now": being
-    // indexed is not an access. An existing row keeps its access history.
+    // last_accessed is computed by indexDatesFor (never "now" for merely
+    // being indexed); access_count is left as it is.
     this.db
       .prepare(
         `INSERT INTO file_meta (file, content_hash, importance, updated_at, last_accessed)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(file) DO UPDATE SET
-           content_hash = ?,
-           importance = ?,
-           updated_at = ?`,
+           content_hash = excluded.content_hash,
+           importance = excluded.importance,
+           updated_at = excluded.updated_at,
+           last_accessed = excluded.last_accessed`,
       )
-      .run(file, hash, importance, updatedAt, updatedAt, hash, importance, updatedAt);
+      .run(file, hash, importance, updatedAt, lastAccessed);
   }
 
   /**
@@ -401,8 +418,11 @@ export class MemoryStore {
    *   stamps every file with the checkout time.
    *
    * Access history (last_accessed, access_count) lives in file_meta and is
-   * carried onto the new chunk rows; a never-accessed memory's
-   * last_accessed is its own date.
+   * carried onto the new chunk rows. last_accessed is "last touched": the
+   * later of the last read and this content date, so an edit counts as a
+   * touch for staleness and decay as it does for search recency. A
+   * last_accessed with no recorded access is ignored: indexes before
+   * version 2 stamped it with the time of indexing.
    */
   private indexDatesFor(
     file: string,
@@ -415,14 +435,16 @@ export class MemoryStore {
       | { content_hash: string | null; access_count: number; last_accessed: string | null }
       | undefined;
     const mtimeMs = Math.min(dates?.mtimeMs ?? now, now);
-    const updatedMs = meta?.content_hash
-      ? mtimeMs
-      : Math.min(parseDateMs(dates?.contentDate) ?? mtimeMs, now);
+    const candidates = Array.isArray(dates?.contentDate) ? dates.contentDate : [dates?.contentDate];
+    const contentMs = candidates.map(parseDateMs).find((ms) => ms !== undefined);
+    const updatedMs = meta?.content_hash ? mtimeMs : Math.min(contentMs ?? mtimeMs, now);
     const updatedAt = toDay(updatedMs);
+    const accessCount = meta?.access_count ?? 0;
+    const lastRead = accessCount > 0 ? meta?.last_accessed : null;
     return {
       updatedAt,
-      lastAccessed: meta?.last_accessed ?? updatedAt,
-      accessCount: meta?.access_count ?? 0,
+      lastAccessed: lastRead && lastRead > updatedAt ? lastRead : updatedAt,
+      accessCount,
     };
   }
 
@@ -432,10 +454,10 @@ export class MemoryStore {
    * deleted (e.g. to redact it) searchable indefinitely.
    */
   clearFile(file: string, content: string, importance: number = 5): void {
-    const { updatedAt } = this.indexDatesFor(file, undefined);
+    const { updatedAt, lastAccessed } = this.indexDatesFor(file, undefined);
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM chunks WHERE file = ?").run(file);
-      this.storeContentHash(file, content, importance, updatedAt);
+      this.storeContentHash(file, content, importance, updatedAt, lastAccessed);
     })();
   }
 
@@ -486,7 +508,7 @@ export class MemoryStore {
           lastAccessed,
         );
       }
-      if (content) this.storeContentHash(file, content, importance, updatedAt);
+      if (content) this.storeContentHash(file, content, importance, updatedAt, lastAccessed);
     });
 
     transaction();
@@ -745,7 +767,7 @@ export class MemoryStore {
       // Known tradeoff (kept deliberately): search itself bumps last_accessed
       // on returned files, so being returned refreshes recency — a mild
       // rich-get-richer effect. Unlike the removed importance feedback loop
-      // this one is bounded (0.2 weight) and self-decaying (30-day half-life;
+      // this one is bounded (0.1 weight) and self-decaying (30-day half-life;
       // nothing ratchets), and the alternative — reads not counting as
       // "recent" — is what B6 was filed about. Revisit if the relevance
       // fixture ever shows entrenchment.

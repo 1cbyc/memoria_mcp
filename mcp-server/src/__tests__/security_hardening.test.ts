@@ -143,15 +143,73 @@ describe("H3: one process per store directory", () => {
     }
   });
 
-  it("does not check a lock written on another host against local pids", async () => {
-    const { MemoryStore } = await import("../store.js");
+  it("respects a fresh lock from another host, reclaims a stale one", async () => {
+    const { acquireStoreLock } = await import("../store-lock.js");
     const db = path.join(ROOT, "data", "foreign.sqlite");
     const lock = path.join(ROOT, "data", ".foreign.sqlite.lock");
-    // process.ppid is alive here, but on the other host it means nothing.
+    // process.ppid is alive here, but on the other host it means nothing:
+    // only the heartbeat (mtime) can say whether that holder is running.
     fs.writeFileSync(lock, `${process.ppid}\nsome-other-host`);
-    const s = new MemoryStore(db);
+    expect(() => acquireStoreLock(db, { foreignWaitMs: 0 })).toThrow(/already in use/);
+    const old = new Date(Date.now() - 5 * 60_000);
+    fs.utimesSync(lock, old, old);
+    const release = acquireStoreLock(db, { foreignWaitMs: 0 });
     expect(fs.readFileSync(lock, "utf-8")).toBe(`${process.pid}\n${os.hostname()}`);
-    s.close();
+    release();
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it("MEMORIA_LOCK_TAKEOVER takes a fresh foreign lock (Cloud Run rollouts)", async () => {
+    const { acquireStoreLock } = await import("../store-lock.js");
+    const db = path.join(ROOT, "data", "takeover.sqlite");
+    const lock = path.join(ROOT, "data", ".takeover.sqlite.lock");
+    fs.writeFileSync(lock, `${process.ppid}\nold-revision`);
+    process.env.MEMORIA_LOCK_TAKEOVER = "true";
+    try {
+      const release = acquireStoreLock(db, { foreignWaitMs: 0 });
+      release();
+    } finally {
+      delete process.env.MEMORIA_LOCK_TAKEOVER;
+    }
+  });
+
+  it("release never deletes a successor's lock, even one with the same pid", async () => {
+    // A rollout or recreated container: both node processes are often pid 7.
+    const { acquireStoreLock } = await import("../store-lock.js");
+    const db = path.join(ROOT, "data", "successor.sqlite");
+    const lock = path.join(ROOT, "data", ".successor.sqlite.lock");
+    const release = acquireStoreLock(db);
+    fs.writeFileSync(lock, `${process.pid}\ncontainer-b`); // taken over
+    release();
+    expect(fs.readFileSync(lock, "utf-8")).toBe(`${process.pid}\ncontainer-b`);
+    fs.rmSync(lock);
+  });
+
+  it("a live local pid whose heartbeat stopped is a reused pid, not a holder", async () => {
+    const { acquireStoreLock } = await import("../store-lock.js");
+    const db = path.join(ROOT, "data", "reused.sqlite");
+    const lock = path.join(ROOT, "data", ".reused.sqlite.lock");
+    fs.writeFileSync(lock, `${process.ppid}\n${os.hostname()}`);
+    const old = new Date(Date.now() - 5 * 60_000);
+    fs.utimesSync(lock, old, old);
+    acquireStoreLock(db)();
+  });
+
+  it("two spellings of one directory are one lock", async () => {
+    const { acquireStoreLock } = await import("../store-lock.js");
+    const db = path.join(ROOT, "data", "spelling.sqlite");
+    const release = acquireStoreLock(db);
+    try {
+      const alias = path.join(ROOT, "data-alias");
+      try {
+        fs.symlinkSync(path.join(ROOT, "data"), alias, "dir");
+      } catch {
+        return; // platform cannot symlink: nothing to test
+      }
+      expect(() => acquireStoreLock(path.join(alias, "spelling.sqlite"))).toThrow(/already in use/);
+    } finally {
+      release();
+    }
   });
 });
 

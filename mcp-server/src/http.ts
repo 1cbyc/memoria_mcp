@@ -1131,7 +1131,7 @@ app.use(errorHandler);
 async function main(): Promise<void> {
   const files = getAllMemoryFiles();
   if (store.needsReindex) {
-    process.stderr.write("Memoria: full reindex triggered by provider change...\n");
+    process.stderr.write("Memoria: full reindex (embedding provider or index format changed)...\n");
   }
   for (const f of files) {
     // A stop signal during a long first index: stop here, before shutdown()

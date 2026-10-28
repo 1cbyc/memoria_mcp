@@ -519,6 +519,9 @@ function findMissingSummaries(files: string[], getRelativePath: (abs: string) =>
 
 // ── Check 5: Gap analysis ───────────────────────────────────
 
+/** A core page this relevant to a frequent daily-log term covers it. */
+const KNOWLEDGE_GAP_MIN_RELEVANCE = 0.25;
+
 const STOP_WORDS = new Set([
   "the",
   "a",
@@ -725,7 +728,13 @@ async function findGaps(store: MemoryStore, memoriesDir: string): Promise<string
     // chunks, the covering core page routinely ranks below a page of daily
     // hits without being absent.
     const results = await store.search(term, 10);
-    const hasCoreMemory = results.some((r) => !isDailyPath(r.file) && r.score > 0.4);
+    // Gate on relevance, not the blended score: the blend depends on the
+    // ranking weights and on each page's recency/importance, so a fixed cut
+    // on it silently moved when the weights changed (0.4 under the old
+    // 0.2/0.3/0.5, which corresponds to roughly 0.25 relevance).
+    const hasCoreMemory = results.some(
+      (r) => !isDailyPath(r.file) && r.relevanceScore >= KNOWLEDGE_GAP_MIN_RELEVANCE,
+    );
     if (!hasCoreMemory) {
       gaps.push(`"${term}" (${wordCounts.get(term)} mentions in daily logs, no core memory)`);
     }
