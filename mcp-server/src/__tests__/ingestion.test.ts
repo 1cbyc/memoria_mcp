@@ -242,3 +242,31 @@ describe("IngestionPipeline — the dedup search never sees unredacted content (
     expect(queries[0].length).toBeLessThanOrEqual(200);
   });
 });
+
+describe("IngestionPipeline — the dedup sidecar holds keyed fingerprints only (review 2026-10)", () => {
+  it("writes v2 keyed entries and drops a v1 sidecar of bare hashes", async () => {
+    const { contentHash } = await import("../collector/crypto.js");
+    const dataDir = path.join(root, "data");
+    fs.mkdirSync(dataDir, { recursive: true });
+    const sidecar =
+      fs.readdirSync(dataDir).find((f) => f.includes("dedup")) ?? ".ingest-dedup.json";
+    const sidecarPath = path.join(dataDir, sidecar);
+    const content = "Wire transfer: routing number 021000021, account 12345678.";
+    // A v1 sidecar: bare SHA-256 keys.
+    fs.writeFileSync(
+      sidecarPath,
+      JSON.stringify({ [`orchestrator-test:${contentHash("old secret")}`]: Date.now() }),
+    );
+    const pipeline = new IngestionPipeline({ memoriesDir });
+    await pipeline.ingest([ev({ content })]);
+    const saved = fs.readFileSync(sidecarPath, "utf-8");
+    const parsed = JSON.parse(saved);
+    expect(parsed.v).toBe(2);
+    expect(saved).not.toContain(contentHash("old secret"));
+    expect(saved).not.toContain(contentHash(content));
+    expect(Object.keys(parsed.entries)).toHaveLength(1);
+    // ...and dedup still works across a restart.
+    const again = await new IngestionPipeline({ memoriesDir }).ingest([ev({ content })]);
+    expect(again.deduplicated).toBe(1);
+  });
+});

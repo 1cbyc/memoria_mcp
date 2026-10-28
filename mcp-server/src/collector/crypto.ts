@@ -12,7 +12,15 @@
  * callers that want it, but the master-key bootstrap does not use a passphrase.)
  */
 
-import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  hkdfSync,
+  randomBytes,
+  scryptSync,
+} from "node:crypto";
 import * as fs from "node:fs";
 import { sleepSync } from "../atomic-fs.js";
 import * as path from "node:path";
@@ -229,8 +237,31 @@ export function decryptJSON<T = unknown>(encoded: string, key?: Buffer): T {
 }
 
 /**
- * Hash content for dedup (not encryption — one-way).
+ * Hash content for dedup (not encryption — one-way). Only for values that
+ * never leave memory: a bare hash of short or templated personal content
+ * (a PIN, an SSN in a known sentence) can be reversed by guessing.
  */
 export function contentHash(content: string): string {
   return createHash("sha256").update(content).digest("hex");
+}
+
+let _hashKey: { master: Buffer; key: Buffer } | null = null;
+
+/**
+ * A keyed fingerprint of content, for fingerprints that are written down:
+ * the ingest dedup sidecar, provenance records, and content-derived event
+ * ids (which reach the synced daily log as `ref:` pointers). HMAC-SHA256
+ * under a subkey of the collector master key, so a fingerprint cannot be
+ * checked against guesses without the key. Initialises the master key from
+ * `dataDir` when nothing has yet.
+ */
+export function keyedContentHash(content: string, dataDir?: string): string {
+  const master = _masterKey ?? (dataDir ? initMasterKey(dataDir) : getMasterKey());
+  if (!_hashKey || _hashKey.master !== master) {
+    const key = Buffer.from(
+      hkdfSync("sha256", master, Buffer.alloc(0), "memoria/content-fingerprint/v1", 32),
+    );
+    _hashKey = { master, key };
+  }
+  return createHmac("sha256", _hashKey.key).update(content).digest("hex");
 }

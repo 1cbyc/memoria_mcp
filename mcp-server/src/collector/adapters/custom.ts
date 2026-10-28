@@ -18,7 +18,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { SourceAdapter, AdapterInfo, AdapterConfig, RawEvent } from "./base.js";
 import { estimateImportance, classifyPrivacy } from "./base.js";
-import { contentHash } from "../crypto.js";
+import { keyedContentHash } from "../crypto.js";
 
 export interface CustomSourceDefinition {
   /** Unique ID for this custom source */
@@ -337,7 +337,7 @@ export class CustomAdapter implements SourceAdapter {
             // Derive a stable id from content so a re-read of unchanged lines
             // collapses at the buffer's UNIQUE(source, event_id) constraint
             // (a random id every poll would re-admit identical lines forever).
-            id: `${this.definition.id}-${contentHash(trimmed).slice(0, 16)}`,
+            id: `${this.definition.id}-${keyedContentHash(trimmed, this.dataDir).slice(0, 16)}`,
             source: this.info.id, // registry key (`custom-<id>`), for correct stats/rate/dedup
             eventType: "custom_entry",
             content: trimmed,
@@ -379,7 +379,7 @@ export class CustomAdapter implements SourceAdapter {
     // reads of the same record dedup at the buffer instead of piling up.
     const id = fm.id
       ? this.getNestedValue(item, fm.id)
-      : `${this.definition.id}-${contentHash(String(content)).slice(0, 16)}`;
+      : `${this.definition.id}-${keyedContentHash(String(content), this.dataDir).slice(0, 16)}`;
 
     const meta: Record<string, unknown> = {};
     if (fm.meta) {
