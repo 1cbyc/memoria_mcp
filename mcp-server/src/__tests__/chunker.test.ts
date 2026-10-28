@@ -255,3 +255,13 @@ describe("chunkMarkdown long lines (review 2026-10)", () => {
     for (const c of chunks) expect(c.text.length).toBeLessThanOrEqual(2 * 1600);
   });
 });
+
+describe("chunkMarkdown never splits a surrogate pair (re-review 2026-10)", () => {
+  it("cuts a long run of emoji between characters", () => {
+    const chunks = chunkMarkdown("a" + "😀".repeat(2000), "emoji.md");
+    for (const c of chunks) {
+      expect(c.text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+      expect(c.text).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    }
+  });
+});

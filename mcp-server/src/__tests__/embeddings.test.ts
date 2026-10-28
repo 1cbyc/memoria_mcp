@@ -82,3 +82,14 @@ describe("lexical embedding keeps non-ASCII text (review 2026-10)", () => {
     expect(cosineSimilarity(vecs[1], vecs[2])).toBeLessThan(0.5);
   });
 });
+
+describe("lexical embedding keeps combining marks (re-review 2026-10)", () => {
+  it("embeds composed and decomposed text alike, and keeps vowel signs", async () => {
+    const nfc = await embed("résumé review");
+    const nfd = await embed("résumé review");
+    expect(cosineSimilarity(nfc, nfd)).toBeGreaterThan(0.99);
+    const a = await embed("किताब मेज़ पर है");
+    const b = await embed("कतब मज पर ह"); // the same with its marks stripped
+    expect(cosineSimilarity(a, b)).toBeLessThan(0.9);
+  });
+});

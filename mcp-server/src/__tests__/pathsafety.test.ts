@@ -273,3 +273,32 @@ describe("unfusedEvents (re-review 2026-10)", () => {
     expect(next).toEqual([ev("chat:o4")]); // one event left: nothing to fuse
   });
 });
+
+describe("reindexAll keeps files written during the pass (re-review 2026-10)", () => {
+  it("does not prune a file that appeared after the listing", async () => {
+    const { reindexAll } = await import("../tools.js");
+    const { MemoryStore } = await import("../store.js");
+    const store = new MemoryStore(path.join(ROOT, "race.sqlite"));
+    const late = path.join(MEMORIES_DIR, "project", "late-note.md");
+    try {
+      const realIndex = store.indexChunks.bind(store);
+      let wrote = false;
+      store.indexChunks = async (chunks, ...rest) => {
+        if (!wrote) {
+          // memory_write during the pass: indexed directly, not in the listing.
+          wrote = true;
+          fs.writeFileSync(late, "---\nname: l\n---\nnovember oscar papa\n");
+          const { chunkMarkdown } = await import("../chunker.js");
+          const c = fs.readFileSync(late, "utf-8");
+          await realIndex(chunkMarkdown(c, "project/late-note.md"), 5, c);
+        }
+        return realIndex(chunks, ...rest);
+      };
+      await reindexAll(store);
+      expect(store.getIndexedFiles()).toContain("project/late-note.md");
+    } finally {
+      store.close();
+      fs.rmSync(late, { force: true });
+    }
+  });
+});

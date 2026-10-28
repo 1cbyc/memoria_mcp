@@ -461,3 +461,30 @@ describe("keyword search matches any query word (review 2026-10)", () => {
     expect(ftsRows.length).toBe(1);
   });
 });
+
+describe("re-review 2026-10: duplicate check and version-3 migration", () => {
+  it("findSimilar finds the duplicate among many chunks sharing common words", async () => {
+    for (let i = 0; i < 300; i++) {
+      const c = `---\nname: f${i}\n---\nThe team met and the notes were about the weekly status number ${i}.`;
+      await store.indexChunks(chunkMarkdown(c, `f${i}.md`), 5, c);
+    }
+    const target =
+      "---\nname: t\n---\nThe queue was moved to Redis streams after the outage review.";
+    await store.indexChunks(chunkMarkdown(target, "target.md"), 5, target);
+    const hits = await store.findSimilar(
+      "The queue was moved to Redis streams after the outage review.",
+    );
+    expect(hits[0].file).toBe("target.md");
+    expect(hits[0].similarity).toBeGreaterThan(0.95);
+  });
+
+  it("version 3 rebuilds only what it changed (hash vectors) and every older index", async () => {
+    const { indexVersionOutdated } = await import("../store.js");
+    expect(indexVersionOutdated("3", "minilm")).toBe(false);
+    expect(indexVersionOutdated("2", "minilm")).toBe(false);
+    expect(indexVersionOutdated("2", "openai")).toBe(false);
+    expect(indexVersionOutdated("2", "local")).toBe(true);
+    expect(indexVersionOutdated(undefined, "minilm")).toBe(true); // 0.2.x: v1
+    expect(indexVersionOutdated("1", "openai")).toBe(true);
+  });
+});

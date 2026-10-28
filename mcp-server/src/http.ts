@@ -961,19 +961,24 @@ interface SessionInfo {
   lastActivity: number;
 }
 
-const sessions: Record<string, SessionInfo> = {};
+// Null prototype: a client-chosen session id such as "__proto__" or
+// "constructor" must not resolve to an Object.prototype member (a 500, and a
+// write onto Object.prototype).
+const sessions: Record<string, SessionInfo> = Object.create(null);
 /** Initializations between the cap check and the session's registration. */
 let pendingSessions = 0;
 
 /**
- * Make room for a new session. At the cap, the least recently active session
- * is closed rather than refusing the newcomer: clients that never send
- * DELETE (most of them) otherwise filled the cap and locked every client out
- * with 503s until the 30-minute idle expiry. Its client gets a 404 on its
- * next request, which tells it to re-initialize.
+ * Make room for a session that has just been established. At the cap, the
+ * least recently active session is closed rather than refusing the
+ * newcomer: clients that never send DELETE (most of them) otherwise filled
+ * the cap and locked every client out with 503s until the 30-minute idle
+ * expiry. Its client gets a 404 on its next request, which tells it to
+ * re-initialize. Called only once the SDK has accepted the initialize
+ * request, so a rejected one (a bad Accept header, say) evicts nobody.
  */
-function reserveSessionSlot(): void {
-  while (Object.keys(sessions).length + pendingSessions >= MAX_SESSIONS) {
+function makeRoomForSession(): void {
+  while (Object.keys(sessions).length >= MAX_SESSIONS) {
     const oldest = Object.entries(sessions).sort(
       ([, a], [, b]) => a.lastActivity - b.lastActivity,
     )[0];
@@ -984,7 +989,6 @@ function reserveSessionSlot(): void {
     delete sessions[oldest[0]];
     void oldest[1].transport.close?.();
   }
-  pendingSessions++;
 }
 
 /** Streamable HTTP: an unknown or expired session is 404, the client's cue to re-initialize. */
@@ -1029,7 +1033,17 @@ app.post("/mcp", async (req, res) => {
       sessionNotFound(res);
       return;
     } else if (isInitializeRequest(req.body)) {
-      reserveSessionSlot();
+      // Bound initializations in flight, so a burst cannot open unbounded
+      // transports before any of them registers.
+      if (pendingSessions >= MAX_SESSIONS) {
+        res.status(503).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Too many sessions initializing. Try again shortly." },
+          id: null,
+        });
+        return;
+      }
+      pendingSessions++;
       let reserved = true;
       const release = () => {
         if (reserved) pendingSessions--;
@@ -1039,6 +1053,7 @@ app.post("/mcp", async (req, res) => {
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
           release();
+          makeRoomForSession();
           sessions[sid] = { transport, lastActivity: Date.now() };
         },
       });

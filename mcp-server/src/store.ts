@@ -163,6 +163,18 @@ export function toFtsQuery(text: string, maxTerms = FTS_MAX_TERMS): string {
  */
 const INDEX_VERSION = "3";
 
+/**
+ * Whether an index written at `stored` version must be rebuilt. Version 3
+ * changed only the lexical (hash, provider "local") vectors, so a version 2
+ * index from another provider is current and is not re-embedded (a full
+ * re-embed costs OpenAI users money and leaves search empty meanwhile).
+ */
+export function indexVersionOutdated(stored: string | undefined, provider: string): boolean {
+  if (stored === INDEX_VERSION) return false;
+  if (stored === "2" && provider !== "local") return false;
+  return true;
+}
+
 /** When a memory was indexed: the inputs for its recency date. */
 export interface IndexDates {
   /**
@@ -340,7 +352,8 @@ export class MemoryStore {
       storedProvider?.value !== currentProvider || storedDim?.value !== currentDim;
     // A store that already has an index from an older version is rebuilt;
     // a brand-new one (no provider recorded yet) is not announced twice.
-    const indexOutdated = !!storedProvider && storedIndexVersion?.value !== INDEX_VERSION;
+    const indexOutdated =
+      !!storedProvider && indexVersionOutdated(storedIndexVersion?.value, currentProvider);
 
     if (providerChanged || indexOutdated) {
       process.stderr.write(
@@ -958,10 +971,12 @@ export class MemoryStore {
    * server was down left a row no sweep would see, and a new file later
    * created at that path inherited its access count.
    */
-  retainFiles(existing: string[]): number {
+  retainFiles(existing: string[], stillExists: (file: string) => boolean = () => false): number {
     const keep = new Set(existing);
     const rows = this.db.prepare("SELECT file FROM file_meta").all() as Array<{ file: string }>;
-    const gone = rows.map((r) => r.file).filter((f) => !keep.has(f));
+    // `existing` is a listing taken before a pass that may run for minutes;
+    // a file written meanwhile is not in it, so ask again before dropping.
+    const gone = rows.map((r) => r.file).filter((f) => !keep.has(f) && !stillExists(f));
     if (gone.length === 0) return 0;
     const del = this.db.prepare("DELETE FROM file_meta WHERE file = ?");
     const delChunks = this.db.prepare("DELETE FROM chunks WHERE file = ?");
@@ -1175,7 +1190,10 @@ export class MemoryStore {
         const ftsQuery = toFtsQuery(headWithoutCutWord(text, 200));
         if (ftsQuery) {
           const ftsRows = this.db
-            .prepare(`SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?`)
+            // ORDER BY rank: with OR-joined terms nearly every chunk matches
+            // a common word, so an unordered LIMIT returned the lowest
+            // rowids and missed the actual duplicate.
+            .prepare(`SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?`)
             .all(ftsQuery, topN * 20) as Array<{ rowid: number }>;
           for (const row of ftsRows) candidateIds.add(row.rowid);
         }

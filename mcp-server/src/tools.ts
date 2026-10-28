@@ -231,7 +231,15 @@ export async function reindexAll(
       );
     }
   }
-  if (!opts.shouldStop?.()) store.retainFiles(files.map(getRelativePath));
+  if (!opts.shouldStop?.()) {
+    store.retainFiles(files.map(getRelativePath), (rel) => {
+      try {
+        return fs.lstatSync(path.join(MEMORIES_DIR, rel)).isFile();
+      } catch {
+        return false;
+      }
+    });
+  }
   return { files: files.length, chunks, failed };
 }
 

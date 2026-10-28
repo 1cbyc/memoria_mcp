@@ -935,3 +935,51 @@ describe("Streamable HTTP sessions and body parsing (review 2026-10)", () => {
     expect(r.status).not.toBe(413);
   });
 });
+
+describe("sessions re-review (2026-10)", () => {
+  it("a session id like __proto__ is an unknown session (404), not a 500", async () => {
+    for (const id of ["__proto__", "constructor", "toString"]) {
+      const r = await request(app)
+        .post("/mcp")
+        .set({ ...auth, "mcp-session-id": id })
+        .set("X-Forwarded-For", "10.7.0.1")
+        .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      expect(r.status).toBe(404);
+    }
+    expect(({} as Record<string, unknown>).lastActivity).toBeUndefined();
+  });
+
+  it("an initialize the SDK rejects does not evict a live session", async () => {
+    const init = (ip: string, accept = "application/json, text/event-stream") =>
+      request(app)
+        .post("/mcp")
+        .set(auth)
+        .set("X-Forwarded-For", ip)
+        .set("Accept", accept)
+        .send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "t", version: "1" },
+          },
+        });
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) ids.push((await init(`10.7.1.${i}`)).headers["mcp-session-id"]);
+    const rejected = await init("10.7.2.1", "text/plain"); // the SDK answers 406
+    expect(rejected.status).toBe(406);
+    const first = await request(app)
+      .delete("/mcp")
+      .set({ ...auth, "mcp-session-id": ids[0] })
+      .set("X-Forwarded-For", "10.7.2.2");
+    expect(first.status).not.toBe(404); // still alive
+    for (const id of ids.slice(1)) {
+      await request(app)
+        .delete("/mcp")
+        .set({ ...auth, "mcp-session-id": id })
+        .set("X-Forwarded-For", "10.7.2.3");
+    }
+  });
+});

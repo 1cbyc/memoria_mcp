@@ -132,7 +132,11 @@ export function chunkMarkdown(content: string, filePath: string): Chunk[] {
     let first = true;
     while (rest.length > TARGET_CHARS) {
       const space = rest.lastIndexOf(" ", TARGET_CHARS);
-      const cut = space > TARGET_CHARS / 2 ? space : TARGET_CHARS;
+      let cut = space > TARGET_CHARS / 2 ? space : TARGET_CHARS;
+      // Never between the two halves of a surrogate pair (an emoji, say):
+      // a lone half is not valid Unicode.
+      const unit = rest.charCodeAt(cut - 1);
+      if (unit >= 0xd800 && unit <= 0xdbff) cut -= 1;
       segments.push({ text: rest.slice(0, cut), newLine: first });
       rest = rest.slice(cut).replace(/^ /, "");
       first = false;
