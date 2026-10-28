@@ -177,6 +177,8 @@ export class StoreInUseError extends Error {
     readonly dir: string,
     readonly holderPid: number,
     cause?: unknown,
+    /** The holder is on another host (a shared network mount). */
+    readonly foreign = false,
   ) {
     super(
       `Memoria store at ${dir} is already in use by another Memoria process` +
@@ -188,8 +190,8 @@ export class StoreInUseError extends Error {
   }
 }
 
-function inUse(dir: string, pid: number, cause?: unknown): Error {
-  return new StoreInUseError(dir, pid, cause);
+function inUse(dir: string, pid: number, cause?: unknown, foreign = false): Error {
+  return new StoreInUseError(dir, pid, cause, foreign);
 }
 
 export function acquireStoreLock(
@@ -229,7 +231,7 @@ export function acquireStoreLock(
                 `(pid ${v.pid}) because MEMORIA_LOCK_TAKEOVER=true.\n`,
             );
             if (reclaim(lockPath, v.observed) || ++reclaims < MAX_RECLAIMS) continue;
-            throw inUse(dir, v.pid, err);
+            throw inUse(dir, v.pid, err, true);
           }
           if (Date.now() < foreignDeadline) {
             if (reclaims === 0) {
@@ -242,7 +244,7 @@ export function acquireStoreLock(
             sleepSync(1_000);
             continue;
           }
-          throw inUse(dir, v.pid, err);
+          throw inUse(dir, v.pid, err, true);
         case "stale":
           process.stderr.write(`Memoria: reclaiming the store lock at ${lockPath}: ${v.why}.\n`);
           if (reclaim(lockPath, v.observed) || ++reclaims < MAX_RECLAIMS) continue;

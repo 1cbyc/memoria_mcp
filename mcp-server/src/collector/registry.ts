@@ -457,7 +457,22 @@ export class SourceRegistry {
   /**
    * Add a user-defined custom data source.
    */
-  addCustomSource(definition: CustomSourceDefinition): { success: boolean; message: string } {
+  addCustomSource(input: CustomSourceDefinition): { success: boolean; message: string } {
+    // Name and description are free text from whoever adds the source,
+    // possibly an agent, and the consent dialog shows them: one line each,
+    // bounded, so they cannot carry a fake "Reads the file: ..." line or
+    // push the real one out of view.
+    const oneLine = (v: unknown, max: number) =>
+      String(v ?? "")
+        // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+        .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
+        .trim()
+        .slice(0, max);
+    const definition: CustomSourceDefinition = {
+      ...input,
+      name: oneLine(input.name, 80),
+      description: oneLine(input.description, 300),
+    };
     // Validate
     if (!definition.id || !/^[a-z0-9_-]+$/.test(definition.id)) {
       return {

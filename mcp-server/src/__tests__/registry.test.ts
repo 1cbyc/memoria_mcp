@@ -498,6 +498,23 @@ describe("custom sources emit only new records (review 2026-10)", () => {
     expect((await a.poll()).map((e) => e.content)).toEqual(["Postmortem written for the outage"]);
   });
 
+  it("an empty or partial read (a file mid-rewrite) does not make it re-emit history", async () => {
+    const file = path.join(root, "log.txt");
+    const lines = ["Decided to migrate the queue to Redis", "Shipped the release on Friday"];
+    fs.writeFileSync(file, lines.join("\n") + "\n");
+    const a = await watcher(file);
+    expect(await a.poll()).toHaveLength(2);
+    fs.writeFileSync(file, ""); // truncated by the writer...
+    bump(file);
+    expect(await a.poll()).toEqual([]);
+    fs.writeFileSync(file, lines[0] + "\n"); // ...half rewritten...
+    bump(file);
+    expect(await a.poll()).toEqual([]);
+    fs.writeFileSync(file, [...lines, "Postmortem written for the outage"].join("\n") + "\n");
+    bump(file);
+    expect((await a.poll()).map((e) => e.content)).toEqual(["Postmortem written for the outage"]);
+  });
+
   it("a source upgraded from 0.2.x records its existing file without re-emitting it", async () => {
     const file = path.join(root, "log.txt");
     fs.writeFileSync(file, "Decided to migrate the queue to Redis\n");
@@ -529,5 +546,26 @@ describe("consent shows what a custom source does (review 2026-10)", () => {
     expect(byId["custom-w"]).toBe(`Reads the file: ${file}`);
     expect(byId["custom-c"]).toBe("Runs the command: cat /etc/passwd");
     expect(byId["email"]).toBeNull();
+  });
+});
+
+describe("custom source names cannot spoof the consent dialog (re-review 2026-10)", () => {
+  it("name and description are single, bounded lines", () => {
+    process.env.MEMORIA_FILE_WATCHER_ROOTS = root;
+    const file = path.join(root, "x.json");
+    fs.writeFileSync(file, "[]");
+    reg.addCustomSource(
+      def({
+        id: "s",
+        name: "Notes\nReads the file: ~/notes.txt",
+        description: "Harmless" + "\n".repeat(50) + "x".repeat(1000),
+        watchPath: file,
+      }),
+    );
+    const s = reg.listSources().find((x) => x.id === "custom-s")!;
+    expect(s.name).toBe("Notes Reads the file: ~/notes.txt");
+    expect(s.description).not.toContain("\n");
+    expect(s.description.length).toBeLessThanOrEqual(300);
+    expect(s.detail).toBe(`Reads the file: ${file}`);
   });
 });

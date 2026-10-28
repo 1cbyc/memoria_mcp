@@ -110,6 +110,28 @@ MEMORIA_DIR="$DEV_B" bash "$REPO_ROOT/scripts/sync/memoria-sync-pull.sh" >/dev/n
 check "generated: merge completed" test "$(git -C "$DEV_B" rev-list --count "HEAD..origin/$GBR")" = "0"
 check "generated: no merge left in progress" test ! -f "$DEV_B/.git/MERGE_HEAD"
 
+# A page a human took over on one device (marker removed), or a note that
+# only mentions the marker in its body, is a real conflict: never resolved
+# by keeping one side.
+mkdir -p "$DEV_A/memories/entities" "$DEV_A/memories/notes"
+printf -- '---\nname: x\ngenerated: auto-compiled\n---\nv0\n' > "$DEV_A/memories/entities/x.md"
+printf -- '---\nname: n\n---\n```\ngenerated: auto-compiled\n```\nv0\n' > "$DEV_A/memories/notes/n.md"
+git -C "$DEV_A" add -A; git -C "$DEV_A" commit -qm pages; git -C "$DEV_A" push -q origin HEAD 2>/dev/null
+MEMORIA_DIR="$DEV_B" bash "$REPO_ROOT/scripts/sync/memoria-sync-pull.sh" >/dev/null 2>&1
+# A takes the page over and curates it; B (the pulling device) regenerates
+# it. Keeping B's side would silently drop A's curation.
+printf -- '---\nname: x\n---\ncurated by a human on A\n' > "$DEV_A/memories/entities/x.md"
+printf -- '---\nname: n\n---\n```\ngenerated: auto-compiled\n```\nA edit\n' > "$DEV_A/memories/notes/n.md"
+git -C "$DEV_A" commit -qam "A pages"; git -C "$DEV_A" push -q origin HEAD 2>/dev/null
+printf -- '---\nname: x\ngenerated: auto-compiled\n---\nregenerated on B\n' > "$DEV_B/memories/entities/x.md"
+printf -- '---\nname: n\n---\n```\ngenerated: auto-compiled\n```\nB edit\n' > "$DEV_B/memories/notes/n.md"
+git -C "$DEV_B" commit -qam "B pages"
+MEMORIA_DIR="$DEV_B" bash "$REPO_ROOT/scripts/sync/memoria-sync-pull.sh" >/dev/null 2>&1
+check "human edits elsewhere: not auto-resolved away (merge aborted)" \
+  test "$(git -C "$DEV_B" merge-base --is-ancestor "origin/$GBR" HEAD && echo merged)" != "merged"
+check "human edits elsewhere: no merge left in progress" test ! -f "$DEV_B/.git/MERGE_HEAD"
+git -C "$DEV_B" reset -q --hard "origin/$GBR" # start the next case from the remote
+
 # A conflict in a real memory still stops for a human.
 printf 'core from A\n' > "$DEV_A/memories/project/core.md"
 git -C "$DEV_A" commit -qam "A core"; git -C "$DEV_A" push -q origin HEAD 2>/dev/null

@@ -231,11 +231,12 @@ export class MemoryStore {
     // One process per store directory (review H3) unless shared: without
     // `shared`, fail loudly rather than race another server.
     try {
-      // A shared open never waits on another host's lock: it starts as a
-      // secondary and is promoted once that lock goes stale.
-      this.releaseLock = acquireStoreLock(dbPath, opts.shared ? { foreignWaitMs: 0 } : {});
+      this.releaseLock = acquireStoreLock(dbPath);
     } catch (err) {
-      if (!opts.shared || !(err instanceof StoreInUseError)) throw err;
+      // Secondary mode is for processes on ONE host, where SQLite's locking
+      // is sound. A holder on another host (two replicas on a network
+      // mount) is still refused: SQLite's WAL is not safe across hosts.
+      if (!opts.shared || !(err instanceof StoreInUseError) || err.foreign) throw err;
       this.isPrimary = false;
       this.releaseLock = () => {};
       process.stderr.write(
@@ -282,6 +283,7 @@ export class MemoryStore {
   tryBecomePrimary(): boolean {
     if (this.isPrimary) return true;
     try {
+      // No waiting on another host's lock: this runs on a timer.
       this.releaseLock = acquireStoreLock(this.dbPath, { foreignWaitMs: 0 });
       this.isPrimary = true;
       process.stderr.write("Memoria: took over the store lock; this server is now the primary.\n");
@@ -525,10 +527,12 @@ export class MemoryStore {
    */
   clearFile(file: string, content: string, importance: number = 5): void {
     const { updatedAt, lastAccessed } = this.indexDatesFor(file, undefined);
-    this.db.transaction(() => {
-      this.db.prepare("DELETE FROM chunks WHERE file = ?").run(file);
-      this.storeContentHash(file, content, importance, updatedAt, lastAccessed);
-    })();
+    this.db
+      .transaction(() => {
+        this.db.prepare("DELETE FROM chunks WHERE file = ?").run(file);
+        this.storeContentHash(file, content, importance, updatedAt, lastAccessed);
+      })
+      .immediate();
   }
 
   /**
@@ -581,7 +585,11 @@ export class MemoryStore {
       if (content) this.storeContentHash(file, content, importance, updatedAt, lastAccessed);
     });
 
-    transaction();
+    // IMMEDIATE: this transaction reads (indexDatesFor) before it writes,
+    // and a deferred transaction that must upgrade from a read to a write
+    // lock while another process writes fails with SQLITE_BUSY at once,
+    // bypassing busy_timeout. Shared stores have several writers.
+    transaction.immediate();
   }
 
   /**
@@ -998,7 +1006,7 @@ export class MemoryStore {
         upsertMeta.run(f, now, now);
       }
     });
-    tx(files);
+    tx.immediate(files);
   }
 
   /**
@@ -1029,12 +1037,14 @@ export class MemoryStore {
     if (gone.length === 0) return 0;
     const del = this.db.prepare("DELETE FROM file_meta WHERE file = ?");
     const delChunks = this.db.prepare("DELETE FROM chunks WHERE file = ?");
-    this.db.transaction(() => {
-      for (const f of gone) {
-        del.run(f);
-        delChunks.run(f);
-      }
-    })();
+    this.db
+      .transaction(() => {
+        for (const f of gone) {
+          del.run(f);
+          delChunks.run(f);
+        }
+      })
+      .immediate();
     return gone.length;
   }
 

@@ -129,16 +129,27 @@ if [ -z "$CONFLICTS" ]; then
 fi
 
 # 4a. Conflicts only in GENERATED files resolve themselves: Memoria rewrites
-#     MEMORY_INDEX.md and auto-compiled entity pages (frontmatter
-#     `generated: auto-compiled`) from the memory files, so either side will
-#     do and the next regeneration is exact. Leaving these to a human stalled
-#     sync between two devices for good: every pull re-conflicted, every push
-#     was rejected.
+#     MEMORY_INDEX.md and auto-compiled entity pages from the memory files,
+#     so either side will do and the next regeneration is exact. Leaving
+#     these to a human stalled sync between two devices for good: every pull
+#     re-conflicted, every push was rejected.
+#     A page counts as generated only if BOTH sides carry the marker in their
+#     frontmatter: a page a human took over (marker removed) on either
+#     device, or a note that merely mentions the marker in its body, is a
+#     real conflict and is left for a person.
+has_generated_marker() { # <stage> <path>: frontmatter has `generated: auto-compiled`
+  git show ":$1:$2" 2>/dev/null | awk '
+    NR == 1 { if ($0 != "---") exit 1; next }
+    $0 == "---" { exit found ? 0 : 1 }
+    $0 == "generated: auto-compiled" { found = 1 }
+    END { if (NR <= 1) exit 1 }
+  '
+}
 generated_only=1
 while IFS= read -r f; do
   [ -z "$f" ] && continue
-  if [ "$(basename "$f")" = "MEMORY_INDEX.md" ] \
-    || git show ":2:$f" 2>/dev/null | head -40 | grep -q '^generated: auto-compiled'; then
+  if [ "$f" = "memories/MEMORY_INDEX.md" ] \
+    || { has_generated_marker 2 "$f" && has_generated_marker 3 "$f"; }; then
     if ! { git checkout --ours -- "$f" && git add -- "$f"; } 2>>"$LOG_FILE"; then
       generated_only=0
     fi

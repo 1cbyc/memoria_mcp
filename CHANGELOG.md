@@ -101,8 +101,11 @@ start** (see below); access counts and last reads are kept.
   lock (stale locks reclaimed) and runs the collector and scheduled
   maintenance; further servers on the same store (another Claude Code
   window, Claude Desktop) run as secondaries that share the memories and
-  take over the lock when the primary exits. SQLite waits on
-  `busy_timeout`, and the compile queue drains by atomic rename so an
+  take over the lock when the primary exits (on one host only: a holder
+  on another host, e.g. a replica on a network mount, is still refused).
+  Multi-statement writes use IMMEDIATE transactions so concurrent writers
+  wait on `busy_timeout` instead of failing, and the compile queue drains
+  by atomic rename so an
   enqueue during a drain is no longer deleted unread. The stdio server
   exits when its client closes stdin; an orphaned server used to live on
   (the file watcher kept it running) and hold the store.
@@ -209,6 +212,14 @@ start** (see below); access counts and last reads are kept.
   wrote, and an activity whose events were all fused already is skipped.
 - Entity pages for sources whose names slugify alike no longer overwrite
   each other.
+- Multi-device sync no longer stalls on `MEMORY_INDEX.md`: the store
+  template union-merges it, and the pull hook resolves conflicts confined
+  to generated files (MEMORY_INDEX.md, and entity pages that carry the
+  `generated: auto-compiled` frontmatter on both sides) by itself. Daily
+  logs merged by union keep their frontmatter (a repeated key takes its
+  last value).
+- Daily-log paths refuse symlinks everywhere (writers and readers), and
+  `memory_compile` no longer leaks its directory lock on a refused path.
 - The sync push hook schedules a deferred push for the end of its rate
   limit instead of leaving a session's last commits on the device; the
   push runs in its own session, so the hook runner cannot kill it.

@@ -441,7 +441,7 @@ export class CustomAdapter implements SourceAdapter {
   private seenCapped = false;
 
   /**
-   * Keep the records the previous read did not have. `null` means no read
+   * Keep the records not seen before. `null` means no read
    * happened (unchanged, missing or oversized file, a failed or disabled
    * command, a parse error): nothing is learned and nothing is reset, so a
    * skipped read can neither forget what was collected nor use up an
@@ -462,10 +462,16 @@ export class CustomAdapter implements SourceAdapter {
       const firstKnown = fps.findIndex((fp) => previous.has(fp));
       if (firstKnown > 0) firstNew = firstKnown;
     }
-    const current = new Set<string>(fps);
     const fresh = events.filter((_, i) => i >= firstNew && !previous.has(fps[i]));
-    this.seenCapped = current.size > MAX_TRACKED;
-    this.seenIds = this.seenCapped ? new Set([...current].slice(-MAX_TRACKED)) : current;
+    // Remember what was seen before AND now, not only this read: a read that
+    // catches a file mid-rewrite (empty or half written), or a command that
+    // printed nothing this time, replaced the set and the next full read
+    // emitted the whole history again. Older ids first, so the cap keeps
+    // the most recently seen.
+    const current = new Set<string>(fps);
+    const seen = [...[...previous].filter((fp) => !current.has(fp)), ...current];
+    this.seenCapped = seen.length > MAX_TRACKED;
+    this.seenIds = new Set(this.seenCapped ? seen.slice(-MAX_TRACKED) : seen);
     if (this.baselineOnly) {
       this.baselineOnly = false;
       return [];

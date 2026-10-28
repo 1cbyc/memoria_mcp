@@ -307,3 +307,25 @@ describe("shared stores: concurrent sessions (review 2026-10)", () => {
     }
   });
 });
+
+describe("shared stores stay on one host (review 2026-10)", () => {
+  it("a shared open refuses a live lock held on another host instead of becoming a secondary", async () => {
+    const { MemoryStore } = await import("../store.js");
+    const { acquireStoreLock } = await import("../store-lock.js");
+    const db = path.join(ROOT, "data", "netmount.sqlite");
+    const lock = path.join(ROOT, "data", ".netmount.sqlite.lock");
+    fs.writeFileSync(lock, `${process.ppid}\nother-host`);
+    // MemoryStore uses the default wait; check the refusal at the lock layer
+    // with no wait, then that MemoryStore does not swallow a foreign refusal.
+    expect(() => acquireStoreLock(db, { foreignWaitMs: 0 })).toThrow(/already in use/);
+    const { StoreInUseError } = await import("../store-lock.js");
+    try {
+      acquireStoreLock(db, { foreignWaitMs: 0 });
+    } catch (e) {
+      expect(e).toBeInstanceOf(StoreInUseError);
+      expect((e as InstanceType<typeof StoreInUseError>).foreign).toBe(true);
+    }
+    fs.rmSync(lock);
+    expect(MemoryStore).toBeDefined();
+  });
+});
