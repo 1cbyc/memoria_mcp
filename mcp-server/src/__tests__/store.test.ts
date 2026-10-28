@@ -242,11 +242,11 @@ describe("keyword search across scripts and operators (2026-09 review, M2)", () 
   };
 
   it("toFtsQuery quotes every word, keeps non-ASCII, and caps the term count", () => {
-    expect(toFtsQuery("Müller café")).toBe('"Müller" "café"');
-    expect(toFtsQuery("plan AND budget")).toBe('"plan" "AND" "budget"');
+    expect(toFtsQuery("Müller café")).toBe('"Müller" OR "café"');
+    expect(toFtsQuery("plan AND budget")).toBe('"plan" OR "AND" OR "budget"');
     expect(toFtsQuery("東京タワー")).toBe('"東京タワー"');
     expect(toFtsQuery("?! -- ()")).toBe("");
-    expect(toFtsQuery(Array(40).fill("w").join(" ")).split(" ")).toHaveLength(32);
+    expect(toFtsQuery(Array(40).fill("w").join(" ")).split(" OR ")).toHaveLength(32);
   });
 
   it("finds words with diacritics, with or without the accent", () => {
@@ -445,5 +445,19 @@ describe("retainFiles (re-review 2026-10)", () => {
     expect(store.retainFiles(["keep.md"])).toBe(1);
     expect(store.getAccessCount("gone.md")).toBe(0);
     expect(store.getIndexedFiles()).toEqual(["keep.md"]);
+  });
+});
+
+describe("keyword search matches any query word (review 2026-10)", () => {
+  it("finds a chunk for a natural-language query that shares only some words", async () => {
+    const c = "---\nname: Q\n---\nWe moved the job queue to Redis streams.";
+    await store.indexChunks(chunkMarkdown(c, "q.md"), 5, c);
+    const [hit] = await store.search("what did we decide about the queue", 1);
+    expect(hit.file).toBe("q.md");
+    // ...through the BM25 path, not just the vector half or substring fallback.
+    const ftsRows = (store as any).db
+      .prepare("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?")
+      .all(toFtsQuery("what did we decide about the queue"));
+    expect(ftsRows.length).toBe(1);
   });
 });

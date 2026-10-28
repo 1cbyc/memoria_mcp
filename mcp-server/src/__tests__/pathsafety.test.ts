@@ -163,3 +163,52 @@ describe("reindexFile dates and emptied bodies (review 2026-10)", () => {
     }
   });
 });
+
+describe("reindexAll (review 2026-10)", () => {
+  it("one failing file does not stop the pass, and deleted files are dropped", async () => {
+    const { reindexAll } = await import("../tools.js");
+    const { MemoryStore } = await import("../store.js");
+    const good = path.join(MEMORIES_DIR, "project", "good-note.md");
+    const bad = path.join(MEMORIES_DIR, "project", "bad-note.md");
+    const gone = path.join(MEMORIES_DIR, "project", "gone-note.md");
+    fs.writeFileSync(good, "---\nname: g\n---\nalpha bravo charlie\n");
+    fs.writeFileSync(bad, "---\nname: b\n---\ndelta echo foxtrot\n");
+    fs.writeFileSync(gone, "---\nname: x\n---\ngolf hotel india\n");
+    const store = new MemoryStore(path.join(ROOT, "reindexall.sqlite"));
+    try {
+      await reindexAll(store);
+      expect(store.getIndexedFiles()).toContain("project/gone-note.md");
+      fs.unlinkSync(gone);
+      fs.writeFileSync(good, "---\nname: g\n---\nalpha bravo charlie, edited\n");
+      fs.writeFileSync(bad, "---\nname: b\n---\ndelta echo foxtrot, edited\n");
+      const realIndex = store.indexChunks.bind(store);
+      store.indexChunks = async (chunks, ...rest) => {
+        if (chunks[0]?.file === "project/bad-note.md") throw new Error("embedding API 429");
+        return realIndex(chunks, ...rest);
+      };
+      const r = await reindexAll(store);
+      expect(r.failed).toEqual(["project/bad-note.md"]);
+      const hits = await store.search("alpha bravo charlie edited", 3);
+      expect(hits[0].text).toContain("edited");
+      expect(store.getIndexedFiles()).not.toContain("project/gone-note.md");
+    } finally {
+      store.close();
+      for (const f of [good, bad]) fs.rmSync(f, { force: true });
+    }
+  });
+
+  it("forgetContentHashes makes every file re-embed (memory_index force)", async () => {
+    const { MemoryStore } = await import("../store.js");
+    const { chunkMarkdown } = await import("../chunker.js");
+    const store = new MemoryStore(path.join(ROOT, "force.sqlite"));
+    try {
+      const c = "---\nname: f\n---\nkilo lima mike\n";
+      await store.indexChunks(chunkMarkdown(c, "f.md"), 5, c);
+      expect(store.hasContentChanged("f.md", c)).toBe(false);
+      store.forgetContentHashes();
+      expect(store.hasContentChanged("f.md", c)).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+});

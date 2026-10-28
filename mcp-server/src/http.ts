@@ -32,8 +32,7 @@ import {
   DB_PATH,
   DATA_DIR,
   MEMORIES_DIR,
-  getAllMemoryFiles,
-  getRelativePath,
+  reindexAll,
   reindexFile,
   setupPeriodicReindex,
   setupPeriodicOptimize,
@@ -1347,20 +1346,19 @@ app.use(errorHandler);
 // ─── Start ──────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const files = getAllMemoryFiles();
   if (store.needsReindex) {
     process.stderr.write("Memoria: full reindex (embedding provider or index format changed)...\n");
   }
-  for (const f of files) {
-    // A stop signal during a long first index: stop here, before shutdown()
-    // closes the store under the next reindexFile.
-    if (shuttingDown) return;
-    await reindexFile(store, f);
-  }
+  // Per file: one failure is logged and skipped instead of exiting. A stop
+  // signal during a long first index stops before shutdown() closes the
+  // store under the next reindexFile. Files deleted while the server was
+  // down are dropped.
+  const indexed = await reindexAll(store, { shouldStop: () => shuttingDown });
   if (shuttingDown) return;
-  // Drop index state for files deleted while the server was down.
-  store.retainFiles(files.map(getRelativePath));
-  process.stderr.write(`Indexed ${files.length} memory files.\n`);
+  process.stderr.write(
+    `Indexed ${indexed.files} memory files` +
+      (indexed.failed.length ? ` (${indexed.failed.length} failed, see above).\n` : ".\n"),
+  );
 
   // fs.watch is inert on the GCS FUSE / Cloud Run mount, so sweep periodically
   // to pick up memory files changed by `git pull` from other devices.

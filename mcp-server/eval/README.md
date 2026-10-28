@@ -60,6 +60,22 @@ quoting a MiniLM number**):
   hybrid, no priors              55.0           52.6        74.9
 ```
 
+Keyword matching then moved from FTS5's implicit AND (every query word must
+appear in the chunk, so most natural-language queries matched nothing) to
+OR, with BM25 still ranking chunks that match more and rarer words first:
+
+```
+  configuration                 nDCG@10   R@20    MRR  stale
+  new default, AND                 60.4   96.2   52.4      2
+  new default, OR                  61.7   96.2   55.1      2
+  keyword only, AND                53.8   92.3   47.5      3
+  keyword only, OR                 66.5   88.5   59.7      3
+  hybrid, no priors, OR            69.9   92.3   65.7      3
+```
+
+Recall@20 falls a little for the keyword-heavy configurations (more weak
+matches compete for the candidate pool); nDCG and MRR rise everywhere.
+
 With real dates, the old weights buy the temporal queries (76.7) at a price
 of roughly 25 to 50 points everywhere else. Relevance scores fall in a
 narrow band while recency and importance span 0 to 1, so priors carrying

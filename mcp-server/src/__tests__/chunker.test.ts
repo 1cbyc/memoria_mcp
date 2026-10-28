@@ -232,3 +232,26 @@ describe("frontmatter write/read round trip", () => {
     expect(roundTrip(compiled)).toEqual(compiled);
   });
 });
+
+describe("chunkMarkdown long lines (review 2026-10)", () => {
+  it("splits a single line longer than a chunk, keeping its line number", () => {
+    const words = Array.from({ length: 2000 }, (_, i) => `word${i}`).join(" "); // ~15KB, one line
+    const content = `---\nname: x\n---\nfirst line\n${words}\nlast line`;
+    const chunks = chunkMarkdown(content, "long.md");
+    expect(chunks.length).toBeGreaterThan(5);
+    for (const c of chunks) expect(c.text.length).toBeLessThanOrEqual(2 * 1600);
+    // Nothing is lost: every word appears in some chunk.
+    const all = chunks.map((c) => c.text).join(" ");
+    expect(all).toContain("word0");
+    expect(all).toContain("word1999");
+    expect(all).toContain("last line");
+    // Pieces of the long line all report line 5 (frontmatter is 3 lines).
+    expect(Math.max(...chunks.map((c) => c.endLine))).toBe(6);
+  });
+
+  it("cuts a line with no spaces at the chunk size", () => {
+    const chunks = chunkMarkdown("x".repeat(10_000), "dense.md");
+    expect(chunks.length).toBeGreaterThan(5);
+    for (const c of chunks) expect(c.text.length).toBeLessThanOrEqual(2 * 1600);
+  });
+});

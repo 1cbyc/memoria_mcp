@@ -126,8 +126,15 @@ export function headWithoutCutWord(text: string, max: number): string {
 
 /**
  * Turn free text into a safe FTS5 MATCH expression: each word becomes a
- * quoted string, and the strings are joined by spaces, FTS5's implicit AND.
- * Returns "" when the text has no words.
+ * quoted string, and the strings are joined with OR. Returns "" when the
+ * text has no words.
+ *
+ * OR, not FTS5's implicit AND: a natural-language query ("what did we
+ * decide about the queue") almost never has every one of its words in one
+ * chunk, so AND returned no keyword matches for most real queries. BM25
+ * still ranks chunks matching more (and rarer) terms first. On the eval
+ * corpus (hash provider) keyword-only nDCG@10 went from 53.8 to 66.5 and
+ * the shipped default from 60.4 to 61.7.
  *
  * The previous sanitiser, `text.replace(/[^\w\s]/g, " ")`, had two failures.
  * JavaScript's \w is ASCII-only, so it cut "Müller" to "M ller" and "café" to
@@ -144,16 +151,17 @@ export function toFtsQuery(text: string, maxTerms = FTS_MAX_TERMS): string {
   return terms
     .slice(0, maxTerms)
     .map((t) => `"${t}"`)
-    .join(" ");
+    .join(" OR ");
 }
 
 /**
  * Bumped when indexed rows need rebuilding from the files. 2: recency dates
  * come from the memory (frontmatter `updated`/`created`, else file mtime)
  * instead of the time it was indexed, so every row indexed by version 1
- * carries an index-time date.
+ * carries an index-time date. 3: the lexical (hash) embedding keeps
+ * non-ASCII words instead of mapping them to nothing.
  */
-const INDEX_VERSION = "2";
+const INDEX_VERSION = "3";
 
 /** When a memory was indexed: the inputs for its recency date. */
 export interface IndexDates {
@@ -937,6 +945,11 @@ export class MemoryStore {
   removeFile(file: string): void {
     this.db.prepare("DELETE FROM chunks WHERE file = ?").run(file);
     this.db.prepare("DELETE FROM file_meta WHERE file = ?").run(file);
+  }
+
+  /** Make every file count as changed, so the next pass re-embeds it all. */
+  forgetContentHashes(): void {
+    this.db.prepare("UPDATE file_meta SET content_hash = NULL").run();
   }
 
   /**

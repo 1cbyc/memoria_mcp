@@ -9,9 +9,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { MemoryStore } from "./store.js";
 import {
   DB_PATH,
-  getAllMemoryFiles,
-  getRelativePath,
-  reindexFile,
+  reindexAll,
   setupWatcher,
   setupPeriodicReindex,
   setupPeriodicOptimize,
@@ -39,20 +37,19 @@ registerCollectorTools(server, store);
 let shuttingDown = false;
 
 async function main(): Promise<void> {
-  const files = getAllMemoryFiles();
   if (store.needsReindex) {
     process.stderr.write("Memoria: full reindex (embedding provider or index format changed)...\n");
   }
-  for (const f of files) {
-    // A stop signal during a long first index: stop here, before shutdown()
-    // closes the store under the next reindexFile.
-    if (shuttingDown) return;
-    await reindexFile(store, f);
-  }
+  // Per file: one failure is logged and skipped instead of exiting. A stop
+  // signal during a long first index stops before shutdown() closes the
+  // store under the next reindexFile. Files deleted while the server was
+  // down are dropped.
+  const indexed = await reindexAll(store, { shouldStop: () => shuttingDown });
   if (shuttingDown) return;
-  // Drop index state for files deleted while the server was down.
-  store.retainFiles(files.map(getRelativePath));
-  process.stderr.write(`Memoria MCP server started. Indexed ${files.length} files.\n`);
+  process.stderr.write(
+    `Memoria MCP server started. Indexed ${indexed.files} files` +
+      (indexed.failed.length ? ` (${indexed.failed.length} failed, see above).\n` : ".\n"),
+  );
 
   setupWatcher(store);
   setupPeriodicReindex(store);

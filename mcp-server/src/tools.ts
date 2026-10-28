@@ -205,6 +205,35 @@ export async function reindexFile(store: MemoryStore, filePath: string): Promise
   return chunks.length;
 }
 
+/**
+ * Index every memory file, each on its own: one failure (an embedding API
+ * error, a file that cannot be read) is logged and skipped rather than
+ * aborting the pass. At startup an uncaught failure used to exit the
+ * process, and the periodic sweep stopped at the first bad file. Index state
+ * for files no longer on disk is dropped.
+ */
+export async function reindexAll(
+  store: MemoryStore,
+  opts: { shouldStop?: () => boolean } = {},
+): Promise<{ files: number; chunks: number; failed: string[] }> {
+  const files = getAllMemoryFiles();
+  let chunks = 0;
+  const failed: string[] = [];
+  for (const f of files) {
+    if (opts.shouldStop?.()) break;
+    try {
+      chunks += await reindexFile(store, f);
+    } catch (err) {
+      failed.push(getRelativePath(f));
+      process.stderr.write(
+        `Memoria: indexing ${getRelativePath(f)} failed (skipped, retried on the next sweep): ${(err as Error).message}\n`,
+      );
+    }
+  }
+  if (!opts.shouldStop?.()) store.retainFiles(files.map(getRelativePath));
+  return { files: files.length, chunks, failed };
+}
+
 // ─── File watcher (1.5s debounce) ───────────────────────────
 
 export function setupWatcher(store: MemoryStore): void {
@@ -263,14 +292,8 @@ export function setupPeriodicReindex(
     if (running) return;
     running = true;
     try {
-      const onDisk = new Set(getAllMemoryFiles().map(getRelativePath));
-      for (const f of getAllMemoryFiles()) {
-        await reindexFile(store, f);
-      }
-      // Drop chunks for files removed on disk since the last sweep.
-      for (const indexed of store.getIndexedFiles()) {
-        if (!onDisk.has(indexed)) store.removeFile(indexed);
-      }
+      // Per-file failures are logged inside; removed files are dropped.
+      await reindexAll(store);
       // Keep MEMORY_INDEX.md fresh so it never drifts from the territory
       // (Karpathy rule VII). Idempotent — only writes when content changed.
       rebuildMarkdownIndex();
@@ -743,15 +766,20 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
   // Tool 5: memory_index
   server.tool(
     "memory_index",
-    "Rebuild the vector search index and MEMORY_INDEX.md catalog from all memory files. Use after bulk changes.",
-    {},
-    async () => {
-      const files = getAllMemoryFiles();
-      let totalChunks = 0;
-
-      for (const f of files) {
-        totalChunks += await reindexFile(store, f);
-      }
+    "Re-index changed memory files, drop deleted ones, and rebuild the MEMORY_INDEX.md catalog. Use after bulk changes. force=true re-embeds every file even if unchanged (repairs a damaged index).",
+    {
+      force: z
+        .boolean()
+        .optional()
+        .describe("Re-embed every file, not only changed ones (default false)"),
+    },
+    async ({ force }) => {
+      // Unchanged files are skipped by content hash, so without force this
+      // could not repair an index whose rows were damaged.
+      if (force) store.forgetContentHashes();
+      const result = await reindexAll(store);
+      const files = { length: result.files };
+      const totalChunks = result.chunks;
 
       const indexSummary = rebuildMarkdownIndex();
 

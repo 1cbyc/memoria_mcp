@@ -234,7 +234,11 @@ async function minilmEmbed(texts: string[]): Promise<Float32Array[]> {
 
 function hashNgrams(text: string, dim: number): Float32Array {
   const vec = new Float32Array(dim);
-  const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ");
+  // Letters and digits of any script. ASCII-only stripping turned CJK,
+  // Cyrillic, Greek or Arabic text into an all-zero vector (the same bug the
+  // FTS query builder had), so such memories were invisible to the vector
+  // half of search.
+  const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ");
   const words = normalized.split(/\s+/).filter(Boolean);
 
   // Word-level features
@@ -331,7 +335,7 @@ export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
       warnedDimMismatch = true;
       process.stderr.write(
         `Memoria: embedding dimension mismatch (${a.length} vs ${b.length}) — ` +
-          `treating as similarity 0. Run memory_index to rebuild the affected rows.\n`,
+          `treating as similarity 0. Run memory_index with force=true to rebuild them.\n`,
       );
     }
     return 0;
