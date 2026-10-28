@@ -13,6 +13,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { keyedContentHash } from "./crypto.js";
+import { dailyLogPath } from "../daily-paths.js";
 import { collectorDailyHeader, utcTimeLabel } from "../daily-format.js";
 import { createOrAppend, writeFileAtomic } from "../atomic-fs.js";
 import { getProvider } from "../embeddings.js";
@@ -425,10 +426,8 @@ export class IngestionPipeline {
 
   private writeNewMemory(event: RawEvent, importance: number): void {
     const today = new Date().toISOString().slice(0, 10);
-    const dailyDir = path.join(this.config.memoriesDir, "daily");
-    fs.mkdirSync(dailyDir, { recursive: true });
-
-    const dailyFile = path.join(dailyDir, `${today}.md`);
+    // Refuses a symlinked daily/ or log (see daily-paths.ts).
+    const dailyFile = dailyLogPath(this.config.memoriesDir, today);
 
     // Format the event as a daily log entry
     const entry = this.formatDailyEntry(event, importance);

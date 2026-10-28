@@ -37,6 +37,7 @@ import {
   resolveLink,
   type StoreEntry,
 } from "./wiki.js";
+import { dailyLogPath, existingDailyLogPath, listDailyLogNames } from "./daily-paths.js";
 
 // scanStore() reads + parses EVERY memory file, and the wiki link graph
 // (outgoing edges + backlinks) is O(N²) to resolve. Both are computed once and
@@ -451,12 +452,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
         return;
       }
 
-      const files = fs
-        .readdirSync(dailyDir)
-        .filter((f) => f.endsWith(".md"))
-        .sort()
-        .reverse()
-        .slice(0, 30);
+      const files = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, 30);
 
       const logs = files.map((f) => {
         const content = fs.readFileSync(path.join(dailyDir, f), "utf-8");
@@ -482,8 +478,10 @@ export function createDashboardRouter(store: MemoryStore): Router {
         res.status(400).json({ error: "Invalid date format (YYYY-MM-DD)" });
         return;
       }
-      const filePath = path.join(MEMORIES_DIR, "daily", `${dateStr}.md`);
-      const { content, exists } = readMemoryFile(filePath);
+      const filePath = existingDailyLogPath(MEMORIES_DIR, dateStr);
+      const { content, exists } = filePath
+        ? readMemoryFile(filePath)
+        : { content: "", exists: false };
       if (!exists) {
         res.json({ date: dateStr, content: "", exists: false });
         return;
@@ -536,9 +534,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
         return;
       }
 
-      const dailyDir = path.join(MEMORIES_DIR, "daily");
-      fs.mkdirSync(dailyDir, { recursive: true });
-      const dailyFile = path.join(dailyDir, `${today}.md`);
+      const dailyFile = dailyLogPath(MEMORIES_DIR, today);
 
       // UTC, like the file's date: daily logs are UTC days everywhere in
       // Memoria. A server-local label made an evening entry west of UTC read

@@ -22,6 +22,7 @@ import { CollectorDaemon } from "./collector/daemon.js";
 import { IngestionPipeline } from "./collector/ingestion.js";
 import { TemporalFusion, formatFusedActivity, type FusedActivity } from "./collector/fusion.js";
 import type { CustomSourceDefinition } from "./collector/adapters/custom.js";
+import { dailyLogPath, listDailyLogNames } from "./daily-paths.js";
 
 // ─── Path resolution ────────────────────────────────────────
 
@@ -844,10 +845,8 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
     async ({ entry }) => {
       // Daily logs are UTC days (the dashboard journal and ingestion agree).
       const today = new Date().toISOString().split("T")[0];
-      const dailyDir = path.join(MEMORIES_DIR, "daily");
-      const dailyFile = path.join(dailyDir, `${today}.md`);
-
-      fs.mkdirSync(dailyDir, { recursive: true });
+      // Refuses a symlinked daily/ or log (see daily-paths.ts).
+      const dailyFile = dailyLogPath(MEMORIES_DIR, today);
 
       // Daily logs are append-only and may be written concurrently by the
       // collector's ingestion path (which uses appendFileSync). A
@@ -917,12 +916,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: "text" as const, text: "No daily logs found." }] };
       }
 
-      const files = fs
-        .readdirSync(dailyDir)
-        .filter((f) => f.endsWith(".md"))
-        .sort()
-        .reverse()
-        .slice(0, days);
+      const files = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, days);
 
       if (files.length === 0) {
         return { content: [{ type: "text" as const, text: "No daily logs found." }] };
@@ -988,12 +982,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
       let dailyLogCount = 0;
       let totalRecentEvents = 0;
       if (fs.existsSync(dailyDir)) {
-        const recent = fs
-          .readdirSync(dailyDir)
-          .filter((f) => f.endsWith(".md"))
-          .sort()
-          .reverse()
-          .slice(0, 7);
+        const recent = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, 7);
         dailyLogCount = recent.length;
         for (const f of recent) {
           const content = fs.readFileSync(path.join(dailyDir, f), "utf-8");
@@ -1167,7 +1156,18 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
       let slug = baseSlug;
       let relFile = `${dir}/${slug}.md`;
       let counter = 2;
-      while (fs.existsSync(resolveMemoryPath(relFile))) {
+      // resolveMemoryPath throws on a symlinked path: release the lock then,
+      // or every later compile into this directory waited forever.
+      const exists = (rel: string): boolean => {
+        try {
+          return fs.existsSync(resolveMemoryPath(rel));
+        } catch (err) {
+          compileLocks.delete(dirLockKey);
+          releaseLock();
+          throw err;
+        }
+      };
+      while (exists(relFile)) {
         slug = `${baseSlug}-${counter}`;
         relFile = `${dir}/${slug}.md`;
         counter++;
@@ -1292,12 +1292,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: "text" as const, text: "No daily logs to compact." }] };
       }
 
-      const files = fs
-        .readdirSync(dailyDir)
-        .filter((f) => f.endsWith(".md"))
-        .sort()
-        .reverse()
-        .slice(0, days);
+      const files = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, days);
 
       if (files.length === 0) {
         return { content: [{ type: "text" as const, text: "No daily logs to compact." }] };
@@ -1750,9 +1745,7 @@ export function writeFusedActivities(activities: FusedActivity[]): FusedActivity
   const fresh = activities.filter((a) => a.sourceEvents.some((e) => !(fusedEventKey(e) in seen)));
   if (fresh.length > 0) {
     const today = new Date().toISOString().slice(0, 10);
-    const dailyDir = path.join(MEMORIES_DIR, "daily");
-    fs.mkdirSync(dailyDir, { recursive: true });
-    const dailyFile = path.join(dailyDir, `${today}.md`);
+    const dailyFile = dailyLogPath(MEMORIES_DIR, today);
     // createOrAppend, not a bare append: when no event has been written
     // today yet, a bare append created a daily log with no frontmatter.
     for (const activity of fresh) {

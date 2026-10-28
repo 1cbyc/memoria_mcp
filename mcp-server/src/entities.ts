@@ -23,6 +23,7 @@ import path from "path";
 import { parseFrontmatter } from "./chunker.js";
 import { TIME_LABEL_SRC } from "./daily-format.js";
 import { writeFileAtomic } from "./atomic-fs.js";
+import { listDailyLogNames } from "./daily-paths.js";
 
 /** Marker placed in entity-page frontmatter so we only ever overwrite our own
  * generated files — never something a human took over. */
@@ -96,13 +97,7 @@ function aggregate(
   let eventsScanned = 0;
   if (!fs.existsSync(dailyDir)) return { bySource, eventsScanned };
 
-  const files = fs
-    .readdirSync(dailyDir)
-    .filter((f) => f.endsWith(".md"))
-    .sort()
-    .reverse()
-    .slice(0, days)
-    .reverse(); // chronological so firstSeen/lastSeen are correct
+  const files = listDailyLogNames(memoriesDir).sort().reverse().slice(0, days).reverse(); // chronological so firstSeen/lastSeen are correct
 
   for (const file of files) {
     const date = path.basename(file, ".md");

@@ -86,4 +86,35 @@ check "deferral: the scheduled push reached the remote" test "$(git -C "$REMOTE"
 for _ in 1 2 3; do [ -f "$STORE/.sync-push-pending" ] || break; sleep 1; done
 check "deferral: the pending marker is cleared" test ! -f "$STORE/.sync-push-pending"
 
+# ── Conflicts only in generated files resolve themselves ──
+# Two devices both regenerate MEMORY_INDEX.md (a store set up without the
+# union line for it): the pull used to abort the merge on every run.
+ORIGIN="$TMP/gen-origin.git"; DEV_A="$TMP/dev-a"; DEV_B="$TMP/dev-b"
+git init -q --bare "$ORIGIN"
+git clone -q "$ORIGIN" "$DEV_A" 2>/dev/null
+git -C "$DEV_A" config user.email t@t; git -C "$DEV_A" config user.name t
+mkdir -p "$DEV_A/memories/project"
+printf 'index v0\n' > "$DEV_A/memories/MEMORY_INDEX.md"
+printf 'core v0\n' > "$DEV_A/memories/project/core.md"
+git -C "$DEV_A" add -A; git -C "$DEV_A" commit -qm base; git -C "$DEV_A" push -q origin HEAD 2>/dev/null
+GBR="$(git -C "$DEV_A" rev-parse --abbrev-ref HEAD)"
+git clone -q "$ORIGIN" "$DEV_B" 2>/dev/null
+git -C "$DEV_B" config user.email t@t; git -C "$DEV_B" config user.name t
+printf 'index from A\n' > "$DEV_A/memories/MEMORY_INDEX.md"
+git -C "$DEV_A" commit -qam "A"; git -C "$DEV_A" push -q origin HEAD 2>/dev/null
+printf 'index from B\n' > "$DEV_B/memories/MEMORY_INDEX.md"
+git -C "$DEV_B" commit -qam "B"
+MEMORIA_DIR="$DEV_B" bash "$REPO_ROOT/scripts/sync/memoria-sync-pull.sh" >/dev/null 2>&1
+check "generated: merge completed" test "$(git -C "$DEV_B" rev-list --count "HEAD..origin/$GBR")" = "0"
+check "generated: no merge left in progress" test ! -f "$DEV_B/.git/MERGE_HEAD"
+
+# A conflict in a real memory still stops for a human.
+printf 'core from A\n' > "$DEV_A/memories/project/core.md"
+git -C "$DEV_A" commit -qam "A core"; git -C "$DEV_A" push -q origin HEAD 2>/dev/null
+printf 'core from B\n' > "$DEV_B/memories/project/core.md"
+git -C "$DEV_B" commit -qam "B core"
+MEMORIA_DIR="$DEV_B" bash "$REPO_ROOT/scripts/sync/memoria-sync-pull.sh" >/dev/null 2>&1
+check "core conflict: merge aborted, local version kept" grep -q 'core from B' "$DEV_B/memories/project/core.md"
+check "core conflict: logged" grep -q 'SYNC CONFLICT' "$DEV_B/.sync.log"
+
 if [ "$fail" -eq 0 ]; then echo "all sync script tests passed"; else echo "FAILURES"; exit 1; fi

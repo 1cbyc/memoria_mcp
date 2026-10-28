@@ -14,6 +14,7 @@ import path from "path";
 import { parseFrontmatter } from "./chunker.js";
 import { getProvider } from "./embeddings.js";
 import type { MemoryStore } from "./store.js";
+import { listDailyLogNames } from "./daily-paths.js";
 
 /** True if a relative memory path is a daily log (separator-agnostic). */
 function isDailyPath(relPath: string): boolean {
@@ -668,12 +669,7 @@ async function findGaps(store: MemoryStore, memoriesDir: string): Promise<string
   if (!fs.existsSync(dailyDir)) return [];
 
   // Read recent daily logs
-  const dailyFiles = fs
-    .readdirSync(dailyDir)
-    .filter((f) => f.endsWith(".md"))
-    .sort()
-    .reverse()
-    .slice(0, 14); // last 2 weeks
+  const dailyFiles = listDailyLogNames(memoriesDir).sort().reverse().slice(0, 14); // last 2 weeks
 
   if (dailyFiles.length === 0) return [];
 

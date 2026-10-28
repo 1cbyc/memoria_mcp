@@ -75,7 +75,11 @@ export function parseFrontmatter(content: string): {
 
   let metadata: Record<string, unknown> = {};
   try {
-    const parsed = load(match[1], { schema: FRONTMATTER_READ_SCHEMA });
+    // json: a repeated key takes its last value instead of failing the
+    // whole block. Git's union merge of a daily log written on two devices
+    // keeps both sides' differing header lines (importance: 3 and
+    // importance: 5), and a strict parse then dropped every field.
+    const parsed = load(match[1], { schema: FRONTMATTER_READ_SCHEMA, json: true });
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       metadata = parsed as Record<string, unknown>;
       // Normalize Date objects (YAML auto-parses ISO dates) back to ISO strings.
