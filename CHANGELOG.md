@@ -16,7 +16,7 @@ existing store gets a migration note here.
 Security fixes from the 2026-10 whole-repo review and the critical
 re-review that followed it, plus a re-weighted search default. The memory
 file format is unchanged. **The search index is rebuilt once on first
-start** (see below); access counts gathered so far start over.
+start** (see below); access counts and last reads are kept.
 
 **Breaking changes:**
 
@@ -210,12 +210,23 @@ start** (see below); access counts gathered so far start over.
 - Entity pages for sources whose names slugify alike no longer overwrite
   each other.
 - The sync push hook schedules a deferred push for the end of its rate
-  limit instead of leaving a session's last commits on the device.
+  limit instead of leaving a session's last commits on the device; the
+  push runs in its own session, so the hook runner cannot kill it.
 - `deploy/gcp/deploy-demo.sh` could not start (production posture
   checks) and ran two instances; fixed.
 - The Python ingestion hook no longer blocks `record_*` calls on the
-  network, and drops batches the server rejects with a 4xx instead of
-  retrying them forever.
+  network, sends at most 200 events per request (the `/ingest` limit),
+  and drops batches the server rejects with a 4xx instead of retrying
+  them forever.
+- The dashboard's consent dialog for a custom source shows the file it
+  reads or the command it runs, not only its (caller-chosen) name.
+- A failed build no longer overwrites `dist/` (`noEmitOnError`), so the
+  launcher really serves the previous build; the plugin's first install
+  uses `npm ci`.
+- Promotion (`boostImportance`) stops two points above a memory's own
+  importance; with every search result counting as an access, files
+  drifted to 10.
+- `docker-compose.yml` exposes `MEMORIA_TRUST_PROXY`.
 - Dashboard annotations use the atomic append helper; entity-page
   regeneration re-checks for human edits at write time; the custom
   file-watcher skips files over 10 MB instead of reading them whole.

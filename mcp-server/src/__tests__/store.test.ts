@@ -488,3 +488,18 @@ describe("re-review 2026-10: duplicate check and version-3 migration", () => {
     expect(indexVersionOutdated("1", "openai")).toBe(true);
   });
 });
+
+describe("promotion is bounded by the memory's own importance (review 2026-10)", () => {
+  it("boosts at most two points above the frontmatter importance", async () => {
+    const c = "---\nname: B\nimportance: 4\n---\nA note about quantum widgets.";
+    await store.indexChunks(chunkMarkdown(c, "b.md"), 4, c);
+    for (let i = 0; i < 12; i++) store.trackAccess("b.md");
+    const db = (store as any).db;
+    for (let day = 0; day < 6; day++) {
+      db.prepare("DELETE FROM store_meta WHERE key = 'last_boost_run'").run(); // a new day
+      store.boostImportance(10);
+    }
+    const row = db.prepare("SELECT importance FROM chunks WHERE file = 'b.md'").get();
+    expect(row.importance).toBe(6);
+  });
+});

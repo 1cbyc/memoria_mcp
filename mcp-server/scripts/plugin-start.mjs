@@ -39,7 +39,11 @@ if (!existsSync(nodeModules) || !existsSync(sdk)) {
   note("first run — installing dependencies (this happens once, and can take a minute)");
   const started = Date.now();
   const isWindows = process.platform === "win32";
-  const NPM_ARGS = ["install", "--no-audit", "--no-fund", "--loglevel", "error"];
+  // `ci` when the lockfile is there (it always is in a plugin checkout): the
+  // exact, audited dependency tree, and the lockfile is never rewritten.
+  // `install` resolved afresh within the semver ranges.
+  const hasLock = existsSync(path.join(root, "package-lock.json"));
+  const NPM_ARGS = [hasLock ? "ci" : "install", "--no-audit", "--no-fund", "--loglevel", "error"];
   const options = {
     cwd: root,
     // stdout piped, NOT inherited: npm writes progress to stdout and that

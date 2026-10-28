@@ -24,7 +24,10 @@ DEMO_KEY="${DEMO_KEY:-memoria-demo}"
 # http.ts). The demo's data is throwaway, so fresh random values per deploy
 # are right: nothing encrypted needs to outlive the instance. The public URL
 # is the service's deterministic Cloud Run URL; override with
-# DEMO_PUBLIC_URL (e.g. a custom domain).
+# DEMO_PUBLIC_URL (e.g. a custom domain). Unlike the real service (see
+# SECURITY.md's checklist), these go in as plain env vars, readable by anyone
+# with run.services.get on the project: acceptable only because they guard
+# throwaway demo data and are regenerated on every deploy.
 OAUTH_SECRET="$(openssl rand -hex 32)"
 ENCRYPTION_KEY="$(openssl rand -hex 32)"
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"

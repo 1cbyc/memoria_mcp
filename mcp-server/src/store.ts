@@ -1202,9 +1202,15 @@ export class MemoryStore {
       return 0; // Already ran today
     }
 
+    // Bounded at two above the memory's own (frontmatter) importance, kept in
+    // file_meta. Every search result counts as an access, so a file that
+    // keeps being returned was boosted +1 on every run day and drifted to 10
+    // under MEMORIA_AUTO_OPTIMIZE, whatever its author rated it.
+    const cap = `MIN(10, COALESCE((SELECT fm.importance FROM file_meta fm WHERE fm.file = chunks.file), 5) + 2)`;
     const result = this.db
       .prepare(
-        "UPDATE chunks SET importance = MIN(10, importance + 1) WHERE access_count >= ? AND importance < 10",
+        `UPDATE chunks SET importance = MIN(${cap}, importance + 1)
+         WHERE access_count >= ? AND importance < ${cap}`,
       )
       .run(accessThreshold);
 

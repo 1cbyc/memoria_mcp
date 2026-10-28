@@ -1256,7 +1256,8 @@ async function enableSource(id) {
   const agreed = confirm(
     'Enable "' + source.name + '"?\\n\\n' +
     'This source will collect: ' + source.description + '\\n' +
-    'Permissions: ' + (source.requiredPermissions.join(', ') || 'none') + '\\n\\n' +
+    'Permissions: ' + (source.requiredPermissions.join(', ') || 'none') + '\\n' +
+    (source.detail ? source.detail + '\\n' : '') + '\\n' +
     'All collected data is encrypted (AES-256-GCM). Only you and the Memoria agent have access.\\n\\n' +
     'Click OK to agree and enable.'
   );

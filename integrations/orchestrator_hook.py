@@ -56,6 +56,9 @@ except ImportError:
 
 logger = logging.getLogger("memoria_hook")
 
+# The most events Memoria's /ingest accepts in one request.
+MAX_BATCH = 200
+
 
 def _http_status(exc: Exception) -> Optional[int]:
     """The HTTP status behind an httpx/requests error, if there is one."""
@@ -308,38 +311,59 @@ class MemoriaHook:
                 events = self._buffer[:]
                 self._buffer.clear()
 
-            try:
-                return self._send(events)
-            except Exception as e:
-                status = _http_status(e)
-                if status is not None and 400 <= status < 500 and status not in (408, 429):
-                    # A client error (bad key, payload rejected) fails the same
-                    # way on every retry; re-queueing it retried forever and
-                    # crowded out newer events.
-                    logger.error(
-                        "Memoria rejected %d event(s) with HTTP %d; dropping them: %s",
-                        len(events),
-                        status,
-                        e,
-                    )
-                    return {"error": str(e), "dropped": len(events)}
-                logger.error(f"Memoria flush failed: {e}")
-                # Re-queue failed events at the FRONT so retry preserves chronological
-                # order (extend() would interleave them after newer pushes). Cap the
-                # buffer at 2x max_buffer, dropping the OLDEST on overflow, so a long
-                # Memoria outage can't grow the buffer unbounded.
-                with self._lock:
-                    self._buffer[:0] = events
-                    hard_cap = self.max_buffer * 2
-                    if len(self._buffer) > hard_cap:
-                        dropped = len(self._buffer) - hard_cap
-                        self._buffer = self._buffer[-hard_cap:]
-                        logger.warning(
-                            "Memoria buffer over %d after failed flush; dropped %d oldest event(s)",
-                            hard_cap,
-                            dropped,
+            # /ingest takes at most MAX_BATCH events per request and answers
+            # 400 to more. The buffer can hold more (max_buffer > 200, or
+            # events re-queued after an outage plus those pushed meanwhile),
+            # so send in chunks: a whole oversized batch was otherwise
+            # rejected, and then dropped as a client error.
+            results = []
+            for start in range(0, len(events), MAX_BATCH):
+                chunk = events[start : start + MAX_BATCH]
+                try:
+                    results.append(self._send(chunk))
+                except Exception as e:
+                    status = _http_status(e)
+                    if status is not None and 400 <= status < 500 and status not in (408, 429):
+                        # A client error (bad key, payload rejected) fails the
+                        # same way on every retry; re-queueing it retried
+                        # forever and crowded out newer events.
+                        logger.error(
+                            "Memoria rejected %d event(s) with HTTP %d; dropping them: %s",
+                            len(chunk),
+                            status,
+                            e,
                         )
-                return {"error": str(e)}
+                        results.append({"error": str(e), "dropped": len(chunk)})
+                        continue
+                    logger.error(f"Memoria flush failed: {e}")
+                    # Re-queue this chunk and everything after it at the FRONT
+                    # so retry preserves chronological order (extend() would
+                    # interleave them after newer pushes). Cap the buffer at
+                    # 2x max_buffer, dropping the OLDEST on overflow, so a long
+                    # Memoria outage can't grow the buffer unbounded.
+                    with self._lock:
+                        self._buffer[:0] = events[start:]
+                        hard_cap = self.max_buffer * 2
+                        if len(self._buffer) > hard_cap:
+                            dropped = len(self._buffer) - hard_cap
+                            self._buffer = self._buffer[-hard_cap:]
+                            logger.warning(
+                                "Memoria buffer over %d after failed flush; dropped %d oldest event(s)",
+                                hard_cap,
+                                dropped,
+                            )
+                    results.append({"error": str(e)})
+                    break
+            if len(results) == 1:
+                return results[0]
+            merged: dict = {"batches": len(results)}
+            for r in results:
+                for k, v in r.items():
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        merged[k] = merged.get(k, 0) + v
+                    elif k == "error":
+                        merged["error"] = v
+            return merged
 
     def _send(self, events: list[dict]) -> dict:
         headers = {

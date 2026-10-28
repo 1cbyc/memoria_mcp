@@ -72,13 +72,15 @@ git init -q --bare "$REMOTE"
 git -C "$STORE" remote add origin "$REMOTE"
 BR="$(git -C "$STORE" rev-parse --abbrev-ref HEAD)"
 git -C "$STORE" push -q origin "$BR"
-touch "$STORE/.last-sync" # a push just happened
+# A push 27s ago with a 30s interval: deferred, with ~3s to spare for the
+# "not pushed yet" check (whole-second clocks made a 2s interval flaky).
+touch -d "@$(( $(date +%s) - 27 ))" "$STORE/.last-sync"
 echo deferred >> "$STORE/memories/a.md"
-MEMORIA_DIR="$STORE" MEMORIA_SYNC_INTERVAL_S=2 bash "$REPO_ROOT/scripts/sync/memoria-sync-push.sh" >"$TMP/out8" 2>&1
+MEMORIA_DIR="$STORE" MEMORIA_SYNC_INTERVAL_S=30 bash "$REPO_ROOT/scripts/sync/memoria-sync-push.sh" >"$TMP/out8" 2>&1
 LOCAL_HEAD="$(git -C "$STORE" rev-parse HEAD)"
 check "deferral: not pushed inside the interval" test "$(git -C "$REMOTE" rev-parse "$BR")" != "$LOCAL_HEAD"
 check "deferral: one background push scheduled" test -f "$STORE/.sync-push-pending"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+for _ in $(seq 1 15); do
   [ "$(git -C "$REMOTE" rev-parse "$BR")" = "$LOCAL_HEAD" ] && break
   sleep 1
 done

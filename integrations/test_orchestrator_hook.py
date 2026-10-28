@@ -107,3 +107,38 @@ def test_recording_never_waits_on_a_slow_send():
         hook._push(event(i))  # must not block behind the in-flight send
     assert time.monotonic() - started < 1.0
     release.set()
+
+
+def test_large_buffers_are_sent_in_chunks_the_server_accepts():
+    hook = make_hook(max_buffer=500)
+    hook._buffer = [event(i) for i in range(450)]
+    sizes = []
+
+    def send(events):
+        if len(events) > 200:
+            raise _HTTPError(400)  # what /ingest answers to more than 200
+        sizes.append(len(events))
+        return {"accepted": len(events)}
+
+    hook._send = send
+    result = hook.flush()
+    assert sizes == [200, 200, 50]
+    assert result["accepted"] == 450
+    assert hook._buffer == []
+
+
+def test_an_outage_mid_flush_requeues_the_rest_in_order():
+    hook = make_hook(max_buffer=500)
+    hook._buffer = [event(i) for i in range(450)]
+    calls = []
+
+    def send(events):
+        calls.append(len(events))
+        if len(calls) == 2:
+            raise _HTTPError(503)
+        return {"accepted": len(events)}
+
+    hook._send = send
+    hook.flush()
+    assert [e["id"] for e in hook._buffer][:2] == ["e200", "e201"]
+    assert len(hook._buffer) == 250

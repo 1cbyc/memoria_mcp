@@ -15,7 +15,9 @@
  *      re-emitted on stderr.
  *   2. A type error must not leave the user with no memory at all. If the build
  *      fails but a previous `dist/` exists, warn loudly and serve the stale
- *      build rather than exiting.
+ *      build rather than exiting. (tsconfig sets noEmitOnError, so a failed
+ *      build leaves that previous dist/ untouched instead of overwriting it
+ *      with the broken output.)
  */
 
 import { spawnSync } from "node:child_process";

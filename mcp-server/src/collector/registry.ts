@@ -42,6 +42,12 @@ export interface SourceStatus {
   eventCount: number;
   lastPoll: string | null;
   error: string | null;
+  /**
+   * For a custom source, what it actually reads or runs (the watched path
+   * or the command). Shown in the consent dialog: the name and description
+   * are free text chosen by whoever added the source, possibly an agent.
+   */
+  detail: string | null;
 }
 
 export interface UserAgreement {
@@ -204,10 +210,19 @@ export class SourceRegistry {
         eventCount: this.state.eventCounts[id] ?? 0,
         lastPoll: this.lastPolled.get(id) ?? null,
         error: this.errors.get(id) ?? null,
+        detail: this.customDetail(id),
       });
     }
 
     return statuses;
+  }
+
+  private customDetail(sourceId: string): string | null {
+    const def = this.state.customSources.find((d) => `custom-${d.id}` === sourceId);
+    if (!def) return null;
+    if (def.mode === "shell_command") return `Runs the command: ${def.command ?? ""}`;
+    if (def.mode === "file_watcher") return `Reads the file: ${def.watchPath ?? ""}`;
+    return `Mode: ${def.mode}`;
   }
 
   /**

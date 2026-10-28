@@ -514,3 +514,20 @@ describe("custom sources emit only new records (review 2026-10)", () => {
     expect((await adapter.poll()).map((e) => e.content)).toEqual(["Shipped the release on Friday"]);
   });
 });
+
+describe("consent shows what a custom source does (review 2026-10)", () => {
+  it("lists the watched path or command, not just the caller-chosen name", () => {
+    process.env.MEMORIA_FILE_WATCHER_ROOTS = root;
+    const file = path.join(root, "notes.json");
+    fs.writeFileSync(file, "[]");
+    reg.addCustomSource(def({ id: "w", name: "Notes sync", watchPath: file }));
+    process.env.MEMORIA_ALLOW_SHELL_SOURCES = "true";
+    reg.addCustomSource(
+      def({ id: "c", name: "Harmless", mode: "shell_command", command: "cat /etc/passwd" }),
+    );
+    const byId = Object.fromEntries(reg.listSources().map((s) => [s.id, s.detail]));
+    expect(byId["custom-w"]).toBe(`Reads the file: ${file}`);
+    expect(byId["custom-c"]).toBe("Runs the command: cat /etc/passwd");
+    expect(byId["email"]).toBeNull();
+  });
+});

@@ -292,7 +292,7 @@ For a durable cloud deployment see [`deploy/gcp/README.md`](deploy/gcp/README.md
 
 | Tool | Description |
 |------|-------------|
-| `memory_sources` | List, enable, disable, add custom, remove, or configure data sources. Includes user agreement flow. |
+| `memory_sources` | List, enable, disable, add custom, remove, or configure data sources. Consent is granted only in the dashboard, and through MCP only a source's schedule can be changed. |
 | `memory_ingest` | Manually trigger ingestion of buffered events into core memory |
 | `memory_fuse` | Run cross-source temporal fusion to detect correlated activities |
 | `memory_priority` | View collector status, adjust importance thresholds, flush buffer |
@@ -492,7 +492,7 @@ curl -X POST https://<your-host>/ingest \
 Response: `{ "accepted": 1, "buffered": 1, "written": 1, "deduplicated": 0, "rateLimited": 0, "failed": 0, "bufferDropped": 0, "bufferUsage": { … } }`
 
 
-**Python hook.** [`integrations/orchestrator_hook.py`](integrations/orchestrator_hook.py) is a dependency-light (`httpx` or `requests`) client that buffers events and flushes them every 30 s in the background — originally written for a multi-agent orchestrator, but generic: `record_agent_result`, `record_metric`, `record_conversation`, `record_training_eval`, plus raw `record(...)`. All calls are best-effort; a Memoria outage never breaks the caller.
+**Python hook.** [`integrations/orchestrator_hook.py`](integrations/orchestrator_hook.py) is a dependency-light (`httpx` or `requests`) client that buffers events and flushes them every 30 s in the background — originally written for a multi-agent orchestrator, but generic: `record_agent_result`, `record_metric`, `record_conversation`, `record_training_eval`, `record_prompt_change` and `record_discovery`. All calls are best-effort and never wait on the network; a Memoria outage never breaks the caller.
 
 ```python
 from integrations.orchestrator_hook import MemoriaHook
@@ -742,7 +742,7 @@ memories/daily/*.md merge=union
 
 With that in place, same-day entries from two devices merge silently and none are lost. Core memories (`user/`, `project/`, `decisions/`, …) deliberately keep the normal three-way merge: those files are edited rather than appended, so a both-sides change is a real disagreement that deserves a human. (Union merge keeps every entry but does not reorder them chronologically — see the [sync guide](scripts/sync/README.md#why-daily-logs-never-conflict).)
 
-**Object storage is optional.** If you also run a hosted instance backed by a bucket, drop an executable at `$MEMORIA_DIR/.memoria-mirror.sh` and both scripts will call it with `pull` / `push` around the git sync.
+**Object storage is optional.** If you also run a hosted instance backed by a bucket, drop an executable at `$MEMORIA_DIR/.memoria-mirror.sh` and set `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true`; both scripts then call it with `pull` / `push` around the git sync. (Without that opt-in it is never run: it lives inside the synced store, so anyone able to push to the store could otherwise run code on your machine.)
 
 **From Claude Code's built-in memory.** [`scripts/sync-from-claude-memory.sh`](scripts/sync-from-claude-memory.sh) one-way-pulls a project's `~/.claude/projects/<project>/memory/*.md` into the store (`MEMORIA_DIR`, default `~/.memoria`) so existing auto-memory is not lost. Pass the memory directory as an argument when more than one project has one.
 
@@ -755,8 +755,8 @@ See [SECURITY.md](SECURITY.md) for the trust model (single-tenant, one static ke
 | **Authentication** | OAuth 2.1 (authorization_code + PKCE, client_credentials) and static Bearer token. 24h token TTL. |
 | **Persistent tokens** | OAuth tokens and codes stored in SQLite as SHA-256 hashes, so a copied database holds no usable credential. They survive restarts when the database is on persistent disk; the Docker image keeps it on container-local `/tmp` (see `MEMORIA_TOKEN_DB_DIR`), so a restart there means one re-auth |
 | **Encryption at rest** | AES-256-GCM for all collector data, configs, and the ring buffer |
-| **Rate limiting** | Per client IP: `/mcp` 30/min, `/token`+`/authorize`+`/register` 20/min, `/ingest`+`/dashboard/api` 120/min (trusts one proxy hop for the real client IP) |
-| **Body size limit** | 5 MB max request body (sized for batched `/ingest` payloads) |
+| **Rate limiting** | Per client IP: `/mcp` 30/min, `/token`+`/authorize`+`/register` 20/min, `/ingest`+`/dashboard/api` 120/min (trusts `MEMORIA_TRUST_PROXY` proxy hops, default 1, for the real client IP) |
+| **Body size limit** | 64 KB for unauthenticated routes; 1 MB on `/mcp` and `/dashboard/api` and 5 MB on `/ingest`, parsed only after authentication |
 | **Session management** | Max 10 concurrent sessions, 30-minute idle TTL |
 | **Localhost binding** | HTTP server binds to `127.0.0.1` by default; set `BIND_ALL=true` for Docker/cloud. NOTE: every shipped Docker/Cloud Run config sets `BIND_ALL=true`, so in production the network is open and Bearer auth is the only access control. |
 | **Non-root container** | Docker image runs as unprivileged `memoria` user (UID 1001), which owns only its data and the model cache; the application code is root-owned |
