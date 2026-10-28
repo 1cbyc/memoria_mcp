@@ -371,7 +371,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
   router.post("/api/sources/:id/disable", async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
-      const result = await registry.disableSource(req.params.id);
+      const result = await registry.disableSource(req.params.id, "user");
       if (result.success) daemon.syncPollTimers();
       res.json(result);
     } catch (err: any) {

@@ -1642,16 +1642,28 @@ let daemon: CollectorDaemon | null = null;
 let ingestion: IngestionPipeline | null = null;
 let fusion: TemporalFusion | null = null;
 let collectorInitPromise: Promise<void> | null = null;
+let collectorReady = false;
+let resumeRetryTimer: NodeJS.Timeout | null = null;
+
+/** How often enabled sources that failed to start are tried again. */
+const RESUME_RETRY_MS = 10 * 60 * 1000;
 
 async function ensureCollector(store: MemoryStore): Promise<void> {
-  if (registry) return;
+  // The fast path keys on completion, not on `registry` being set: the
+  // registry is assigned before init's first await, so callers used to
+  // proceed against a half-built collector (no ingestion yet, buffer not
+  // initialised).
+  if (collectorReady) return;
   // If init is already in flight, wait for it instead of starting a second one
-  if (collectorInitPromise) return collectorInitPromise;
-
-  collectorInitPromise = doInitCollector(store).finally(() => {
-    // Clear the promise once done so future calls hit the registry-set fast path
-    collectorInitPromise = null;
-  });
+  if (!collectorInitPromise) {
+    collectorInitPromise = doInitCollector(store)
+      .then(() => {
+        collectorReady = true;
+      })
+      .finally(() => {
+        collectorInitPromise = null;
+      });
+  }
   return collectorInitPromise;
 }
 
@@ -1729,9 +1741,25 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
     return result;
   });
 
-  // Resume the sources left enabled before a restart, then start polling.
-  await registry.restoreEnabledSources();
   daemon.start();
+
+  // Resume the sources left enabled before a restart, each on its own and
+  // in the background: a slow login or dependency install must not hold up
+  // the collector, and the registry serializes a resume against a
+  // concurrent enable of the same source. Sources that fail (offline at
+  // boot, say) are retried periodically rather than staying dead until the
+  // next restart.
+  const reg = registry;
+  const d = daemon;
+  const resume = () =>
+    reg
+      .restoreEnabledSources(() => d.syncPollTimers())
+      .catch((err) =>
+        process.stderr.write(`Memoria: resuming sources failed: ${(err as Error).message}\n`),
+      );
+  void resume();
+  resumeRetryTimer = setInterval(resume, RESUME_RETRY_MS);
+  resumeRetryTimer.unref();
 }
 
 /**
@@ -1744,6 +1772,9 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
 export async function resumeCollectorIfConfigured(store: MemoryStore): Promise<void> {
   if (!fs.existsSync(path.join(DATA_DIR, "collector-config.enc"))) return;
   try {
+    // A config can exist with every source off; then there is nothing to
+    // resume and no reason to run the daemon.
+    if (!new SourceRegistry(DATA_DIR).hasEnabledSources()) return;
     await ensureCollector(store);
   } catch (err) {
     process.stderr.write(`Memoria: collector did not start: ${(err as Error).message}\n`);
@@ -2153,6 +2184,9 @@ export async function destroyCollector(): Promise<void> {
   } catch {
     // best-effort
   }
+  if (resumeRetryTimer) clearInterval(resumeRetryTimer);
+  resumeRetryTimer = null;
+  collectorReady = false;
   if (daemon) await daemon.stop();
   if (buffer) await buffer.destroy();
   if (registry) await registry.destroy();

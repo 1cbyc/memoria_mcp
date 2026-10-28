@@ -36,6 +36,11 @@ export class EmailAdapter implements SourceAdapter {
 
   private client: any = null;
   private checkpoint: number = 0; // UID of last processed message
+  // UIDs are only meaningful within one UIDVALIDITY. When the mailbox is
+  // recreated, the server migrates, or the mailbox setting changes, a stale
+  // high UID made "N:*" match only the newest message, which the cursor
+  // then skipped: collection stopped silently.
+  private uidValidity: string = "";
   private config!: AdapterConfig;
 
   async init(config: AdapterConfig): Promise<void> {
@@ -100,6 +105,15 @@ export class EmailAdapter implements SourceAdapter {
       const lock = await this.client.getMailboxLock(mailbox);
 
       try {
+        const validity = String(this.client.mailbox?.uidValidity ?? "");
+        if (validity && this.uidValidity && validity !== this.uidValidity) {
+          process.stderr.write(
+            `Memoria email: UIDVALIDITY of ${mailbox} changed; restarting from the newest message.\n`,
+          );
+          this.checkpoint = 0;
+        }
+        if (validity) this.uidValidity = validity;
+
         // Messages with a UID above the checkpoint. The range is only read
         // as UIDs when `uid: true` is in the third (options) argument; in the
         // query object it merely asks for the UID attribute, and the stored
@@ -187,11 +201,14 @@ export class EmailAdapter implements SourceAdapter {
   }
 
   getCheckpoint(): string {
-    return String(this.checkpoint);
+    return this.uidValidity ? `${this.uidValidity}:${this.checkpoint}` : String(this.checkpoint);
   }
 
+  /** "<uidvalidity>:<uid>", or a bare UID from before UIDVALIDITY was kept. */
   setCheckpoint(cursor: string): void {
-    this.checkpoint = parseInt(cursor, 10) || 0;
+    const sep = cursor.indexOf(":");
+    this.uidValidity = sep === -1 ? "" : cursor.slice(0, sep);
+    this.checkpoint = parseInt(sep === -1 ? cursor : cursor.slice(sep + 1), 10) || 0;
   }
 
   async destroy(): Promise<void> {

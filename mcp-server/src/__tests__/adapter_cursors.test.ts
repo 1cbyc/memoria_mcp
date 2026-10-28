@@ -19,10 +19,12 @@ const imap = {
   messages: [] as FakeMessage[],
   fetchCalls: [] as Array<{ range: string; query: any; options: any }>,
   failLock: false,
+  uidValidity: 1,
 };
 
 class FakeImapFlow {
   usable = false;
+  mailbox: { uidValidity: number } | false = false;
   constructor(public opts: any) {
     imap.instances.push(this);
   }
@@ -37,6 +39,7 @@ class FakeImapFlow {
   }
   async getMailboxLock() {
     if (imap.failLock) throw new Error("connection not available");
+    this.mailbox = { uidValidity: imap.uidValidity };
     return { release() {} };
   }
   // Mirrors IMAP: "N:*" by UID when options.uid, else by sequence number;
@@ -86,6 +89,7 @@ beforeEach(() => {
   imap.instances = [];
   imap.fetchCalls = [];
   imap.failLock = false;
+  imap.uidValidity = 1;
   // A long-lived mailbox: UIDs far above sequence numbers.
   imap.messages = Array.from({ length: 5 }, (_, i) => ({ uid: 120_000 + i, seq: 4_996 + i }));
 });
@@ -99,7 +103,17 @@ describe("EmailAdapter", () => {
     expect(imap.fetchCalls[0].range).toBe("120002:*");
     expect(imap.fetchCalls[0].options).toEqual({ uid: true });
     expect(events.map((e) => e.id)).toEqual(["email-120002", "email-120003", "email-120004"]);
-    expect(a.getCheckpoint()).toBe("120004");
+    expect(a.getCheckpoint()).toBe("1:120004");
+  });
+
+  it("restarts from the newest message when UIDVALIDITY changes", async () => {
+    const a = new EmailAdapter();
+    await a.init(emailConfig());
+    a.setCheckpoint("1:999999"); // a UID from the mailbox's previous life
+    imap.uidValidity = 2;
+    const events = await a.poll();
+    expect(events.map((e) => e.id)).toEqual(["email-120004"]);
+    expect(a.getCheckpoint()).toBe("2:120004");
   });
 
   it("starts from the newest message when there is no cursor", async () => {
@@ -107,7 +121,7 @@ describe("EmailAdapter", () => {
     await a.init(emailConfig());
     const events = await a.poll();
     expect(events.map((e) => e.id)).toEqual(["email-120004"]);
-    expect(a.getCheckpoint()).toBe("120004");
+    expect(a.getCheckpoint()).toBe("1:120004");
     // Nothing new: the "*" match on the newest message is not re-emitted.
     expect(await a.poll()).toEqual([]);
   });
@@ -137,10 +151,14 @@ function fakeGmail(pages: Array<{ history: any[]; nextPageToken?: string }>, cur
   const gmail = {
     users: {
       history: {
-        list: vi.fn(async ({ pageToken }: { pageToken?: string }) => {
-          const page = pages[pageToken ? parseInt(pageToken, 10) : 0];
-          return { data: { ...page, historyId: current } };
-        }),
+        list: vi.fn(
+          async ({ pageToken, startHistoryId }: { pageToken?: string; startHistoryId: string }) => {
+            const page = pages[pageToken ? parseInt(pageToken, 10) : 0];
+            // startHistoryId is exclusive, as in the Gmail API.
+            const history = page.history.filter((r) => Number(r.id) > Number(startHistoryId));
+            return { data: { ...page, history, historyId: current } };
+          },
+        ),
       },
       messages: {
         get: vi.fn(async ({ id }: { id: string }) => {
@@ -197,6 +215,20 @@ describe("GoogleGmailAdapter history cursor", () => {
     expect(fetched).toEqual(["m1", "m2", "m3"]);
     // Not the mailbox's current id (900): records 103-104 are still pending.
     expect(a.getCheckpoint()).toBe("102");
+  });
+
+  it("the next poll resumes exactly where the previous batch stopped", async () => {
+    const { gmail, fetched } = fakeGmail([
+      {
+        history: [record(101, "m1", "m2"), record(102, "m3"), record(103, "m4"), record(104, "m5")],
+      },
+    ]);
+    const a = gmailAdapter(gmail, 3);
+    await a.poll();
+    expect(a.getCheckpoint()).toBe("102");
+    await a.poll();
+    expect(fetched).toEqual(["m1", "m2", "m3", "m4", "m5"]);
+    expect(a.getCheckpoint()).toBe("900");
   });
 
   it("jumps to the mailbox's current history id once everything was read", async () => {
@@ -271,16 +303,33 @@ describe("CalendarAdapter cursor", () => {
 
   it("a page cut off by the limit resumes after the last row returned, not at 'now'", async () => {
     const base = Date.now() / 1000 - CORE_DATA_EPOCH - 100_000;
-    const db = calendarDb(250, (i) => base + i);
+    const db = calendarDb(550, (i) => base + i);
     const a = calendarAdapter(db);
     a.setCheckpoint(new Date((base - 1 + CORE_DATA_EPOCH) * 1000).toISOString());
     const first = await a.poll();
-    expect(first).toHaveLength(200);
+    expect(first).toHaveLength(500);
     const second = await a.poll();
-    // Rows 199..249: the boundary row is re-seen (>=) and deduped by id later.
+    // Rows 499..549: the boundary row is re-seen (>=) and deduped by id later.
     expect(second.length).toBeGreaterThanOrEqual(50);
     const titles = new Set([...first, ...second].map((e) => e.content));
-    expect(titles.size).toBe(250);
+    expect(titles.size).toBe(550);
+  });
+
+  it("a full page tied on a fractional timestamp moves on instead of repeating forever", async () => {
+    // Core Data dates carry sub-millisecond fractions the ISO cursor drops.
+    const t = Date.now() / 1000 - CORE_DATA_EPOCH - 100_000 + 0.123456;
+    const db = calendarDb(520, (i) => (i < 510 ? t : t + 10));
+    const a = calendarAdapter(db);
+    a.setCheckpoint(new Date((t - 1 + CORE_DATA_EPOCH) * 1000).toISOString());
+    await a.poll();
+    const cursors = [a.getCheckpoint()];
+    for (let i = 0; i < 3; i++) {
+      await a.poll();
+      cursors.push(a.getCheckpoint());
+    }
+    // It must not sit on the tied timestamp: it advances to the next one or
+    // (having skipped the rest of the tie, with a warning) to now.
+    expect(new Set(cursors).size).toBeGreaterThan(1);
   });
 
   it("throws on a query error instead of returning an empty calendar", async () => {

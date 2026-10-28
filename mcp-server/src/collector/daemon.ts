@@ -171,8 +171,9 @@ export class CollectorDaemon {
       await this.runIngestion();
     }
 
-    // Save registry checkpoints
-    this.registry.saveCheckpoints();
+    // Cursors were persisted as each poll's events reached the buffer;
+    // saving live cursors here could record one ahead of a poll still in
+    // flight (see registry.saveCheckpoints).
 
     process.stderr.write("Memoria: daemon stopped\n");
   }
@@ -202,7 +203,9 @@ export class CollectorDaemon {
       const effective = this.registry.getEffectiveConfig(sourceId);
       const rawSec = effective?.pollIntervalSec ?? adapter.info.defaultConfig.pollIntervalSec ?? 60;
       const MIN_POLL_SEC = 10;
-      const pollSec = Number.isFinite(rawSec) && rawSec >= MIN_POLL_SEC ? rawSec : 60;
+      const MAX_POLL_SEC = 86_400; // beyond 2^31-1 ms setInterval fires every 1ms
+      const pollSec =
+        Number.isFinite(rawSec) && rawSec >= MIN_POLL_SEC && rawSec <= MAX_POLL_SEC ? rawSec : 60;
       const intervalMs = pollSec * 1000;
 
       const pt: PollTimer = {

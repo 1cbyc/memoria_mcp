@@ -285,3 +285,83 @@ describe("enabled sources resume after a restart (review 2026-10)", () => {
     await reg.destroy();
   });
 });
+
+describe("source lifecycle hardening (re-review 2026-10)", () => {
+  beforeEach(() => {
+    process.env.MEMORIA_FILE_WATCHER_ROOTS = root;
+    fs.writeFileSync(path.join(root, "a.json"), "[]");
+  });
+
+  async function enabledWatcher() {
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+  }
+
+  it("concurrent enables of one source run one at a time and leave one live instance", async () => {
+    await enabledWatcher();
+    const adapter = (reg as any).adapters.get("custom-w");
+    let live = 0;
+    let maxLive = 0;
+    const init = adapter.init.bind(adapter);
+    const destroy = adapter.destroy.bind(adapter);
+    adapter.init = async (c: unknown) => {
+      await new Promise((r) => setTimeout(r, 20)); // a slow login
+      live++;
+      maxLive = Math.max(maxLive, live);
+      return init(c);
+    };
+    adapter.destroy = async () => {
+      live--;
+      return destroy();
+    };
+    const results = await Promise.all([
+      reg.enableSource("custom-w", undefined, "user"),
+      reg.enableSource("custom-w", undefined, "user"),
+      reg.restoreEnabledSources(),
+    ]);
+    expect(results[0].success && results[1].success).toBe(true);
+    expect(maxLive).toBe(1);
+    expect(live).toBe(1);
+  });
+
+  it("a user disabling a source withdraws consent; an agent disabling does not", async () => {
+    await enabledWatcher();
+    await reg.enableSource("custom-w", undefined, "user");
+    await reg.disableSource("custom-w", "agent");
+    expect(reg.hasAgreement("custom-w")).toBe(true);
+    await reg.enableSource("custom-w", undefined, "user");
+    await reg.disableSource("custom-w", "user");
+    expect(reg.hasAgreement("custom-w")).toBe(false);
+    expect((await reg.enableSource("custom-w")).success).toBe(false);
+  });
+
+  it("rejects a poll interval large enough to overflow the timer", () => {
+    // 3e6 s exceeds setInterval's 2^31-1 ms and fired every 1ms.
+    expect(reg.updateSourceConfig("email", { pollIntervalSec: 3e6 }, "agent").success).toBe(false);
+    expect(reg.updateSourceConfig("email", { pollIntervalSec: 86_400 }, "agent").success).toBe(
+      true,
+    );
+  });
+
+  it("disable and re-enable keep the persisted cursor, not a live one a poll ran ahead with", async () => {
+    await enabledWatcher();
+    await reg.enableSource("custom-w", undefined, "user");
+    const adapter = reg.getActiveAdapters().get("custom-w")!;
+    adapter.setCheckpoint("durable");
+    reg.saveCheckpoint("custom-w");
+    adapter.setCheckpoint("ahead-of-the-buffer"); // a poll mid-flight
+    await reg.disableSource("custom-w", "agent");
+    expect((reg as any).state.checkpoints["custom-w"]).toBe("durable");
+    await reg.destroy();
+    expect((new SourceRegistry(dataDir) as any).state.checkpoints["custom-w"]).toBe("durable");
+  });
+
+  it("hasEnabledSources reflects the switched-on sources", async () => {
+    expect(reg.hasEnabledSources()).toBe(false);
+    await enabledWatcher();
+    await reg.enableSource("custom-w", undefined, "user");
+    expect(reg.hasEnabledSources()).toBe(true);
+  });
+});

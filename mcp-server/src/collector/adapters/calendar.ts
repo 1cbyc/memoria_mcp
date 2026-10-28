@@ -91,10 +91,10 @@ export class CalendarAdapter implements SourceAdapter {
 
     // Oldest modification first, so a page cut off by the LIMIT ends at a
     // known point and the next poll resumes there. Ordered by start date
-    // with the cursor jumping to "now", every row past the 200th was lost.
+    // with the cursor jumping to "now", every row past the limit was lost.
     // A query error (the schema differs between macOS versions) propagates
     // to the daemon instead of looking like an empty calendar.
-    const LIMIT = 200;
+    const LIMIT = 500;
     const rows = this.db
       .prepare(
         `SELECT
@@ -166,17 +166,22 @@ export class CalendarAdapter implements SourceAdapter {
     // is re-seen next time and deduped, never missed). A full page that did
     // not advance (200+ events sharing one timestamp) would repeat forever,
     // so it moves on and says what it skipped.
+    // Compared as the stored strings: Core Data dates carry sub-millisecond
+    // fractions that the ISO cursor truncates, so comparing raw values saw
+    // "progress" on every poll of a tied page while writing back the same
+    // cursor, and the poll repeated those rows forever.
     const last = rows[rows.length - 1];
-    const lastModifiedMs =
-      last?.modified != null ? (last.modified + CORE_DATA_EPOCH) * 1000 : undefined;
-    const previousMs = this.checkpoint ? new Date(this.checkpoint).getTime() : -Infinity;
-    if (rows.length >= LIMIT && lastModifiedMs !== undefined && lastModifiedMs > previousMs) {
-      this.checkpoint = new Date(lastModifiedMs).toISOString();
+    const nextCursor =
+      last?.modified != null
+        ? new Date((last.modified + CORE_DATA_EPOCH) * 1000).toISOString()
+        : undefined;
+    if (rows.length >= LIMIT && nextCursor !== undefined && nextCursor > (this.checkpoint || "")) {
+      this.checkpoint = nextCursor;
     } else {
       if (rows.length >= LIMIT) {
         process.stderr.write(
-          `Memoria calendar: more than ${LIMIT} events share one modification time; ` +
-            "some were skipped.\n",
+          `Memoria calendar: ${LIMIT} or more events share one modification time ` +
+            "(or have none); some were skipped.\n",
         );
       }
       this.checkpoint = now.toISOString();
