@@ -4,6 +4,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -19,7 +20,7 @@ import { SourceRegistry } from "./collector/registry.js";
 import { EventBuffer } from "./collector/buffer.js";
 import { CollectorDaemon } from "./collector/daemon.js";
 import { IngestionPipeline } from "./collector/ingestion.js";
-import { TemporalFusion, formatFusedActivity } from "./collector/fusion.js";
+import { TemporalFusion, formatFusedActivity, type FusedActivity } from "./collector/fusion.js";
 import type { CustomSourceDefinition } from "./collector/adapters/custom.js";
 
 // ─── Path resolution ────────────────────────────────────────
@@ -1664,6 +1665,55 @@ export function rebuildMarkdownIndex(): string {
 
 // ─── Collector subsystem (sub-memory agent) ───────────────────
 
+/** Member events already written as part of a fused activity: key -> epoch ms. */
+const FUSED_SIDECAR = ".fused-events.json";
+const FUSED_WINDOW_MS = 3 * 24 * 3600 * 1000;
+
+/**
+ * Write fused activities to today's daily log, skipping any whose events
+ * were all fused already. memory_fuse fuses unsynced events that the daemon
+ * later ingests and fuses again, so the same activity was written twice.
+ * Returns the activities written.
+ */
+export function writeFusedActivities(activities: FusedActivity[]): FusedActivity[] {
+  if (activities.length === 0) return [];
+  const sidecar = path.join(DATA_DIR, FUSED_SIDECAR);
+  const now = Date.now();
+  let seen: Record<string, number> = {};
+  try {
+    seen = JSON.parse(fs.readFileSync(sidecar, "utf-8")) as Record<string, number>;
+  } catch {
+    // none yet, or unreadable: start fresh
+  }
+  for (const [k, t] of Object.entries(seen)) {
+    if (typeof t !== "number" || now - t > FUSED_WINDOW_MS) delete seen[k];
+  }
+  const keyOf = (e: { source: string; id: string }) =>
+    createHash("sha256").update(`${e.source}:${e.id}`).digest("hex").slice(0, 24);
+
+  const fresh = activities.filter((a) => a.sourceEvents.some((e) => !(keyOf(e) in seen)));
+  if (fresh.length > 0) {
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyDir = path.join(MEMORIES_DIR, "daily");
+    fs.mkdirSync(dailyDir, { recursive: true });
+    const dailyFile = path.join(dailyDir, `${today}.md`);
+    // createOrAppend, not a bare append: when no event has been written
+    // today yet, a bare append created a daily log with no frontmatter.
+    for (const activity of fresh) {
+      const entry = formatFusedActivity(activity);
+      createOrAppend(dailyFile, collectorDailyHeader(today) + entry, `\n${entry}`);
+      for (const e of activity.sourceEvents) seen[keyOf(e)] = now;
+    }
+  }
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    writeFileAtomic(sidecar, JSON.stringify(seen));
+  } catch {
+    // best effort: worst case a later run writes an activity twice
+  }
+  return fresh;
+}
+
 let registry: SourceRegistry | null = null;
 let buffer: EventBuffer | null = null;
 let daemon: CollectorDaemon | null = null;
@@ -1734,23 +1784,19 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
       enqueueCompileSources(result.writtenSources);
     }
 
-    // Run cross-source fusion (best-effort — fusion failure shouldn't block ingestion)
-    if (fusion && events.length >= 2) {
+    // Run cross-source fusion (best-effort — fusion failure shouldn't block
+    // ingestion) over the events this cycle actually wrote. Fusing the whole
+    // batch also fused events scored below threshold, and rate-limited ones,
+    // which come back next cycle and were fused (and written) again.
+    const written = new Set(
+      (result?.outcomes ?? [])
+        .filter((o) => o.outcome === "written")
+        .map((o) => `${o.source}:${o.id}`),
+    );
+    const fusable = events.filter((e) => written.has(`${e.source}:${e.id}`));
+    if (fusion && fusable.length >= 2) {
       try {
-        const activities = fusion.fuse(events);
-        if (activities.length > 0) {
-          const today = new Date().toISOString().slice(0, 10);
-          const fusionDir = path.join(MEMORIES_DIR, "daily");
-          fs.mkdirSync(fusionDir, { recursive: true });
-          const fusionFile = path.join(fusionDir, `${today}.md`);
-
-          // createOrAppend, not a bare append: when no event has been written
-          // today yet, a bare append created a daily log with no frontmatter.
-          for (const activity of activities) {
-            const entry = formatFusedActivity(activity);
-            createOrAppend(fusionFile, collectorDailyHeader(today) + entry, `\n${entry}`);
-          }
-        }
+        writeFusedActivities(fusion.fuse(fusable));
       } catch (err) {
         process.stderr.write(
           `Memoria: fusion write failed (non-fatal): ${(err as Error).message}\n`,
@@ -2044,7 +2090,7 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
         windowMs: window_minutes * 60_000,
       });
 
-      const activities = fusionEngine.fuse(recentEvents);
+      const activities = writeFusedActivities(fusionEngine.fuse(recentEvents));
 
       if (activities.length === 0) {
         return {
@@ -2055,17 +2101,6 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
             },
           ],
         };
-      }
-
-      // Write fused activities to daily log
-      const today = new Date().toISOString().slice(0, 10);
-      const dailyDir = path.join(MEMORIES_DIR, "daily");
-      fs.mkdirSync(dailyDir, { recursive: true });
-      const dailyFile = path.join(dailyDir, `${today}.md`);
-
-      for (const activity of activities) {
-        const entry = formatFusedActivity(activity);
-        createOrAppend(dailyFile, collectorDailyHeader(today) + entry, `\n${entry}`);
       }
 
       const summary = activities

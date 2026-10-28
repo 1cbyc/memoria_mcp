@@ -54,3 +54,56 @@ def test_successful_flush_clears_buffer():
 def test_empty_flush_is_a_noop():
     hook = make_hook()
     assert hook.flush() == {"accepted": 0}
+
+
+class _HTTPError(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.response = type("R", (), {"status_code": status})()
+
+
+def test_client_errors_are_dropped_not_retried_forever():
+    hook = make_hook()
+    hook._buffer = [event(1), event(2)]
+
+    def reject(events):
+        raise _HTTPError(401)
+
+    hook._send = reject
+    result = hook.flush()
+    assert result["dropped"] == 2
+    assert hook._buffer == []
+
+
+def test_rate_limits_and_server_errors_are_retried():
+    for status in (429, 503):
+        hook = make_hook()
+        hook._buffer = [event(1)]
+
+        def fail(events, status=status):
+            raise _HTTPError(status)
+
+        hook._send = fail
+        hook.flush()
+        assert [e["id"] for e in hook._buffer] == ["e1"]
+
+
+def test_recording_never_waits_on_a_slow_send():
+    import threading
+    import time
+
+    hook = make_hook(max_buffer=2)
+    release = threading.Event()
+
+    def slow_send(events):
+        release.wait(5)
+        return {"accepted": len(events)}
+
+    hook._send = slow_send
+    hook._push(event(1))
+    hook._push(event(2))  # fills the buffer: a background flush starts
+    started = time.monotonic()
+    for i in range(3, 10):
+        hook._push(event(i))  # must not block behind the in-flight send
+    assert time.monotonic() - started < 1.0
+    release.set()

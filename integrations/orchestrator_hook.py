@@ -57,6 +57,13 @@ except ImportError:
 logger = logging.getLogger("memoria_hook")
 
 
+def _http_status(exc: Exception) -> Optional[int]:
+    """The HTTP status behind an httpx/requests error, if there is one."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
 class MemoriaHook:
     """Buffers Orchestrator events and flushes them to Memoria's /ingest endpoint."""
 
@@ -74,7 +81,11 @@ class MemoriaHook:
         self.api_key = api_key or os.environ.get("MEMORIA_API_KEY", "")
         self.max_buffer = max_buffer
         self._buffer: list[dict] = []
+        # _lock guards the buffer only and is never held across network I/O,
+        # so record_* calls never wait on Memoria. _send_lock serializes
+        # sends (one batch in flight at a time).
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
 
         if auto_flush and flush_interval > 0:
             self._timer = threading.Timer(flush_interval, self._auto_flush)
@@ -95,8 +106,23 @@ class MemoriaHook:
     def _push(self, event: dict) -> None:
         with self._lock:
             self._buffer.append(event)
-            if len(self._buffer) >= self.max_buffer:
-                self._do_flush()
+            full = len(self._buffer) >= self.max_buffer
+        if full:
+            self._flush_in_background()
+
+    def _flush_in_background(self) -> None:
+        # The send used to run inline, under the buffer lock, in whichever
+        # agent thread happened to fill the buffer: during an outage every
+        # record_* call then blocked for up to the 10s timeout.
+        if self._send_lock.locked():
+            return  # a send is in flight; the next flush takes these events
+        threading.Thread(target=self._safe_flush, daemon=True).start()
+
+    def _safe_flush(self) -> None:
+        try:
+            self.flush()
+        except Exception as e:  # never let a background flush raise
+            logger.debug(f"Background flush error: {e}")
 
     # ── Data collection methods ──────────────────────────────
 
@@ -275,35 +301,45 @@ class MemoriaHook:
 
     def flush(self) -> dict:
         """Flush all buffered events to Memoria. Returns ingestion result."""
-        with self._lock:
-            return self._do_flush()
+        with self._send_lock:
+            with self._lock:
+                if not self._buffer:
+                    return {"accepted": 0}
+                events = self._buffer[:]
+                self._buffer.clear()
 
-    def _do_flush(self) -> dict:
-        if not self._buffer:
-            return {"accepted": 0}
-
-        events = self._buffer[:]
-        self._buffer.clear()
-
-        try:
-            return self._send(events)
-        except Exception as e:
-            logger.error(f"Memoria flush failed: {e}")
-            # Re-queue failed events at the FRONT so retry preserves chronological
-            # order (extend() would interleave them after newer pushes). Cap the
-            # buffer at 2x max_buffer, dropping the OLDEST on overflow, so a long
-            # Memoria outage can't grow the buffer unbounded.
-            self._buffer[:0] = events
-            hard_cap = self.max_buffer * 2
-            if len(self._buffer) > hard_cap:
-                dropped = len(self._buffer) - hard_cap
-                self._buffer = self._buffer[-hard_cap:]
-                logger.warning(
-                    "Memoria buffer over %d after failed flush; dropped %d oldest event(s)",
-                    hard_cap,
-                    dropped,
-                )
-            return {"error": str(e)}
+            try:
+                return self._send(events)
+            except Exception as e:
+                status = _http_status(e)
+                if status is not None and 400 <= status < 500 and status not in (408, 429):
+                    # A client error (bad key, payload rejected) fails the same
+                    # way on every retry; re-queueing it retried forever and
+                    # crowded out newer events.
+                    logger.error(
+                        "Memoria rejected %d event(s) with HTTP %d; dropping them: %s",
+                        len(events),
+                        status,
+                        e,
+                    )
+                    return {"error": str(e), "dropped": len(events)}
+                logger.error(f"Memoria flush failed: {e}")
+                # Re-queue failed events at the FRONT so retry preserves chronological
+                # order (extend() would interleave them after newer pushes). Cap the
+                # buffer at 2x max_buffer, dropping the OLDEST on overflow, so a long
+                # Memoria outage can't grow the buffer unbounded.
+                with self._lock:
+                    self._buffer[:0] = events
+                    hard_cap = self.max_buffer * 2
+                    if len(self._buffer) > hard_cap:
+                        dropped = len(self._buffer) - hard_cap
+                        self._buffer = self._buffer[-hard_cap:]
+                        logger.warning(
+                            "Memoria buffer over %d after failed flush; dropped %d oldest event(s)",
+                            hard_cap,
+                            dropped,
+                        )
+                return {"error": str(e)}
 
     def _send(self, events: list[dict]) -> dict:
         headers = {

@@ -212,3 +212,38 @@ describe("reindexAll (review 2026-10)", () => {
     }
   });
 });
+
+describe("writeFusedActivities (review 2026-10)", () => {
+  it("writes an activity once, even when its events are fused again later", async () => {
+    const { writeFusedActivities } = await import("../tools.js");
+    const activity = (ids: string[], label: string) => ({
+      id: label,
+      label,
+      description: "fused activity",
+      startTime: "2026-10-28T10:00:00.000Z",
+      endTime: "2026-10-28T10:30:00.000Z",
+      sourceEvents: ids.map((id) => ({
+        source: id.split(":")[0],
+        id: id.split(":")[1],
+        content: "x",
+        timestamp: "2026-10-28T10:00:00.000Z",
+      })),
+      sourceCount: 2,
+      importance: 6,
+      tags: ["meeting"],
+    });
+    const a = activity(["calendar:c1", "email:m1"], "Fused standup A");
+    expect(writeFusedActivities([a] as never)).toHaveLength(1);
+    // memory_fuse then the daemon (or a re-fused retry) see the same events.
+    expect(writeFusedActivities([activity(["calendar:c1", "email:m1"], "again")] as never)).toEqual(
+      [],
+    );
+    // An activity with any new event is still written.
+    expect(
+      writeFusedActivities([activity(["calendar:c1", "email:m2"], "Fused standup B")] as never),
+    ).toHaveLength(1);
+    const today = new Date().toISOString().slice(0, 10);
+    const log = fs.readFileSync(path.join(MEMORIES_DIR, "daily", `${today}.md`), "utf-8");
+    expect(log.match(/Fused standup A/g)).toHaveLength(1);
+  });
+});
