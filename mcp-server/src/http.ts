@@ -319,9 +319,20 @@ export const app = express();
 // X-Forwarded-For padding: the platform APPENDS the real client IP as the
 // rightmost entry, which is precisely the one this setting selects — client-
 // supplied left-side entries are ignored. If you deploy behind a DIFFERENT
-// proxy chain (e.g. a CDN in front of Cloud Run), update this to match the
-// real hop count or the limiter keys on the wrong IP.
-app.set("trust proxy", 1);
+// proxy chain (e.g. a CDN in front of Cloud Run), set MEMORIA_TRUST_PROXY to
+// the real hop count, or the limiter keys on the wrong IP. With nothing in
+// front (a LAN or VPS deployment reached directly), set it to 0: otherwise a
+// client's own X-Forwarded-For chooses its rate-limit bucket.
+const TRUST_PROXY = (() => {
+  const raw = process.env.MEMORIA_TRUST_PROXY;
+  if (raw === undefined || raw === "") return 1;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 10) {
+    throw new Error("MEMORIA_TRUST_PROXY must be a whole number of proxy hops (0-10).");
+  }
+  return n;
+})();
+app.set("trust proxy", TRUST_PROXY);
 
 // Baseline limiter for EVERY route. The dedicated limiters below cover /mcp,
 // the OAuth endpoints and the write/ingest paths, but the unauthenticated
@@ -341,9 +352,21 @@ app.use(
   }),
 );
 
-// Body parsing
-app.use(express.json({ limit: "5mb" }));
-app.use(express.urlencoded({ extended: false }));
+// Body parsing. Bodies are parsed before a route's handlers run, so a global
+// 5MB parser let unauthenticated clients make the only instance parse 5MB
+// JSON per request. The routes that need large bodies parse them themselves,
+// AFTER authenticate(): /mcp (memory_write content up to 100KB, JSON-escaped)
+// and /dashboard/api at 1MB, /ingest at 5MB. Everything else is small.
+const AUTHED_BODY_ROUTES = ["/mcp", "/dashboard/api", "/ingest"];
+const smallJson = express.json({ limit: "64kb" });
+app.use((req, res, next) => {
+  if (AUTHED_BODY_ROUTES.some((r) => req.path === r || req.path.startsWith(`${r}/`))) {
+    next();
+    return;
+  }
+  smallJson(req, res, next);
+});
+app.use(express.urlencoded({ extended: false, limit: "64kb" }));
 
 // Rate limiting: 30 requests per minute per IP
 app.use(
@@ -930,7 +953,7 @@ function authenticate(
 }
 
 // Apply auth to all /mcp routes
-app.use("/mcp", authenticate);
+app.use("/mcp", authenticate, express.json({ limit: "1mb" }));
 
 // ─── Session management ─────────────────────────────────────
 
@@ -940,6 +963,39 @@ interface SessionInfo {
 }
 
 const sessions: Record<string, SessionInfo> = {};
+/** Initializations between the cap check and the session's registration. */
+let pendingSessions = 0;
+
+/**
+ * Make room for a new session. At the cap, the least recently active session
+ * is closed rather than refusing the newcomer: clients that never send
+ * DELETE (most of them) otherwise filled the cap and locked every client out
+ * with 503s until the 30-minute idle expiry. Its client gets a 404 on its
+ * next request, which tells it to re-initialize.
+ */
+function reserveSessionSlot(): void {
+  while (Object.keys(sessions).length + pendingSessions >= MAX_SESSIONS) {
+    const oldest = Object.entries(sessions).sort(
+      ([, a], [, b]) => a.lastActivity - b.lastActivity,
+    )[0];
+    if (!oldest) break;
+    process.stderr.write(
+      `Memoria: session cap reached; closing idlest ${oldest[0].slice(0, 8)}...\n`,
+    );
+    delete sessions[oldest[0]];
+    void oldest[1].transport.close?.();
+  }
+  pendingSessions++;
+}
+
+/** Streamable HTTP: an unknown or expired session is 404, the client's cue to re-initialize. */
+function sessionNotFound(res: express.Response): void {
+  res.status(404).json({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "Session not found" },
+    id: null,
+  });
+}
 
 // Periodic session + token cleanup. unref so it never keeps the process alive
 // (matters for tests that import this module without starting the server).
@@ -969,23 +1025,25 @@ app.post("/mcp", async (req, res) => {
     if (sessionId && sessions[sessionId]) {
       sessions[sessionId].lastActivity = Date.now();
       transport = sessions[sessionId].transport;
-    } else if (!sessionId && isInitializeRequest(req.body)) {
-      // Check session cap
-      if (Object.keys(sessions).length >= MAX_SESSIONS) {
-        res.status(503).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Too many active sessions. Try again later." },
-          id: null,
-        });
-        return;
-      }
-
+    } else if (sessionId) {
+      // A session id we do not hold (expired, evicted, or lost in a restart).
+      sessionNotFound(res);
+      return;
+    } else if (isInitializeRequest(req.body)) {
+      reserveSessionSlot();
+      let reserved = true;
+      const release = () => {
+        if (reserved) pendingSessions--;
+        reserved = false;
+      };
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
+          release();
           sessions[sid] = { transport, lastActivity: Date.now() };
         },
       });
+      res.on("close", release);
 
       transport.onclose = () => {
         const sid = Object.entries(sessions).find(([, s]) => s.transport === transport)?.[0];
@@ -1018,8 +1076,12 @@ app.post("/mcp", async (req, res) => {
 // GET /mcp — SSE stream
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !sessions[sessionId]) {
-    res.status(400).send("Invalid or missing session ID");
+  if (!sessionId) {
+    res.status(400).send("Missing session ID");
+    return;
+  }
+  if (!sessions[sessionId]) {
+    sessionNotFound(res);
     return;
   }
   sessions[sessionId].lastActivity = Date.now();
@@ -1029,8 +1091,12 @@ app.get("/mcp", async (req, res) => {
 // DELETE /mcp — session termination
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !sessions[sessionId]) {
-    res.status(400).send("Invalid or missing session ID");
+  if (!sessionId) {
+    res.status(400).send("Missing session ID");
+    return;
+  }
+  if (!sessions[sessionId]) {
+    sessionNotFound(res);
     return;
   }
   await sessions[sessionId].transport.handleRequest(req, res, req.body);
@@ -1087,7 +1153,8 @@ app.post("/dashboard/login", authLimiter, express.json(), (req, res) => {
   res.json({ ok: true });
 });
 
-app.use("/dashboard/api", writeLimiter, authenticate); // gate API subtree only
+// gate API subtree only; its bodies are parsed after authentication
+app.use("/dashboard/api", writeLimiter, authenticate, express.json({ limit: "1mb" }));
 app.use("/dashboard", dashboardRouter); // page "/" + API "/api/*"
 
 // Root convenience redirect → the human-facing dashboard. (MCP clients use
@@ -1149,105 +1216,111 @@ export function normalizeTimestamp(v: unknown, now: Date = new Date()): string {
   return (plausible ? d : now).toISOString();
 }
 
-app.post("/ingest", writeLimiter, authenticate, async (req, res) => {
-  const events = req.body?.events;
-  if (!Array.isArray(events) || events.length === 0) {
-    res.status(400).json({ error: "Request body must contain 'events' array" });
-    return;
-  }
-
-  // Validate event shape — all three must be non-empty strings
-  for (const event of events) {
-    const id = typeof event.id === "string" ? event.id.trim() : "";
-    const source = typeof event.source === "string" ? event.source.trim() : "";
-    const content = typeof event.content === "string" ? event.content.trim() : "";
-    if (!id || !source || !content) {
-      res.status(400).json({
-        error: "Each event must have non-empty string id, source, and content fields",
-      });
+app.post(
+  "/ingest",
+  writeLimiter,
+  authenticate,
+  express.json({ limit: "5mb" }),
+  async (req, res) => {
+    const events = req.body?.events;
+    if (!Array.isArray(events) || events.length === 0) {
+      res.status(400).json({ error: "Request body must contain 'events' array" });
       return;
     }
-  }
 
-  // Cap batch size
-  if (events.length > 200) {
-    res.status(400).json({ error: "Max 200 events per request" });
-    return;
-  }
-
-  try {
-    // Normalize events to RawEvent shape with defaults. Caller-supplied
-    // importance and privacyTier are untrusted: clamp importance to [1,10] and
-    // reject any privacyTier outside the known enum (the ingestion sink also
-    // re-classifies content and takes the most-restrictive tier).
-    const VALID_TIERS = new Set(["send", "summarize", "local-only"]);
-    const clampImportance = (v: unknown): number => {
-      const n = typeof v === "number" && Number.isFinite(v) ? v : 5;
-      return Math.max(1, Math.min(10, Math.round(n)));
-    };
-    const normalized = events.map((e: any) => ({
-      id: String(e.id),
-      source: String(e.source),
-      eventType: String(e.eventType || "external"),
-      content: String(e.content),
-      timestamp: normalizeTimestamp(e.timestamp),
-      meta: sanitizeIngestMeta(e.meta),
-      importanceEstimate: clampImportance(e.importance),
-      privacyTier: VALID_TIERS.has(e.privacyTier) ? e.privacyTier : "send",
-    }));
-
-    // Buffer events and run ingestion
-    const { buffer, ingestion } = await getCollectorPipeline(store);
-    const { inserted: buffered, dropped: bufferDropped } = buffer.pushBatch(normalized);
-    const result = await ingestion.ingest(normalized);
-
-    // Reindex today's daily log so new events are searchable immediately
-    if (result.written > 0) {
-      const today = new Date().toISOString().slice(0, 10);
-      const dailyFile = path.join(MEMORIES_DIR, "daily", `${today}.md`);
-      if (fs.existsSync(dailyFile)) {
-        await reindexFile(store, dailyFile);
+    // Validate event shape — all three must be non-empty strings
+    for (const event of events) {
+      const id = typeof event.id === "string" ? event.id.trim() : "";
+      const source = typeof event.source === "string" ? event.source.trim() : "";
+      const content = typeof event.content === "string" ? event.content.trim() : "";
+      if (!id || !source || !content) {
+        res.status(400).json({
+          error: "Each event must have non-empty string id, source, and content fields",
+        });
+        return;
       }
-      // Propagate to the entity pages these sources touch (rule V).
-      enqueueCompileSources(result.writtenSources);
     }
 
-    process.stderr.write(
-      `Memoria: /ingest received ${events.length} events, buffered ${buffered}, ` +
-        `written ${result.written}, deduped ${result.deduplicated}, failed ${result.errors.length}` +
-        (bufferDropped > 0 ? `, BUFFER FULL: ${bufferDropped} dropped` : "") +
-        "\n" +
-        result.errors
-          .slice(0, 5)
-          .map((e) => `  failed: ${e}\n`)
-          .join(""),
-    );
+    // Cap batch size
+    if (events.length > 200) {
+      res.status(400).json({ error: "Max 200 events per request" });
+      return;
+    }
 
-    // Warn the caller if buffer is near capacity
-    const total = buffer.totalCount();
-    const cap = buffer.maxCapacity();
-    const nearCapacity = total >= cap * 0.9;
+    try {
+      // Normalize events to RawEvent shape with defaults. Caller-supplied
+      // importance and privacyTier are untrusted: clamp importance to [1,10] and
+      // reject any privacyTier outside the known enum (the ingestion sink also
+      // re-classifies content and takes the most-restrictive tier).
+      const VALID_TIERS = new Set(["send", "summarize", "local-only"]);
+      const clampImportance = (v: unknown): number => {
+        const n = typeof v === "number" && Number.isFinite(v) ? v : 5;
+        return Math.max(1, Math.min(10, Math.round(n)));
+      };
+      const normalized = events.map((e: any) => ({
+        id: String(e.id),
+        source: String(e.source),
+        eventType: String(e.eventType || "external"),
+        content: String(e.content),
+        timestamp: normalizeTimestamp(e.timestamp),
+        meta: sanitizeIngestMeta(e.meta),
+        importanceEstimate: clampImportance(e.importance),
+        privacyTier: VALID_TIERS.has(e.privacyTier) ? e.privacyTier : "send",
+      }));
 
-    res.json({
-      accepted: events.length,
-      buffered,
-      written: result.written,
-      deduplicated: result.deduplicated,
-      rateLimited: result.rateLimited,
-      // Events that failed to write. They stay buffered and are retried; the
-      // messages are logged server-side, not returned (they can hold paths).
-      failed: result.errors.length,
-      bufferDropped,
-      bufferUsage: { current: total, max: cap, nearCapacity },
-      ...(bufferDropped > 0 && {
-        warning: `${bufferDropped} oldest events dropped due to buffer capacity`,
-      }),
-    });
-  } catch (err: any) {
-    process.stderr.write(`Memoria: /ingest error: ${err.message}\n`);
-    res.status(500).json({ error: "Ingestion failed" });
-  }
-});
+      // Buffer events and run ingestion
+      const { buffer, ingestion } = await getCollectorPipeline(store);
+      const { inserted: buffered, dropped: bufferDropped } = buffer.pushBatch(normalized);
+      const result = await ingestion.ingest(normalized);
+
+      // Reindex today's daily log so new events are searchable immediately
+      if (result.written > 0) {
+        const today = new Date().toISOString().slice(0, 10);
+        const dailyFile = path.join(MEMORIES_DIR, "daily", `${today}.md`);
+        if (fs.existsSync(dailyFile)) {
+          await reindexFile(store, dailyFile);
+        }
+        // Propagate to the entity pages these sources touch (rule V).
+        enqueueCompileSources(result.writtenSources);
+      }
+
+      process.stderr.write(
+        `Memoria: /ingest received ${events.length} events, buffered ${buffered}, ` +
+          `written ${result.written}, deduped ${result.deduplicated}, failed ${result.errors.length}` +
+          (bufferDropped > 0 ? `, BUFFER FULL: ${bufferDropped} dropped` : "") +
+          "\n" +
+          result.errors
+            .slice(0, 5)
+            .map((e) => `  failed: ${e}\n`)
+            .join(""),
+      );
+
+      // Warn the caller if buffer is near capacity
+      const total = buffer.totalCount();
+      const cap = buffer.maxCapacity();
+      const nearCapacity = total >= cap * 0.9;
+
+      res.json({
+        accepted: events.length,
+        buffered,
+        written: result.written,
+        deduplicated: result.deduplicated,
+        rateLimited: result.rateLimited,
+        // Events that failed to write. They stay buffered and are retried; the
+        // messages are logged server-side, not returned (they can hold paths).
+        failed: result.errors.length,
+        bufferDropped,
+        bufferUsage: { current: total, max: cap, nearCapacity },
+        ...(bufferDropped > 0 && {
+          warning: `${bufferDropped} oldest events dropped due to buffer capacity`,
+        }),
+      });
+    } catch (err: any) {
+      process.stderr.write(`Memoria: /ingest error: ${err.message}\n`);
+      res.status(500).json({ error: "Ingestion failed" });
+    }
+  },
+);
 
 // ─── Error handler ──────────────────────────────────────────
 //

@@ -836,3 +836,102 @@ describe("normalizeTimestamp (2026-09 re-review, round 4)", () => {
     }
   });
 });
+
+describe("Streamable HTTP sessions and body parsing (review 2026-10)", () => {
+  const init = (ip: string) =>
+    request(app)
+      .post("/mcp")
+      .set(auth)
+      .set("X-Forwarded-For", ip)
+      .set("Accept", "application/json, text/event-stream")
+      .send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "t", version: "1" },
+        },
+      });
+
+  it("an unknown or expired session is 404 (the client's cue to re-initialize)", async () => {
+    const h = { ...auth, "mcp-session-id": "no-such-session" };
+    const post = await request(app)
+      .post("/mcp")
+      .set(h)
+      .set("X-Forwarded-For", "10.8.0.1")
+      .send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    expect(post.status).toBe(404);
+    expect((await request(app).get("/mcp").set(h).set("X-Forwarded-For", "10.8.0.1")).status).toBe(
+      404,
+    );
+    expect(
+      (await request(app).delete("/mcp").set(h).set("X-Forwarded-For", "10.8.0.1")).status,
+    ).toBe(404);
+    // No session id and not an initialize request is still a bad request.
+    const bare = await request(app)
+      .post("/mcp")
+      .set(auth)
+      .set("X-Forwarded-For", "10.8.0.1")
+      .send({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+    expect(bare.status).toBe(400);
+  });
+
+  it("at the session cap the idlest session is closed instead of refusing everyone", async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 11; i++) {
+      const r = await init(`10.8.1.${i}`);
+      expect(r.status).toBe(200);
+      ids.push(r.headers["mcp-session-id"]);
+    }
+    // The first session was the idlest; it was closed to make room.
+    const first = await request(app)
+      .post("/mcp")
+      .set({ ...auth, "mcp-session-id": ids[0] })
+      .set("X-Forwarded-For", "10.8.2.1")
+      .set("Accept", "application/json, text/event-stream")
+      .send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    expect(first.status).toBe(404);
+    for (const id of ids.slice(1)) {
+      await request(app)
+        .delete("/mcp")
+        .set({ ...auth, "mcp-session-id": id })
+        .set("X-Forwarded-For", "10.8.2.2");
+    }
+  });
+
+  it("does not parse a large body before authentication", async () => {
+    // 2MB of JSON: rejected by auth (401), not parsed (413/400) first.
+    const big = JSON.stringify({ pad: "x".repeat(2 * 1024 * 1024) });
+    for (const route of ["/mcp", "/ingest", "/dashboard/api/stats"]) {
+      const r = await request(app)
+        .post(route)
+        .set("Content-Type", "application/json")
+        .set("X-Forwarded-For", "10.8.3.1")
+        .send(big);
+      expect(r.status).toBe(401);
+    }
+    // Unauthenticated routes only take small bodies.
+    const reg = await request(app)
+      .post("/register")
+      .set("Content-Type", "application/json")
+      .set("X-Forwarded-For", "10.8.3.2")
+      .send(JSON.stringify({ pad: "x".repeat(100 * 1024) }));
+    expect(reg.status).toBe(413);
+  });
+
+  it("an authenticated /ingest still takes a multi-megabyte batch", async () => {
+    const events = Array.from({ length: 30 }, (_, i) => ({
+      id: `big-${i}`,
+      source: "bulk-test",
+      content: `Event ${i} ` + "y".repeat(100 * 1024),
+    }));
+    const r = await request(app)
+      .post("/ingest")
+      .set(auth)
+      .set("X-Forwarded-For", "10.8.3.3")
+      .send({ events });
+    expect(r.status).not.toBe(413);
+  });
+});
