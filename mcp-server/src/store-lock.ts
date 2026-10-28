@@ -111,7 +111,7 @@ function reclaim(lockPath: string, observed: string): boolean {
   } catch {
     return false; // someone else moved it first
   }
-  let moved = "";
+  let moved: string;
   try {
     moved = fs.readFileSync(aside, "utf-8");
   } catch {
