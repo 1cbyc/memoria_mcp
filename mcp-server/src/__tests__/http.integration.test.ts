@@ -703,9 +703,58 @@ describe("sanitizeIngestMeta (review M6)", () => {
         .set("Cookie", approveCookie)
         .send({ jsonrpc: "2.0", method: "tools/list", id: 1 });
       expect(mcp.status).toBe(401);
+      // ...nor the dashboard API: each cookie is honoured on its own path.
+      const dash = await request(app).get("/dashboard/api/stats").set("Cookie", approveCookie);
+      expect(dash.status).toBe(401);
     } finally {
       delete process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL;
     }
+  });
+
+  it("the approval gate also closes client_credentials, and stops advertising it", async () => {
+    // Without this the gate was decorative: the client secret alone minted a
+    // token through the other grant type.
+    process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL = "true";
+    try {
+      const r = await request(app)
+        .post("/token")
+        .set("X-Forwarded-For", "10.9.8.6")
+        .type("form")
+        .send({
+          grant_type: "client_credentials",
+          client_id: "memoria",
+          client_secret: OAUTH_SECRET,
+        });
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe("unauthorized_client");
+      expect(r.body.access_token).toBeUndefined();
+      const meta = await request(app).get("/.well-known/oauth-authorization-server");
+      expect(meta.body.grant_types_supported).toEqual(["authorization_code"]);
+      const reg = await request(app).post("/register").set("X-Forwarded-For", "10.9.8.4").send({});
+      expect(reg.status).toBe(201);
+      expect(reg.body.grant_types).toEqual(["authorization_code"]);
+    } finally {
+      delete process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL;
+    }
+    const meta = await request(app).get("/.well-known/oauth-authorization-server");
+    expect(meta.body.grant_types_supported).toContain("client_credentials");
+  });
+
+  it("the approval cookie is SameSite=Lax so a cross-site OAuth navigation carries it", async () => {
+    // Browsers withhold SameSite=Strict cookies on the top-level navigation
+    // from claude.ai to /authorize, so a Strict approve cookie could never
+    // satisfy the gate in a real flow. The dashboard cookie stays Strict.
+    const login = await request(app)
+      .post("/dashboard/login")
+      .set("X-Forwarded-For", "10.9.8.5")
+      .send({ key: KEY });
+    const cookies = login.headers["set-cookie"] as unknown as string[];
+    const approve = cookies.find((c) => c.startsWith("memoria_approve="))!;
+    const session = cookies.find((c) => c.startsWith("memoria_session="))!;
+    expect(approve).toContain("SameSite=Lax");
+    expect(approve).toContain("Path=/authorize");
+    expect(approve).toContain("HttpOnly");
+    expect(session).toContain("SameSite=Strict");
   });
 });
 

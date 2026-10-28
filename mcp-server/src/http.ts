@@ -381,6 +381,19 @@ const writeLimiter = rateLimit({
 
 // ─── OAuth 2.0 endpoints (for claude.ai custom connector) ──
 
+// The optional human-approval gate (review M5). Read per request so tests and
+// operators can toggle it without restarting.
+function approvalRequired(): boolean {
+  return process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL === "true";
+}
+
+// client_credentials mints a token from the client secret alone, which is
+// exactly what the approval gate exists to prevent, so it is withdrawn while
+// the gate is on.
+function supportedGrantTypes(): string[] {
+  return approvalRequired() ? ["authorization_code"] : ["authorization_code", "client_credentials"];
+}
+
 // Token endpoint — client credentials grant
 app.post("/token", (req, res) => {
   // No body (or a Content-Type no parser claims) leaves req.body undefined in
@@ -465,6 +478,14 @@ app.post("/token", (req, res) => {
   }
 
   if (grantType === "client_credentials") {
+    if (approvalRequired()) {
+      res.status(400).json({
+        error: "unauthorized_client",
+        error_description:
+          "client_credentials is disabled while MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true; use the authorization_code flow.",
+      });
+      return;
+    }
     if (!validateClientCredentials(body.client_id, body.client_secret)) {
       res.status(401).json({ error: "invalid_client" });
       return;
@@ -524,7 +545,7 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
     token_endpoint: `${baseUrl}/token`,
     registration_endpoint: `${baseUrl}/register`,
     token_endpoint_auth_methods_supported: ["client_secret_post"],
-    grant_types_supported: ["authorization_code", "client_credentials"],
+    grant_types_supported: supportedGrantTypes(),
     response_types_supported: ["code"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: ["mcp:tools"],
@@ -537,7 +558,7 @@ app.post("/register", (_req, res) => {
   res.status(201).json({
     client_id: OAUTH_CLIENT_ID,
     client_name: "Memoria MCP Client",
-    grant_types: ["authorization_code", "client_credentials"],
+    grant_types: supportedGrantTypes(),
     response_types: ["code"],
     token_endpoint_auth_method: "client_secret_post",
   });
@@ -574,11 +595,14 @@ app.get("/authorize", (req, res) => {
   // MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true, issuing a code additionally
   // requires a logged-in dashboard session or the API key, so a leaked
   // OAuth client secret alone is not sufficient to obtain a token.
-  if (process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL === "true") {
+  if (approvalRequired()) {
     const bearer = req.headers.authorization?.startsWith("Bearer ")
       ? req.headers.authorization.slice(7)
       : "";
-    if (!hasValidDashboardSession(req) && !(bearer && API_KEY && safeEqual(bearer, API_KEY))) {
+    if (
+      !hasValidDashboardSession(req, "memoria_approve") &&
+      !(bearer && API_KEY && safeEqual(bearer, API_KEY))
+    ) {
       res.status(401).json({
         error: "access_denied",
         error_description:
@@ -638,11 +662,15 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return out;
 }
 
-function hasValidDashboardSession(req: express.Request): boolean {
+// memoria_approve carries the same session token as memoria_session, but is
+// scoped Path=/authorize and honoured only there; memoria_session is honoured
+// only on /dashboard. Each check names the one cookie it accepts.
+function hasValidDashboardSession(
+  req: express.Request,
+  cookieName: "memoria_session" | "memoria_approve",
+): boolean {
   const cookies = parseCookies(req.headers.cookie);
-  // memoria_approve carries the same session token, scoped Path=/authorize
-  // so browsers present it there; memoria_session stays Path=/dashboard.
-  const token = cookies["memoria_session"] || cookies["memoria_approve"];
+  const token = cookies[cookieName];
   if (!token) return false;
   const expiry = dashboardSessions.get(token);
   if (expiry === undefined) return false;
@@ -696,7 +724,7 @@ function authenticate(
     // than just dashboard access.
     const reqPath = req.originalUrl.split("?")[0];
     const onDashboard = reqPath === "/dashboard" || reqPath.startsWith("/dashboard/");
-    if (onDashboard && hasValidDashboardSession(req)) {
+    if (onDashboard && hasValidDashboardSession(req, "memoria_session")) {
       next();
       return;
     }
@@ -895,14 +923,20 @@ app.post("/dashboard/login", authLimiter, express.json(), (req, res) => {
   }
   const token = issueDashboardSession();
   const secure = req.secure || req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
-  const attrs = `HttpOnly; SameSite=Strict; Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}${secure}`;
+  const attrs = `HttpOnly; Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}${secure}`;
   res.setHeader("Set-Cookie", [
-    `memoria_session=${token}; Path=/dashboard; ${attrs}`,
+    `memoria_session=${token}; Path=/dashboard; SameSite=Strict; ${attrs}`,
     // Same session, scoped to /authorize only, so the approval gate there
     // (MEMORIA_AUTHORIZE_REQUIRE_APPROVAL) can see a dashboard login in a
     // real browser — the Path=/dashboard cookie is never sent to /authorize.
-    // Neither cookie is honoured on /mcp or /ingest (see authenticate()).
-    `memoria_approve=${token}; Path=/authorize; ${attrs}`,
+    // SameSite=Lax, not Strict: the OAuth flow reaches /authorize by a
+    // top-level navigation from claude.ai, and browsers withhold Strict
+    // cookies on cross-site navigations, so a Strict cookie could never
+    // satisfy the gate. Lax is still withheld from cross-site subresource
+    // and POST requests, and /authorize can only deliver a code to an
+    // allow-listed redirect_uri. Neither cookie is honoured on /mcp or
+    // /ingest (see authenticate()).
+    `memoria_approve=${token}; Path=/authorize; SameSite=Lax; ${attrs}`,
   ]);
   res.json({ ok: true });
 });
