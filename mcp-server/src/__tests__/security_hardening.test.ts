@@ -120,10 +120,38 @@ describe("H3: one process per store directory", () => {
     fs.writeFileSync(lock, "999999"); // no such process -> ESRCH -> stale
     const s = new MemoryStore(db);
     s.close();
-    // A lock naming THIS live process must block, never be reclaimed.
-    fs.writeFileSync(lock, String(process.pid));
+    // A lock naming another live local process must block, never be reclaimed.
+    fs.writeFileSync(lock, `${process.ppid}\n${os.hostname()}`);
     expect(() => new MemoryStore(db)).toThrow(/already in use/);
     fs.rmSync(lock, { force: true });
+  });
+
+  it("reclaims a leftover lock that names this pid but is not held (container restart)", async () => {
+    // A restarted container usually gives node the same pid as the crashed
+    // process. Its lock then named a live process (us), and the server
+    // refused to start forever.
+    const { MemoryStore } = await import("../store.js");
+    const db = path.join(ROOT, "data", "pid-reuse.sqlite");
+    const lock = path.join(ROOT, "data", ".pid-reuse.sqlite.lock");
+    for (const contents of [String(process.pid), `${process.pid}\n${os.hostname()}`]) {
+      fs.writeFileSync(lock, contents);
+      const s = new MemoryStore(db);
+      // ...while a lock this process actually holds still blocks a second open.
+      expect(() => new MemoryStore(db)).toThrow(/already in use/);
+      s.close();
+      expect(fs.existsSync(lock)).toBe(false);
+    }
+  });
+
+  it("does not check a lock written on another host against local pids", async () => {
+    const { MemoryStore } = await import("../store.js");
+    const db = path.join(ROOT, "data", "foreign.sqlite");
+    const lock = path.join(ROOT, "data", ".foreign.sqlite.lock");
+    // process.ppid is alive here, but on the other host it means nothing.
+    fs.writeFileSync(lock, `${process.ppid}\nsome-other-host`);
+    const s = new MemoryStore(db);
+    expect(fs.readFileSync(lock, "utf-8")).toBe(`${process.pid}\n${os.hostname()}`);
+    s.close();
   });
 });
 
