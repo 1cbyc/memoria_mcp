@@ -10,6 +10,7 @@ import { MemoryStore } from "./store.js";
 import {
   DB_PATH,
   getAllMemoryFiles,
+  getRelativePath,
   reindexFile,
   setupWatcher,
   setupPeriodicReindex,
@@ -49,6 +50,8 @@ async function main(): Promise<void> {
     await reindexFile(store, f);
   }
   if (shuttingDown) return;
+  // Drop index state for files deleted while the server was down.
+  store.retainFiles(files.map(getRelativePath));
   process.stderr.write(`Memoria MCP server started. Indexed ${files.length} files.\n`);
 
   setupWatcher(store);

@@ -5,17 +5,24 @@
  * last-writer-wins. Taking an exclusive lock file at store open makes the
  * second process fail loudly at startup instead.
  *
- * The lock records "<pid>\n<hostname>" and its holder refreshes the file's
- * mtime every HEARTBEAT_MS. A lock is stale, and reclaimed, when:
+ * The lock records "<pid>\n<hostname>\n<process start ms>" and its holder
+ * refreshes the file's mtime every HEARTBEAT_MS. A lock is stale, and
+ * reclaimed, when:
  *
  * - it was written on this host and its pid is gone (ESRCH);
  * - it names our own pid but this process does not hold it: a container
  *   restarted after a crash usually hands node the same small pid, and the
  *   leftover lock used to block every restart;
- * - its heartbeat stopped more than STALE_MS ago. This is the only check
- *   possible for a lock written on another host (a recreated container, a
- *   shared mount), whose pid means nothing here, and it also catches a
- *   local pid reused by an unrelated process.
+ * - its pid is alive but belongs to a process that started at a different
+ *   time (a reused pid; checked through /proc on Linux, elsewhere a live
+ *   pid counts as the holder);
+ * - it was written on another host (a recreated container, a shared mount),
+ *   whose pid means nothing here, and its heartbeat stopped more than
+ *   STALE_MS ago.
+ *
+ * A live local holder is never judged by its heartbeat: a process paused
+ * by SIGSTOP or a laptop's sleep misses beats while still running, and
+ * taking its lock would put two writers on one store.
  *
  * A fresh lock from another host is waited on for up to one stale window
  * (its holder may just have crashed), then refused. A deployment that
@@ -36,9 +43,39 @@ const MAX_RECLAIMS = 5;
 /** Locks held by this process, by real path, with their heartbeat timers. */
 const heldLocks = new Map<string, NodeJS.Timeout>();
 
-function parseLock(text: string): { pid: number; host: string | null } {
-  const [pidLine, hostLine] = text.split("\n");
-  return { pid: parseInt((pidLine ?? "").trim(), 10), host: hostLine?.trim() || null };
+function parseLock(text: string): { pid: number; host: string | null; startMs: number } {
+  const [pidLine, hostLine, startLine] = text.split("\n");
+  return {
+    pid: parseInt((pidLine ?? "").trim(), 10),
+    host: hostLine?.trim() || null,
+    startMs: Number((startLine ?? "").trim()) || NaN,
+  };
+}
+
+/**
+ * When a process started, in epoch ms, from /proc (Linux only). Field 22 of
+ * /proc/<pid>/stat is the start time in clock ticks since boot (USER_HZ,
+ * 100 on every mainstream Linux); /proc/stat's btime is the boot time.
+ * Both live in the same clock, also inside a container's pid namespace.
+ */
+function linuxProcessStartMs(pid: number): number | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+    // The command name may contain spaces or parentheses; fields resume
+    // after its last ")". The first field there is field 3 (state).
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const startTicks = Number(fields[22 - 3]);
+    const btime = Number(/^btime (\d+)$/m.exec(fs.readFileSync("/proc/stat", "utf-8"))?.[1]);
+    if (!Number.isFinite(startTicks) || !Number.isFinite(btime)) return undefined;
+    return btime * 1000 + startTicks * 10;
+  } catch {
+    return undefined;
+  }
+}
+
+function ownStartMs(): number {
+  return linuxProcessStartMs(process.pid) ?? Math.round(Date.now() - process.uptime() * 1000);
 }
 
 function sleepSync(ms: number): void {
@@ -62,7 +99,7 @@ function inspect(lockPath: string): Verdict {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return { kind: "gone" };
     return { kind: "held", pid: NaN }; // unreadable: treat as held rather than race
   }
-  const { pid, host } = parseLock(observed);
+  const { pid, host, startMs } = parseLock(observed);
   if (!Number.isFinite(pid)) {
     return ageMs > UNWRITTEN_GRACE_MS
       ? { kind: "stale", observed, why: "it is empty" }
@@ -92,8 +129,11 @@ function inspect(lockPath: string): Verdict {
       return { kind: "stale", observed, why: `pid ${pid} is gone` };
     }
   }
-  if (heartbeats && ageMs > STALE_MS) {
-    return { kind: "stale", observed, why: `pid ${pid} stopped refreshing it (pid reused?)` };
+  // Alive. Ours only if it is the same process that wrote the lock: a
+  // different start time means the pid was reused.
+  const liveStart = Number.isFinite(startMs) ? linuxProcessStartMs(pid) : undefined;
+  if (liveStart !== undefined && Math.abs(liveStart - startMs) > 1_000) {
+    return { kind: "stale", observed, why: `pid ${pid} now belongs to another process` };
   }
   return { kind: "held", pid };
 }
@@ -198,7 +238,7 @@ export function acquireStoreLock(
       }
     }
 
-    const written = `${process.pid}\n${os.hostname()}`;
+    const written = `${process.pid}\n${os.hostname()}\n${ownStartMs()}`;
     fs.writeFileSync(fd, written, "utf-8");
     fs.closeSync(fd);
     // Everything below acts only while the file still holds what we wrote:
@@ -211,8 +251,18 @@ export function acquireStoreLock(
         return false;
       }
     };
+    let lostWarned = false;
     const heartbeat = setInterval(() => {
-      if (!stillOurs()) return;
+      if (!stillOurs()) {
+        if (!lostWarned) {
+          lostWarned = true;
+          process.stderr.write(
+            `Memoria: WARNING — the store lock at ${lockPath} was taken over by another ` +
+              `process. Two servers may now be writing this store; stop one of them.\n`,
+          );
+        }
+        return;
+      }
       try {
         const now = new Date();
         fs.utimesSync(lockPath, now, now);

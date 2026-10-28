@@ -940,6 +940,28 @@ export class MemoryStore {
   }
 
   /**
+   * Forget files that no longer exist. A rebuild drops every chunk but keeps
+   * file_meta (it holds the access history), so a file deleted while the
+   * server was down left a row no sweep would see, and a new file later
+   * created at that path inherited its access count.
+   */
+  retainFiles(existing: string[]): number {
+    const keep = new Set(existing);
+    const rows = this.db.prepare("SELECT file FROM file_meta").all() as Array<{ file: string }>;
+    const gone = rows.map((r) => r.file).filter((f) => !keep.has(f));
+    if (gone.length === 0) return 0;
+    const del = this.db.prepare("DELETE FROM file_meta WHERE file = ?");
+    const delChunks = this.db.prepare("DELETE FROM chunks WHERE file = ?");
+    this.db.transaction(() => {
+      for (const f of gone) {
+        del.run(f);
+        delChunks.run(f);
+      }
+    })();
+    return gone.length;
+  }
+
+  /**
    * Get all indexed files.
    */
   getIndexedFiles(): string[] {

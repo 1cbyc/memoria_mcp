@@ -703,6 +703,8 @@ describe("sanitizeIngestMeta (review M6)", () => {
           .type("form")
           .send({ ...q, csrf, ...over });
 
+      // The page must not make browsers send `Origin: null` on its POST.
+      expect(page.headers["referrer-policy"]).toBe("same-origin");
       // Cross-origin, missing or mismatched token, or tampered parameters fail.
       expect((await approve({}, { Origin: "https://evil.example" })).status).toBe(403);
       expect((await approve({ csrf: "" })).status).toBe(403);
@@ -715,8 +717,12 @@ describe("sanitizeIngestMeta (review M6)", () => {
         .send({ ...q, csrf });
       expect(noCookie.status).toBe(403);
 
-      // The operator's click issues the code.
-      const done = await approve({});
+      // The operator's click issues the code. Its Origin is the host the
+      // browser used, which need not be the configured public URL.
+      const done = await approve(
+        {},
+        { Host: "memoria.example:8443", Origin: "http://memoria.example:8443" },
+      );
       expect(done.status).toBe(303);
       const loc = new URL(done.headers.location);
       expect(loc.origin + loc.pathname).toBe(q.redirect_uri);

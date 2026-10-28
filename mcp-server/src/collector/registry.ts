@@ -641,8 +641,21 @@ export class SourceRegistry {
         continue;
       }
       // Each source on its own: one slow login must not hold up the rest.
+      // The checks above are repeated under the source's lock: a disable
+      // queued ahead of this resume (the retry timer can fire mid-disable)
+      // must win, not be undone.
       pending.push(
-        this.enableSource(sourceId).then((result) => {
+        this.withSourceLock(sourceId, async () => {
+          if (
+            !this.state.configs[sourceId]?.enabled ||
+            this.activeAdapters.has(sourceId) ||
+            !this.hasAgreement(sourceId)
+          ) {
+            return null;
+          }
+          return this.enableSourceUnlocked(sourceId, undefined, "agent");
+        }).then((result) => {
+          if (!result) return;
           if (result.success) {
             this.resumeErrorsLogged.delete(sourceId);
             onEnabled?.(sourceId);

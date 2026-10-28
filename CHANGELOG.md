@@ -130,10 +130,13 @@ start** (see below); access counts gathered so far start over.
 - A crash left a store lock naming the dead server's pid; in a restarted
   container node usually gets the same pid, so the lock named the new
   server itself and the store refused to open on every restart. Locks now
-  record the host, carry a heartbeat and are tracked per process by real
-  path, so a leftover is reclaimed; a server shutting down no longer
-  deletes a successor's lock, and a reclaim race that could let two
-  servers in is closed.
+  record the host and the holder's start time, carry a heartbeat (used
+  only for locks from another host), and are tracked per process by real
+  path, so a leftover or a reused pid is reclaimed while a live holder,
+  even one paused or asleep, never is; a server shutting down no longer
+  deletes a successor's lock, one that lost its lock says so, and a
+  reclaim race that could let two servers in is closed. Index state for
+  files deleted while the server was down is dropped at startup.
 - Collector sources marked enabled were never restarted after a server
   restart (the dashboard still said "Enabled"), and the collector only
   started when a collector tool, the dashboard or `/ingest` touched it.

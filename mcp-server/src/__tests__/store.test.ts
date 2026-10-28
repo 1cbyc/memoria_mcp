@@ -435,3 +435,15 @@ describe("access history survives rebuilds and edits count as touches (re-review
     ]);
   });
 });
+
+describe("retainFiles (re-review 2026-10)", () => {
+  it("drops index state for files that no longer exist, keeps the rest", async () => {
+    const c = "---\nname: N\n---\nA note about quantum widgets.";
+    await store.indexChunks(chunkMarkdown(c, "keep.md"), 5, c);
+    await store.indexChunks(chunkMarkdown(c + " x", "gone.md"), 5, c + " x");
+    store.trackAccess("gone.md");
+    expect(store.retainFiles(["keep.md"])).toBe(1);
+    expect(store.getAccessCount("gone.md")).toBe(0);
+    expect(store.getIndexedFiles()).toEqual(["keep.md"]);
+  });
+});

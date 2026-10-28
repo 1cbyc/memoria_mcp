@@ -365,3 +365,26 @@ describe("source lifecycle hardening (re-review 2026-10)", () => {
     expect(reg.hasEnabledSources()).toBe(true);
   });
 });
+
+describe("resume never undoes a disable queued ahead of it (re-review 2026-10)", () => {
+  it("a resume that runs after a pending disable leaves the source off", async () => {
+    process.env.MEMORIA_FILE_WATCHER_ROOTS = root;
+    fs.writeFileSync(path.join(root, "a.json"), "[]");
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+    await reg.enableSource("custom-w", undefined, "user");
+    const adapter = reg.getActiveAdapters().get("custom-w")!;
+    const destroy = adapter.destroy.bind(adapter);
+    adapter.destroy = async () => {
+      await new Promise((r) => setTimeout(r, 30)); // a slow teardown
+      return destroy();
+    };
+    const disabling = reg.disableSource("custom-w", "agent");
+    const resuming = reg.restoreEnabledSources(); // the retry timer fires mid-disable
+    await Promise.all([disabling, resuming]);
+    expect(reg.getActiveAdapters().has("custom-w")).toBe(false);
+    expect(reg.hasEnabledSources()).toBe(false);
+  });
+});

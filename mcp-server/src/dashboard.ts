@@ -385,7 +385,12 @@ export function createDashboardRouter(store: MemoryStore): Router {
   router.post("/api/sources/:id/disable", async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
-      const result = await registry.disableSource(req.params.id, "user");
+      const result = await registry.disableSource(
+        req.params.id,
+        // Disabling as the operator withdraws consent; an MCP client's OAuth
+        // token may switch a source off but not revoke what the user agreed.
+        res.locals.authKind === "oauth" ? "agent" : "user",
+      );
       if (result.success) daemon.syncPollTimers();
       res.json(result);
     } catch (err: any) {

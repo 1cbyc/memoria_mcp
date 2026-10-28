@@ -154,7 +154,9 @@ describe("H3: one process per store directory", () => {
     const old = new Date(Date.now() - 5 * 60_000);
     fs.utimesSync(lock, old, old);
     const release = acquireStoreLock(db, { foreignWaitMs: 0 });
-    expect(fs.readFileSync(lock, "utf-8")).toBe(`${process.pid}\n${os.hostname()}`);
+    expect(fs.readFileSync(lock, "utf-8")).toMatch(
+      new RegExp(`^${process.pid}\\n${os.hostname()}\\n\\d+$`),
+    );
     release();
     expect(fs.existsSync(lock)).toBe(false);
   });
@@ -185,14 +187,30 @@ describe("H3: one process per store directory", () => {
     fs.rmSync(lock);
   });
 
-  it("a live local pid whose heartbeat stopped is a reused pid, not a holder", async () => {
+  it("a live local holder is judged by its start time, never by a missed heartbeat", async () => {
+    // A holder paused by SIGSTOP or a laptop's sleep misses beats while
+    // still running; taking its lock would put two writers on one store.
     const { acquireStoreLock } = await import("../store-lock.js");
     const db = path.join(ROOT, "data", "reused.sqlite");
     const lock = path.join(ROOT, "data", ".reused.sqlite.lock");
-    fs.writeFileSync(lock, `${process.ppid}\n${os.hostname()}`);
     const old = new Date(Date.now() - 5 * 60_000);
+    // No start time recorded (or not Linux): a live pid is the holder.
+    fs.writeFileSync(lock, `${process.ppid}\n${os.hostname()}`);
     fs.utimesSync(lock, old, old);
-    acquireStoreLock(db)();
+    expect(() => acquireStoreLock(db)).toThrow(/already in use/);
+    if (process.platform === "linux") {
+      // A start time that does not match the live process: a reused pid.
+      fs.writeFileSync(lock, `${process.ppid}\n${os.hostname()}\n1000`);
+      fs.utimesSync(lock, old, old);
+      acquireStoreLock(db)();
+      // Our own lock records our real start time, so it would be honoured.
+      const release = acquireStoreLock(db);
+      const [, , start] = fs.readFileSync(lock, "utf-8").split("\n");
+      expect(Math.abs(Number(start) - (Date.now() - process.uptime() * 1000))).toBeLessThan(2_000);
+      release();
+    } else {
+      fs.rmSync(lock);
+    }
   });
 
   it("two spellings of one directory are one lock", async () => {

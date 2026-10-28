@@ -33,6 +33,7 @@ import {
   DATA_DIR,
   MEMORIES_DIR,
   getAllMemoryFiles,
+  getRelativePath,
   reindexFile,
   setupPeriodicReindex,
   setupPeriodicOptimize,
@@ -695,7 +696,9 @@ function renderConsentPage(res: express.Response, ar: AuthorizeRequest, csrf: st
       "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${target.origin}; frame-ancestors 'none'; base-uri 'none'`,
       "X-Frame-Options": "DENY",
       "Cache-Control": "no-store",
-      "Referrer-Policy": "no-referrer",
+      // Not no-referrer: under that policy browsers send `Origin: null` on
+      // the form POST, which the Origin check below would reject.
+      "Referrer-Policy": "same-origin",
     })
     .type("html").send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -751,8 +754,15 @@ app.post("/authorize", (req, res) => {
     res.status(405).json({ error: "invalid_request" });
     return;
   }
+  // The origin the browser is on: the configured public URL, or the host it
+  // actually used (an operator may reach the server under a second name).
   const origin = req.headers.origin;
-  if (origin !== undefined && origin !== new URL(getBaseUrl(req)).origin) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const sameOrigins = new Set([
+    new URL(getBaseUrl(req)).origin,
+    req.headers.host ? `${proto}://${req.headers.host}` : "",
+  ]);
+  if (origin !== undefined && !sameOrigins.has(origin)) {
     res.status(403).json({ error: "access_denied", error_description: "cross-origin approval" });
     return;
   }
@@ -1275,6 +1285,8 @@ async function main(): Promise<void> {
     await reindexFile(store, f);
   }
   if (shuttingDown) return;
+  // Drop index state for files deleted while the server was down.
+  store.retainFiles(files.map(getRelativePath));
   process.stderr.write(`Indexed ${files.length} memory files.\n`);
 
   // fs.watch is inert on the GCS FUSE / Cloud Run mount, so sweep periodically
