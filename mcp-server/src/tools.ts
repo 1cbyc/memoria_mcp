@@ -1737,7 +1737,9 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
       config: z
         .record(z.string(), z.unknown())
         .optional()
-        .describe("Configuration overrides (for enable/configure)"),
+        .describe(
+          "Scheduling overrides for enable/configure: pollIntervalSec (>= 10) and importanceThreshold (1-10). Source settings such as hosts, credentials and paths can only be changed in the Memoria dashboard.",
+        ),
       custom_definition: z
         .object({
           id: z.string(),
@@ -1790,7 +1792,7 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
         case "enable": {
           if (!source)
             return { content: [{ type: "text" as const, text: "Error: source ID required" }] };
-          const result = await registry!.enableSource(source, config as any);
+          const result = await registry!.enableSource(source, config, "agent");
           if (result.success) daemon!.syncPollTimers();
           return { content: [{ type: "text" as const, text: result.message }] };
         }
@@ -1826,7 +1828,7 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
             return { content: [{ type: "text" as const, text: "Error: source ID required" }] };
           if (!config)
             return { content: [{ type: "text" as const, text: "Error: config required" }] };
-          const result = registry!.updateSourceConfig(source, config);
+          const result = registry!.updateSourceConfig(source, config, "agent");
           return { content: [{ type: "text" as const, text: result.message }] };
         }
 
@@ -2053,9 +2055,11 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
           if (threshold === undefined || threshold < 1 || threshold > 10) {
             return { content: [{ type: "text" as const, text: "Error: threshold must be 1-10" }] };
           }
-          const result = registry!.updateSourceConfig(source, {
-            importanceThreshold: threshold,
-          });
+          const result = registry!.updateSourceConfig(
+            source,
+            { importanceThreshold: threshold },
+            "agent",
+          );
           return { content: [{ type: "text" as const, text: result.message }] };
         }
 

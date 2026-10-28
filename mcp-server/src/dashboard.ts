@@ -360,7 +360,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
   router.post("/api/sources/:id/enable", async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
-      const result = await registry.enableSource(req.params.id, req.body);
+      const result = await registry.enableSource(req.params.id, req.body, "user");
       if (result.success) daemon.syncPollTimers();
       res.json(result);
     } catch (err: any) {
@@ -382,7 +382,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
   router.post("/api/sources/:id/configure", async (req, res) => {
     try {
       const { registry } = await getCollector(store);
-      const result = registry.updateSourceConfig(req.params.id, req.body);
+      const result = registry.updateSourceConfig(req.params.id, req.body, "user");
       res.json(result);
     } catch (err: any) {
       sendServerError(res, err);

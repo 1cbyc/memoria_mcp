@@ -94,3 +94,142 @@ describe("SourceRegistry.enableSource consent gate", () => {
     expect(r.message).toMatch(/agreement|not available/i);
   });
 });
+
+describe("source config changes: agent vs user (review 2026-10, credential redirect)", () => {
+  function consentedEmail(): void {
+    reg.updateSourceConfig(
+      "email",
+      { host: "imap.example.com", user: "me@example.com", password: "s3cret" },
+      "user",
+    );
+    reg.recordAgreement("email");
+  }
+
+  it("an agent cannot redirect a consented source's stored credentials via enable", async () => {
+    consentedEmail();
+    const r = await reg.enableSource("email", { host: "attacker.example", secure: false }, "agent");
+    expect(r.success).toBe(false);
+    expect(r.message).toMatch(/dashboard/i);
+    // Nothing was persisted from the refused change.
+    expect(reg.getEffectiveConfig("email")!.settings.host).toBe("imap.example.com");
+    expect(reg.getEffectiveConfig("email")!.settings.secure).toBe(true);
+  });
+
+  it("enable defaults to the agent origin (fail closed)", async () => {
+    consentedEmail();
+    const r = await reg.enableSource("email", { settings: { host: "attacker.example" } });
+    expect(r.success).toBe(false);
+    expect(r.message).toMatch(/dashboard/i);
+  });
+
+  it("an agent cannot change settings via configure, in either shape", () => {
+    consentedEmail();
+    for (const change of [
+      { host: "attacker.example" },
+      { settings: { host: "attacker.example" } },
+    ]) {
+      const r = reg.updateSourceConfig("email", change, "agent");
+      expect(r.success).toBe(false);
+    }
+    expect(reg.getEffectiveConfig("email")!.settings.host).toBe("imap.example.com");
+  });
+
+  it("an agent can change the scheduling knobs, at the top level where adapters read them", () => {
+    const r = reg.updateSourceConfig(
+      "email",
+      { importanceThreshold: 7, pollIntervalSec: 120 },
+      "agent",
+    );
+    expect(r.success).toBe(true);
+    const cfg = reg.getEffectiveConfig("email")!;
+    expect(cfg.importanceThreshold).toBe(7);
+    expect(cfg.pollIntervalSec).toBe(120);
+    // Previously memory_priority set_threshold wrote settings.importanceThreshold,
+    // which no adapter reads.
+    expect(cfg.settings.importanceThreshold).toBeUndefined();
+  });
+
+  it("rejects out-of-range scheduling values", () => {
+    expect(reg.updateSourceConfig("email", { pollIntervalSec: 0 }, "agent").success).toBe(false);
+    expect(reg.updateSourceConfig("email", { importanceThreshold: 11 }, "agent").success).toBe(
+      false,
+    );
+  });
+
+  it("re-sending an unchanged setting is not a settings change", () => {
+    consentedEmail();
+    const r = reg.updateSourceConfig("email", { host: "imap.example.com" }, "agent");
+    expect(r.success).toBe(true);
+  });
+
+  it("the dashboard's flat config form lands in settings, where adapters read it", () => {
+    // The dashboard posts { host, port, user, password } to /enable and
+    // /configure; enable used to spread these onto the top level.
+    reg.updateSourceConfig("email", { host: "h", port: 993, user: "u", password: "p" }, "user");
+    const cfg = reg.getEffectiveConfig("email")! as unknown as Record<string, unknown> & {
+      settings: Record<string, unknown>;
+    };
+    expect(cfg.settings).toMatchObject({ host: "h", port: 993, user: "u", password: "p" });
+    expect(cfg.host).toBeUndefined();
+  });
+
+  it("ignores prototype-polluting keys", () => {
+    const change = JSON.parse(
+      '{"__proto__": {"polluted": true}, "settings": {"__proto__": {"x": 1}}}',
+    );
+    reg.updateSourceConfig("email", change, "user");
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(Object.getPrototypeOf(reg.getEffectiveConfig("email")!.settings)).toBe(Object.prototype);
+  });
+});
+
+describe("custom source consent is bound to the definition", () => {
+  beforeEach(() => {
+    process.env.MEMORIA_FILE_WATCHER_ROOTS = root;
+    fs.writeFileSync(path.join(root, "a.json"), "[]");
+    fs.writeFileSync(path.join(root, "b.json"), "[]");
+  });
+
+  it("removing a custom source revokes its consent; re-adding requires consent again", async () => {
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+    expect(reg.hasAgreement("custom-w")).toBe(true);
+    await reg.removeCustomSource("w");
+    expect(reg.hasAgreement("custom-w")).toBe(false);
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "b.json") })).success,
+    ).toBe(true);
+    const r = await reg.enableSource("custom-w");
+    expect(r.success).toBe(false);
+    expect(r.message).toMatch(/agreement/i);
+  });
+
+  it("consent lingering in old state does not carry over to a new definition", async () => {
+    // State written before removal revoked consent.
+    reg.recordAgreement("custom-w");
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    expect(reg.hasAgreement("custom-w")).toBe(false);
+  });
+
+  it("re-enabling a running source destroys the old instance first", async () => {
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: path.join(root, "a.json") })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+    expect((await reg.enableSource("custom-w", undefined, "user")).success).toBe(true);
+    const first = reg.getActiveAdapters().get("custom-w")!;
+    let destroyed = 0;
+    const orig = first.destroy.bind(first);
+    first.destroy = async () => {
+      destroyed++;
+      await orig();
+    };
+    expect((await reg.enableSource("custom-w", undefined, "user")).success).toBe(true);
+    expect(destroyed).toBe(1);
+    expect(reg.getActiveAdapters().get("custom-w")).toBeDefined();
+  });
+});

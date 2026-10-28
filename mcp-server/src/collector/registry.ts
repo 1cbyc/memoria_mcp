@@ -57,6 +57,70 @@ interface RegistryState {
   eventCounts: Record<string, number>;
 }
 
+/**
+ * Who asked for a source change. "user" is the dashboard: a person at a
+ * logged-in browser. "agent" is any MCP caller, which may be acting on
+ * prompt-injected instructions, so it is held to scheduling changes only.
+ */
+export type ChangeOrigin = "user" | "agent";
+
+const MIN_POLL_SEC = 10;
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Apply a config change to a source's effective config. Accepts both shapes
+ * callers send: `{ settings: {...} }` and the flat form the dashboard posts
+ * (`{ host, user, password }`), where every key other than the two
+ * scheduling knobs is a source setting. Before this, enable spread the flat
+ * form onto the top level, so a dashboard-configured email or Google source
+ * never saw its own settings.
+ *
+ * `settingsChanged` reports whether anything under `settings` changed. That
+ * is where hosts, TLS, credentials, watch paths and labels live, i.e. what is
+ * collected and where credentials are sent, so only the user may change it.
+ */
+export function applyConfigChange(
+  base: AdapterConfig,
+  change: Record<string, unknown> | undefined,
+): { config: AdapterConfig; settingsChanged: boolean } | { error: string } {
+  const settings: Record<string, unknown> = { ...base.settings };
+  const config: AdapterConfig = { ...base, settings };
+  let settingsChanged = false;
+  const setSetting = (key: string, value: unknown) => {
+    if (UNSAFE_KEYS.has(key)) return;
+    if (JSON.stringify(settings[key]) !== JSON.stringify(value)) settingsChanged = true;
+    settings[key] = value;
+  };
+
+  for (const [key, value] of Object.entries(change ?? {})) {
+    if (UNSAFE_KEYS.has(key) || key === "enabled") continue;
+    if (key === "pollIntervalSec") {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < MIN_POLL_SEC) {
+        return { error: `pollIntervalSec must be a number of seconds >= ${MIN_POLL_SEC}.` };
+      }
+      config.pollIntervalSec = value;
+    } else if (key === "importanceThreshold") {
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 10) {
+        return { error: "importanceThreshold must be an integer from 1 to 10." };
+      }
+      config.importanceThreshold = value;
+    } else if (key === "settings" && isPlainObject(value)) {
+      for (const [k, v] of Object.entries(value)) setSetting(k, v);
+    } else {
+      setSetting(key, value);
+    }
+  }
+  return { config, settingsChanged };
+}
+
+const AGENT_SETTINGS_REFUSAL =
+  "Source settings (hosts, credentials, paths, labels) can only be changed in the Memoria " +
+  "dashboard (Sources tab). Through MCP, only pollIntervalSec and importanceThreshold can be changed.";
+
 // ── Registry ───────────────────────────────────────────────
 
 export class SourceRegistry {
@@ -139,7 +203,8 @@ export class SourceRegistry {
    */
   async enableSource(
     sourceId: string,
-    configOverrides?: Partial<AdapterConfig>,
+    configOverrides?: Record<string, unknown>,
+    origin: ChangeOrigin = "agent",
   ): Promise<{ success: boolean; message: string }> {
     const adapter = this.adapters.get(sourceId);
     if (!adapter) {
@@ -190,6 +255,19 @@ export class SourceRegistry {
       }
     }
 
+    // Resolve the config before doing anything with side effects. An agent
+    // may not change settings: consent was given for the source as the user
+    // configured it, and reusing that consent with an attacker's host would
+    // send the stored credentials there (review 2026-10, credential redirect).
+    const change = applyConfigChange(
+      { ...adapter.info.defaultConfig, ...this.state.configs[sourceId] },
+      configOverrides,
+    );
+    if ("error" in change) return { success: false, message: change.error };
+    if (change.settingsChanged && origin !== "user") {
+      return { success: false, message: AGENT_SETTINGS_REFUSAL };
+    }
+
     // Auto-install dependencies
     if (adapter.info.dependencies.length > 0) {
       const installResult = await this.installDependencies(adapter.info.dependencies);
@@ -201,14 +279,21 @@ export class SourceRegistry {
       }
     }
 
-    // Merge config
-    const config: AdapterConfig = {
-      ...adapter.info.defaultConfig,
-      ...this.state.configs[sourceId],
-      ...configOverrides,
-      enabled: true,
-    };
+    const config: AdapterConfig = { ...change.config, enabled: true };
     this.state.configs[sourceId] = config;
+
+    // Re-enabling a running source: release the old instance (its IMAP
+    // connection or SQLite handle) and keep its cursor before re-initialising.
+    const running = this.activeAdapters.get(sourceId);
+    if (running) {
+      this.state.checkpoints[sourceId] = running.getCheckpoint();
+      this.activeAdapters.delete(sourceId);
+      try {
+        await running.destroy();
+      } catch {
+        // best effort: a failed teardown must not block the re-init
+      }
+    }
 
     // Initialize adapter
     try {
@@ -264,18 +349,23 @@ export class SourceRegistry {
    */
   updateSourceConfig(
     sourceId: string,
-    settings: Record<string, unknown>,
+    changes: Record<string, unknown>,
+    origin: ChangeOrigin = "agent",
   ): { success: boolean; message: string } {
     const adapter = this.adapters.get(sourceId);
     if (!adapter) {
       return { success: false, message: `Unknown source: ${sourceId}` };
     }
 
-    const existing = this.state.configs[sourceId] ?? adapter.info.defaultConfig;
-    this.state.configs[sourceId] = {
-      ...existing,
-      settings: { ...existing.settings, ...settings },
-    };
+    const change = applyConfigChange(
+      { ...adapter.info.defaultConfig, ...this.state.configs[sourceId] },
+      changes,
+    );
+    if ("error" in change) return { success: false, message: change.error };
+    if (change.settingsChanged && origin !== "user") {
+      return { success: false, message: AGENT_SETTINGS_REFUSAL };
+    }
+    this.state.configs[sourceId] = change.config;
 
     this.saveState();
     return {
@@ -351,6 +441,11 @@ export class SourceRegistry {
       }
     }
 
+    // A new definition is a new consent decision. Consent left behind by an
+    // earlier source with this id (removed before removal revoked it) must
+    // not carry over to whatever this one watches or runs.
+    this.revokeAgreement(`custom-${definition.id}`);
+
     // Register the adapter
     const adapter = new CustomAdapter(definition, { dataDir: this.dataDir });
     this.adapters.set(`custom-${definition.id}`, adapter);
@@ -384,6 +479,9 @@ export class SourceRegistry {
     delete this.state.configs[fullId];
     delete this.state.checkpoints[fullId];
     delete this.state.eventCounts[fullId];
+    // Consent was for this definition; a later add_custom with the same id
+    // must be agreed to afresh in the dashboard.
+    this.revokeAgreement(fullId);
 
     this.saveState();
     return { success: true, message: `Custom source "${sourceId}" removed.` };
@@ -409,6 +507,13 @@ export class SourceRegistry {
     }
 
     this.saveState();
+  }
+
+  revokeAgreement(sourceId: string): void {
+    if (!this.state.agreement) return;
+    const before = this.state.agreement.sources.length;
+    this.state.agreement.sources = this.state.agreement.sources.filter((s) => s !== sourceId);
+    if (this.state.agreement.sources.length !== before) this.saveState();
   }
 
   hasAgreement(sourceId: string): boolean {
