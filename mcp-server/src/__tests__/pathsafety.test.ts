@@ -140,3 +140,26 @@ describe("indexing skips symlinked memory files (2026-09 review, L1)", () => {
     }
   });
 });
+
+describe("reindexFile dates and emptied bodies (review 2026-10)", () => {
+  it("indexes with the frontmatter date and drops a body that was emptied", async () => {
+    const { reindexFile } = await import("../tools.js");
+    const { MemoryStore } = await import("../store.js");
+    const file = path.join(MEMORIES_DIR, "project", "dated.md");
+    fs.writeFileSync(file, "---\nname: d\nupdated: 2020-01-15\n---\nlaunch codes zebra\n");
+    const store = new MemoryStore(path.join(ROOT, "dates.sqlite"));
+    try {
+      expect(await reindexFile(store, file)).toBeGreaterThan(0);
+      const [hit] = await store.search("launch codes zebra", 1);
+      expect(hit.file).toBe("project/dated.md");
+      expect(hit.recencyScore).toBeLessThan(0.01);
+
+      fs.writeFileSync(file, "---\nname: d\nupdated: 2020-01-15\n---\n");
+      expect(await reindexFile(store, file)).toBe(0);
+      const after = await store.search("launch codes zebra", 5);
+      expect(after.map((r) => r.file)).not.toContain("project/dated.md");
+    } finally {
+      store.close();
+    }
+  });
+});

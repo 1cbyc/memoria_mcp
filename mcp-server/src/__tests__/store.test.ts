@@ -289,3 +289,100 @@ describe("headWithoutCutWord outside the BMP (2026-09 re-review, round 4)", () =
     expect(headWithoutCutWord(text, 8)).toBe("note ");
   });
 });
+
+describe("recency comes from the memory, not from when it was indexed (review 2026-10)", () => {
+  const DAY = 24 * 3600 * 1000;
+  const daysAgo = (n: number) => new Date(Date.now() - n * DAY).toISOString().split("T")[0];
+  const note = (updated: string) =>
+    `---\nname: Note\nimportance: 5\nupdated: ${updated}\n---\nA note about quantum widgets.`;
+
+  it("a first index takes the frontmatter date, not today", async () => {
+    const c = note(daysAgo(90));
+    await store.indexChunks(chunkMarkdown(c, "n.md"), 5, c, {
+      contentDate: daysAgo(90),
+      mtimeMs: Date.now(),
+    });
+    const [r] = await store.search("quantum widgets", 1);
+    // 0.5^(90/30) = 0.125. Index-time dating gave ~1.0 for every memory.
+    expect(r.recencyScore).toBeLessThan(0.2);
+    expect(r.recencyScore).toBeGreaterThan(0.08);
+  });
+
+  it("falls back to mtime when there is no frontmatter date, and never dates into the future", async () => {
+    const c = "---\nname: N\n---\nA note about quantum widgets.";
+    await store.indexChunks(chunkMarkdown(c, "a.md"), 5, c, { mtimeMs: Date.now() - 60 * DAY });
+    const c2 = note("2999-01-01");
+    await store.indexChunks(chunkMarkdown(c2, "b.md"), 5, c2, { contentDate: "2999-01-01" });
+    const rows = (store as any).db
+      .prepare("SELECT DISTINCT file, updated_at FROM chunks ORDER BY file")
+      .all();
+    expect(rows[0].updated_at).toBe(daysAgo(60));
+    expect(rows[1].updated_at).toBe(daysAgo(0));
+  });
+
+  it("an edit to an indexed file is dated by its mtime, even with a stale frontmatter date", async () => {
+    const c1 = note(daysAgo(200));
+    await store.indexChunks(chunkMarkdown(c1, "e.md"), 5, c1, { contentDate: daysAgo(200) });
+    const c2 = c1 + "\nAn edit made today.";
+    await store.indexChunks(chunkMarkdown(c2, "e.md"), 5, c2, {
+      contentDate: daysAgo(200),
+      mtimeMs: Date.now(),
+    });
+    const [r] = await store.search("quantum widgets", 1);
+    expect(r.recencyScore).toBeGreaterThan(0.95);
+  });
+
+  it("re-indexing keeps the access history instead of resetting it to now", async () => {
+    const c1 = note(daysAgo(120));
+    await store.indexChunks(chunkMarkdown(c1, "h.md"), 5, c1, { contentDate: daysAgo(120) });
+    store.trackAccess("h.md");
+    store.trackAccess("h.md");
+    // Pretend those reads were 40 days ago.
+    (store as any).db
+      .prepare("UPDATE file_meta SET last_accessed = ? WHERE file = 'h.md'")
+      .run(daysAgo(40));
+    const c2 = c1 + "\nMore.";
+    await store.indexChunks(chunkMarkdown(c2, "h.md"), 5, c2, { mtimeMs: Date.now() - 100 * DAY });
+    const row = (store as any).db
+      .prepare("SELECT updated_at, last_accessed, access_count FROM chunks WHERE file = 'h.md'")
+      .get();
+    expect(row.updated_at).toBe(daysAgo(100));
+    expect(row.last_accessed).toBe(daysAgo(40));
+    expect(row.access_count).toBe(2);
+    expect(store.getAccessCount("h.md")).toBe(2);
+  });
+
+  it("a never-accessed memory is not stale-exempt just because it was indexed today", async () => {
+    const c = note(daysAgo(200));
+    await store.indexChunks(chunkMarkdown(c, "s.md"), 3, c, { contentDate: daysAgo(200) });
+    expect(store.findStale(90, 5).map((s) => s.file)).toContain("s.md");
+  });
+});
+
+describe("an emptied file leaves the index (review 2026-10)", () => {
+  it("clearFile drops the chunks, and the unchanged empty file is then skipped", async () => {
+    const c1 = "---\nname: Secret\n---\nlaunch codes zebra";
+    await store.indexChunks(chunkMarkdown(c1, "r.md"), 5, c1);
+    expect((await store.search("launch codes zebra", 5)).map((r) => r.file)).toContain("r.md");
+    const c2 = "---\nname: Secret\n---\n";
+    expect(chunkMarkdown(c2, "r.md")).toEqual([]);
+    store.clearFile("r.md", c2);
+    expect((await store.search("launch codes zebra", 5)).map((r) => r.file)).not.toContain("r.md");
+    expect(store.hasContentChanged("r.md", c2)).toBe(false);
+  });
+});
+
+describe("index format version (review 2026-10)", () => {
+  it("rebuilds an index written by the previous version once", async () => {
+    const c = "---\nname: N\n---\nA note about quantum widgets.";
+    await store.indexChunks(chunkMarkdown(c, "v.md"), 5, c);
+    (store as any).db.prepare("DELETE FROM store_meta WHERE key = 'index_version'").run();
+    store.close();
+    store = new MemoryStore(dbPath);
+    expect(store.needsReindex).toBe(true);
+    expect(store.getIndexedFiles()).toEqual([]);
+    store.close();
+    store = new MemoryStore(dbPath);
+    expect(store.needsReindex).toBe(false);
+  });
+});

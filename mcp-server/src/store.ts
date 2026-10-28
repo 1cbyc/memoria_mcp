@@ -147,6 +147,32 @@ export function toFtsQuery(text: string, maxTerms = FTS_MAX_TERMS): string {
     .join(" ");
 }
 
+/**
+ * Bumped when indexed rows need rebuilding from the files. 2: recency dates
+ * come from the memory (frontmatter `updated`/`created`, else file mtime)
+ * instead of the time it was indexed, so every row indexed by version 1
+ * carries an index-time date.
+ */
+const INDEX_VERSION = "2";
+
+/** When a memory was indexed: the inputs for its recency date. */
+export interface IndexDates {
+  /** The memory's own date (frontmatter `updated`, else `created`). */
+  contentDate?: unknown;
+  /** The file's mtime, in epoch ms. */
+  mtimeMs?: number;
+}
+
+function toDay(ms: number): string {
+  return new Date(ms).toISOString().split("T")[0];
+}
+
+function parseDateMs(value: unknown): number | undefined {
+  if (typeof value !== "string" && !(value instanceof Date)) return undefined;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
 export class MemoryStore {
   private db: Database.Database;
   private dimension: number;
@@ -288,9 +314,20 @@ export class MemoryStore {
       .prepare("SELECT value FROM store_meta WHERE key = 'embedding_dimension'")
       .get() as { value: string } | undefined;
 
-    if (storedProvider?.value !== currentProvider || storedDim?.value !== currentDim) {
+    const storedIndexVersion = this.db
+      .prepare("SELECT value FROM store_meta WHERE key = 'index_version'")
+      .get() as { value: string } | undefined;
+    const providerChanged =
+      storedProvider?.value !== currentProvider || storedDim?.value !== currentDim;
+    // A store that already has an index from an older version is rebuilt;
+    // a brand-new one (no provider recorded yet) is not announced twice.
+    const indexOutdated = !!storedProvider && storedIndexVersion?.value !== INDEX_VERSION;
+
+    if (providerChanged || indexOutdated) {
       process.stderr.write(
-        `Memoria: embedding provider changed (${storedProvider?.value ?? "none"}→${currentProvider}, dim ${storedDim?.value ?? "?"}→${currentDim}). Will reindex.\n`,
+        providerChanged
+          ? `Memoria: embedding provider changed (${storedProvider?.value ?? "none"}→${currentProvider}, dim ${storedDim?.value ?? "?"}→${currentDim}). Will reindex.\n`
+          : `Memoria: index format updated (v${storedIndexVersion?.value ?? "1"}→v${INDEX_VERSION}). Will reindex.\n`,
       );
       this.db.prepare("DELETE FROM chunks").run();
       // Rebuild FTS after clearing chunks
@@ -310,6 +347,9 @@ export class MemoryStore {
     this.db
       .prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('embedding_dimension', ?)")
       .run(currentDim);
+    this.db
+      .prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('index_version', ?)")
+      .run(INDEX_VERSION);
   }
 
   /**
@@ -327,26 +367,88 @@ export class MemoryStore {
   /**
    * Store the content hash for a file after indexing.
    */
-  private storeContentHash(file: string, content: string, importance: number): void {
+  private storeContentHash(
+    file: string,
+    content: string,
+    importance: number,
+    updatedAt: string,
+  ): void {
     const hash = crypto.createHash("sha256").update(content).digest("hex");
-    const now = new Date().toISOString().split("T")[0];
+    // A new row's last_accessed is the memory's own date, not "now": being
+    // indexed is not an access. An existing row keeps its access history.
     this.db
       .prepare(
-        `INSERT INTO file_meta (file, content_hash, importance, updated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO file_meta (file, content_hash, importance, updated_at, last_accessed)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(file) DO UPDATE SET
            content_hash = ?,
            importance = ?,
            updated_at = ?`,
       )
-      .run(file, hash, importance, now, hash, importance, now);
+      .run(file, hash, importance, updatedAt, updatedAt, hash, importance, updatedAt);
+  }
+
+  /**
+   * The recency inputs for a file about to be (re)indexed. Recency used to
+   * be the time a row was inserted, so every edit, provider switch or
+   * rebuild made every memory look brand new and restarted the decay and
+   * staleness clocks.
+   *
+   * - An edit to a file already in the index happened at its mtime.
+   * - On a first index (a new file, or a rebuild after the index was
+   *   dropped) the frontmatter date is the memory's own record of when it
+   *   was written. mtime is only the fallback there: a git clone or pull
+   *   stamps every file with the checkout time.
+   *
+   * Access history (last_accessed, access_count) lives in file_meta and is
+   * carried onto the new chunk rows; a never-accessed memory's
+   * last_accessed is its own date.
+   */
+  private indexDatesFor(
+    file: string,
+    dates: IndexDates | undefined,
+  ): { updatedAt: string; lastAccessed: string; accessCount: number } {
+    const now = Date.now();
+    const meta = this.db
+      .prepare("SELECT content_hash, access_count, last_accessed FROM file_meta WHERE file = ?")
+      .get(file) as
+      | { content_hash: string | null; access_count: number; last_accessed: string | null }
+      | undefined;
+    const mtimeMs = Math.min(dates?.mtimeMs ?? now, now);
+    const updatedMs = meta?.content_hash
+      ? mtimeMs
+      : Math.min(parseDateMs(dates?.contentDate) ?? mtimeMs, now);
+    const updatedAt = toDay(updatedMs);
+    return {
+      updatedAt,
+      lastAccessed: meta?.last_accessed ?? updatedAt,
+      accessCount: meta?.access_count ?? 0,
+    };
+  }
+
+  /**
+   * Drop a file's chunks while keeping its content hash, for a file that
+   * now has no indexable body. Leaving the old chunks made text a user
+   * deleted (e.g. to redact it) searchable indefinitely.
+   */
+  clearFile(file: string, content: string, importance: number = 5): void {
+    const { updatedAt } = this.indexDatesFor(file, undefined);
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM chunks WHERE file = ?").run(file);
+      this.storeContentHash(file, content, importance, updatedAt);
+    })();
   }
 
   /**
    * Index chunks from a file, replacing any existing chunks for that file.
    * Skips re-embedding if content hasn't changed (use force=true to override).
    */
-  async indexChunks(chunks: Chunk[], importance: number = 5, content?: string): Promise<void> {
+  async indexChunks(
+    chunks: Chunk[],
+    importance: number = 5,
+    content?: string,
+    dates?: IndexDates,
+  ): Promise<void> {
     if (chunks.length === 0) return;
 
     const file = chunks[0].file;
@@ -360,10 +462,15 @@ export class MemoryStore {
 
     const deleteStmt = this.db.prepare("DELETE FROM chunks WHERE file = ?");
     const insertStmt = this.db.prepare(
-      "INSERT INTO chunks (text, file, start_line, end_line, embedding, importance) VALUES (?, ?, ?, ?, ?, ?)",
+      `INSERT INTO chunks (text, file, start_line, end_line, embedding, importance,
+                           updated_at, access_count, last_accessed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     const transaction = this.db.transaction(() => {
+      // Read inside the transaction, after the embedding await, so the
+      // dates match the file_meta row this write replaces.
+      const { updatedAt, lastAccessed, accessCount } = this.indexDatesFor(file, dates);
       deleteStmt.run(file);
       for (let i = 0; i < chunks.length; i++) {
         const embBuffer = Buffer.from(embeddings[i].buffer);
@@ -374,16 +481,15 @@ export class MemoryStore {
           chunks[i].endLine,
           embBuffer,
           importance,
+          updatedAt,
+          accessCount,
+          lastAccessed,
         );
       }
+      if (content) this.storeContentHash(file, content, importance, updatedAt);
     });
 
     transaction();
-
-    // Store content hash
-    if (content) {
-      this.storeContentHash(file, content, importance);
-    }
   }
 
   /**

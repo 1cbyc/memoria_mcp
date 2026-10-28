@@ -187,7 +187,21 @@ export async function reindexFile(store: MemoryStore, filePath: string): Promise
   }
 
   const chunks = chunkMarkdown(content, relPath);
-  await store.indexChunks(chunks, importance, content);
+  if (chunks.length === 0) {
+    // The body was emptied (or never had one): drop what was indexed for it.
+    store.clearFile(relPath, content, importance);
+    return 0;
+  }
+  let mtimeMs: number | undefined;
+  try {
+    mtimeMs = fs.statSync(filePath).mtimeMs;
+  } catch {
+    // raced with a delete; the index date falls back to now
+  }
+  await store.indexChunks(chunks, importance, content, {
+    contentDate: metadata.updated ?? metadata.created,
+    mtimeMs,
+  });
   return chunks.length;
 }
 
