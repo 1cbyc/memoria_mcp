@@ -43,6 +43,8 @@ import {
   destroyCollector,
   getCollectorPipeline,
   resumeCollectorIfConfigured,
+  setupPrimaryTakeover,
+  COLLECTOR_IN_PRIMARY,
   SERVER_DESCRIPTION,
 } from "./tools.js";
 import { createDashboardRouter } from "./dashboard.js";
@@ -290,7 +292,10 @@ interface AuthCodeEntry {
 
 // ─── Store + Server factory ─────────────────────────────────
 
-const store = new MemoryStore(DB_PATH);
+// Shared, like the stdio server: a second server on the same store (a local
+// stdio session, a rollout without MEMORIA_LOCK_TAKEOVER) runs as a
+// secondary rather than failing; see MemoryStore.
+const store = new MemoryStore(DB_PATH, { shared: true });
 
 function createServer(): McpServer {
   const server = new McpServer({
@@ -1236,6 +1241,11 @@ app.post(
   authenticate,
   express.json({ limit: "5mb" }),
   async (req, res) => {
+    if (!store.isPrimary) {
+      // Ingestion goes through the collector, which only the primary runs.
+      res.status(503).json({ error: COLLECTOR_IN_PRIMARY });
+      return;
+    }
     const events = req.body?.events;
     if (!Array.isArray(events) || events.length === 0) {
       res.status(400).json({ error: "Request body must contain 'events' array" });
@@ -1380,6 +1390,7 @@ async function main(): Promise<void> {
   setupPeriodicReindex(store);
   setupPeriodicOptimize(store); // no-op unless MEMORIA_AUTO_OPTIMIZE=true
   setupPeriodicCompile(store); // no-op unless MEMORIA_AUTO_COMPILE=true
+  setupPrimaryTakeover(store); // no-op in the primary
 
   // Bind to 0.0.0.0 when BIND_ALL=true (for cloud/Docker), else localhost only
   const host = process.env.BIND_ALL === "true" ? "0.0.0.0" : "127.0.0.1";

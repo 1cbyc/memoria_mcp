@@ -272,3 +272,38 @@ describe("M1: provenance archive stores no plaintext content", () => {
     expect(recs.find((r) => r.id === "evt-enc")?.content).toBe(secret);
   });
 });
+
+describe("shared stores: concurrent sessions (review 2026-10)", () => {
+  it("a second shared open runs as a secondary, and takes over when the primary closes", async () => {
+    const { MemoryStore } = await import("../store.js");
+    const { chunkMarkdown } = await import("../chunker.js");
+    const db = path.join(ROOT, "data", "shared.sqlite");
+    const first = new MemoryStore(db, { shared: true });
+    const second = new MemoryStore(db, { shared: true });
+    try {
+      expect(first.isPrimary).toBe(true);
+      expect(second.isPrimary).toBe(false);
+      // Both read and write the one index.
+      const c = "---\nname: s\n---\nzebra launch window decided";
+      await second.indexChunks(chunkMarkdown(c, "s.md"), 5, c);
+      expect((await first.search("zebra launch window", 1))[0].file).toBe("s.md");
+      expect(second.tryBecomePrimary()).toBe(false);
+      first.close();
+      expect(second.tryBecomePrimary()).toBe(true);
+      expect(second.isPrimary).toBe(true);
+    } finally {
+      second.close();
+    }
+  });
+
+  it("without `shared` a second open still fails (tools and tests that must be alone)", async () => {
+    const { MemoryStore } = await import("../store.js");
+    const db = path.join(ROOT, "data", "exclusive.sqlite");
+    const first = new MemoryStore(db);
+    try {
+      expect(() => new MemoryStore(db)).toThrow(/already in use/);
+    } finally {
+      first.close();
+    }
+  });
+});

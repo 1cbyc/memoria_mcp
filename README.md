@@ -42,9 +42,13 @@ changes most likely to affect you:
 - **Remote embeddings are opt-in.** Setting `OPENAI_API_KEY` no longer
   sends memory content and search queries to OpenAI by itself; only
   `MEMORIA_EMBEDDINGS=openai` does. `auto` now stays on this device.
-- **One server per store.** A second process opening the same store now
-  fails at startup with a clear message instead of racing the first
-  (SQLite also waits on contention, and compile-queue drains are atomic).
+- **One collector per store, any number of sessions.** Each Claude Code
+  window or Claude Desktop session starts its own server on the same
+  store. The first holds the store lock and runs the collector and
+  scheduled maintenance; the others run as secondaries that search, read
+  and write the same memories, and take over when the first exits. A
+  stdio server exits when its client goes away, so it never holds the lock
+  for a session that is gone.
 - **Sync scripts are safer.** The pull hook executes a mirror script from
   inside the synced store only with `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true`,
   and `sync-from-claude-memory.sh` overwrites only newer files, backing up
@@ -258,7 +262,7 @@ For a durable cloud deployment see [`deploy/gcp/README.md`](deploy/gcp/README.md
 | `MEMORIA_PUBLIC_URL` | *(none)* | Pins the OAuth issuer/endpoint metadata base URL. Without it, the base URL is derived from request headers (`Host`/`X-Forwarded-Host`), which reflects attacker-supplied hosts into the discovery document. **Set this in any network-exposed deployment.** |
 | `MEMORIA_INSECURE_ALLOW_FALLBACKS` | `false` | **Escape hatch.** With `BIND_ALL=true` the server refuses to start unless `MEMORIA_OAUTH_CLIENT_SECRET`, `MEMORIA_ENCRYPTION_KEY` and `MEMORIA_PUBLIC_URL` are all set, rather than falling back to the API key, an on-disk key, or a base URL taken from request headers. Self-hosted setups that accept those risks can set this to `true`. |
 | `MEMORIA_VECTOR_SCAN_CAP` | `5000` | Max chunks scanned per query for semantic candidate selection. |
-| `MEMORIA_DIR` | Auto-detected | The root Memoria directory. Defaults to `/data/memoria` when `DOCKER=true` or a `/data` directory exists, otherwise `~/.memoria`. |
+| `MEMORIA_DIR` | Auto-detected | The root Memoria directory. Defaults to `/data/memoria` when `DOCKER=true` (the image sets it), otherwise `~/.memoria`. |
 | `MEMORIA_REPO_URL` | `https://github.com/Agripp87/memoria_mcp` | Link shown in the dashboard's About card (forks: point it at your repo/docs). |
 | `PORT` | `3100` | HTTP server port |
 | `BIND_ALL` | `false` | Set to `true` to bind to `0.0.0.0` instead of `127.0.0.1` (required for Docker/Cloud Run) |

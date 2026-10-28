@@ -171,13 +171,25 @@ function reclaim(lockPath: string, observed: string): boolean {
   return true;
 }
 
+/** The store is held by another live Memoria process. */
+export class StoreInUseError extends Error {
+  constructor(
+    readonly dir: string,
+    readonly holderPid: number,
+    cause?: unknown,
+  ) {
+    super(
+      `Memoria store at ${dir} is already in use by another Memoria process` +
+        (Number.isFinite(holderPid) ? ` (pid ${holderPid})` : "") +
+        `. Stop that process first; running two servers on one store corrupts the index.`,
+      { cause },
+    );
+    this.name = "StoreInUseError";
+  }
+}
+
 function inUse(dir: string, pid: number, cause?: unknown): Error {
-  return new Error(
-    `Memoria store at ${dir} is already in use by another Memoria process` +
-      (Number.isFinite(pid) ? ` (pid ${pid})` : "") +
-      `. Stop that process first; running two servers on one store corrupts the index.`,
-    { cause },
-  );
+  return new StoreInUseError(dir, pid, cause);
 }
 
 export function acquireStoreLock(

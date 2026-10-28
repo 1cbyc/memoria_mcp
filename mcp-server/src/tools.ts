@@ -26,8 +26,11 @@ import type { CustomSourceDefinition } from "./collector/adapters/custom.js";
 // ─── Path resolution ────────────────────────────────────────
 
 function resolveDefaultMemoriaDir(): string {
-  // Docker / cloud: use /data/memoria if /data exists (mounted volume)
-  if (process.env.DOCKER === "true" || fs.existsSync("/data")) {
+  // Docker / cloud: the image sets DOCKER=true (and MEMORIA_DIR). Merely
+  // having a /data directory used to count too, so on an ordinary host with
+  // one the local server used /data/memoria while the sync hooks used
+  // ~/.memoria, and an unwritable /data crashed the server at import.
+  if (process.env.DOCKER === "true") {
     return "/data/memoria";
   }
   // Local: ~/.memoria
@@ -39,6 +42,9 @@ const MEMORIES_DIR = path.join(MEMORIA_DIR, "memories");
 const DB_PATH = path.join(MEMORIA_DIR, "data", "memoria.sqlite");
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+// memories/ too: path checks resolve it, and on a fresh store the first
+// memory_write into a subfolder failed with ENOENT before creating anything.
+fs.mkdirSync(MEMORIES_DIR, { recursive: true });
 
 const DATA_DIR = path.join(MEMORIA_DIR, "data");
 
@@ -245,6 +251,26 @@ export async function reindexAll(
 
 // ─── File watcher (1.5s debounce) ───────────────────────────
 
+/**
+ * In a secondary server, try every 30s to take over the store lock (the
+ * primary may have exited), and resume the collector once promoted.
+ */
+export function setupPrimaryTakeover(store: MemoryStore): NodeJS.Timeout | null {
+  if (store.isPrimary) return null;
+  const timer = setInterval(() => {
+    try {
+      if (store.tryBecomePrimary()) {
+        clearInterval(timer);
+        void resumeCollectorIfConfigured(store);
+      }
+    } catch (err) {
+      process.stderr.write(`Memoria: lock takeover check failed: ${(err as Error).message}\n`);
+    }
+  }, 30_000);
+  timer.unref?.();
+  return timer;
+}
+
 export function setupWatcher(store: MemoryStore): void {
   if (!fs.existsSync(MEMORIES_DIR)) return;
 
@@ -337,6 +363,8 @@ export function setupPeriodicOptimize(
 
   let running = false;
   const run = () => {
+    // Only the primary maintains the store; a secondary sharing it skips.
+    if (!store.isPrimary) return;
     if (running) return;
     running = true;
     try {
@@ -379,6 +407,7 @@ export function setupPeriodicCompile(
 
   let running = false;
   const run = async () => {
+    if (!store.isPrimary) return; // see setupPeriodicOptimize
     if (running) return;
     running = true;
     try {
@@ -1753,7 +1782,16 @@ let resumeRetryTimer: NodeJS.Timeout | null = null;
 /** How often enabled sources that failed to start are tried again. */
 const RESUME_RETRY_MS = 10 * 60 * 1000;
 
+/** Thrown when a secondary server is asked for the collector. */
+export const COLLECTOR_IN_PRIMARY =
+  "The collector runs in the Memoria server that opened this store first; this " +
+  "session's server shares its memories but not its collector. Use the dashboard, or " +
+  "retry after that server exits (this one then takes over).";
+
 async function ensureCollector(store: MemoryStore): Promise<void> {
+  // One collector per store: its registry state file is last-writer-wins
+  // and two daemons would poll every source twice.
+  if (!store.isPrimary) throw new Error(COLLECTOR_IN_PRIMARY);
   // The fast path keys on completion, not on `registry` being set: the
   // registry is assigned before init's first await, so callers used to
   // proceed against a half-built collector (no ingestion yet, buffer not
@@ -1871,6 +1909,7 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
  * for nothing.
  */
 export async function resumeCollectorIfConfigured(store: MemoryStore): Promise<void> {
+  if (!store.isPrimary) return;
   if (!fs.existsSync(path.join(DATA_DIR, "collector-config.enc"))) return;
   try {
     // A config can exist with every source off; then there is nothing to

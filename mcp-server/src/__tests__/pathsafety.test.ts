@@ -302,3 +302,19 @@ describe("reindexAll keeps files written during the pass (re-review 2026-10)", (
     }
   });
 });
+
+describe("the collector stays with the primary (review 2026-10)", () => {
+  it("a secondary server refuses to start a second collector", async () => {
+    const { getCollector, COLLECTOR_IN_PRIMARY } = await import("../tools.js");
+    const { MemoryStore } = await import("../store.js");
+    const db = path.join(ROOT, "collector-shared.sqlite");
+    const primary = new MemoryStore(db, { shared: true });
+    const secondary = new MemoryStore(db, { shared: true });
+    try {
+      await expect(getCollector(secondary)).rejects.toThrow(COLLECTOR_IN_PRIMARY);
+    } finally {
+      secondary.close();
+      primary.close();
+    }
+  });
+});

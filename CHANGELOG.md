@@ -97,10 +97,15 @@ start** (see below); access counts gathered so far start over.
 - Bounded `memory_reflect`/`memory_compact` `days` and `max_chars`,
   `memory_ingest` `batch_size`, `memory_search` query length, and
   `memory_compile` tags/related; the compile size cap now measures bytes.
-- One server process per store: a second process opening the same store
-  fails at startup (store lock file, stale locks reclaimed), SQLite waits
-  on `busy_timeout`, and the compile queue drains by atomic rename so an
-  enqueue during a drain is no longer deleted unread.
+- One collector per store: the first server to open a store holds its
+  lock (stale locks reclaimed) and runs the collector and scheduled
+  maintenance; further servers on the same store (another Claude Code
+  window, Claude Desktop) run as secondaries that share the memories and
+  take over the lock when the primary exits. SQLite waits on
+  `busy_timeout`, and the compile queue drains by atomic rename so an
+  enqueue during a drain is no longer deleted unread. The stdio server
+  exits when its client closes stdin; an orphaned server used to live on
+  (the file watcher kept it running) and hold the store.
 - The provenance archive stores non-`local-only` content encrypted under
   the collector master key instead of plaintext (older plaintext records
   still read back).

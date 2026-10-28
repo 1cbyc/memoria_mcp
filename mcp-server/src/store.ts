@@ -12,7 +12,7 @@
  */
 
 import Database from "better-sqlite3";
-import { acquireStoreLock } from "./store-lock.js";
+import { acquireStoreLock, StoreInUseError } from "./store-lock.js";
 import { Chunk } from "./chunker.js";
 import { embed, embedBatch, cosineSimilarity, getDimension, getProvider } from "./embeddings.js";
 import crypto from "crypto";
@@ -208,11 +208,43 @@ export class MemoryStore {
   private db: Database.Database;
   private dimension: number;
   private releaseLock: () => void;
+  private readonly dbPath: string;
+  /**
+   * Whether this process holds the store lock. Only the primary runs what
+   * must not run twice over one store: the collector (its whole-state
+   * registry file is last-writer-wins) and scheduled maintenance.
+   */
+  isPrimary = true;
 
-  constructor(dbPath: string) {
-    // One process per store directory (review H3): fail loudly here rather
-    // than racing another server's writers and collector state.
-    this.releaseLock = acquireStoreLock(dbPath);
+  /**
+   * @param opts.shared When the store is held by another live server, open
+   *   it as a secondary instead of failing. Each Claude Code window or
+   *   Claude Desktop session starts its own stdio server on the same store;
+   *   refusing the second one left that session with no memory tools.
+   *   SQLite (WAL, busy_timeout) makes concurrent reads and writes from
+   *   processes on one host safe; see isPrimary for what stays with the
+   *   primary. A secondary takes over the lock when the primary exits
+   *   (tryBecomePrimary).
+   */
+  constructor(dbPath: string, opts: { shared?: boolean } = {}) {
+    this.dbPath = dbPath;
+    // One process per store directory (review H3) unless shared: without
+    // `shared`, fail loudly rather than race another server.
+    try {
+      // A shared open never waits on another host's lock: it starts as a
+      // secondary and is promoted once that lock goes stale.
+      this.releaseLock = acquireStoreLock(dbPath, opts.shared ? { foreignWaitMs: 0 } : {});
+    } catch (err) {
+      if (!opts.shared || !(err instanceof StoreInUseError)) throw err;
+      this.isPrimary = false;
+      this.releaseLock = () => {};
+      process.stderr.write(
+        `Memoria: another Memoria server` +
+          (Number.isFinite(err.holderPid) ? ` (pid ${err.holderPid})` : "") +
+          ` holds this store; running as a secondary. Search, reading and writing work; ` +
+          `the collector and scheduled maintenance run in that server.\n`,
+      );
+    }
     try {
       this.db = new Database(dbPath);
     } catch (err: any) {
@@ -242,6 +274,23 @@ export class MemoryStore {
   }
 
   needsReindex: boolean = false;
+
+  /**
+   * A secondary tries to take the store lock (the primary may have exited).
+   * Returns whether this process is now the primary.
+   */
+  tryBecomePrimary(): boolean {
+    if (this.isPrimary) return true;
+    try {
+      this.releaseLock = acquireStoreLock(this.dbPath, { foreignWaitMs: 0 });
+      this.isPrimary = true;
+      process.stderr.write("Memoria: took over the store lock; this server is now the primary.\n");
+      return true;
+    } catch (err) {
+      if (err instanceof StoreInUseError) return false;
+      throw err;
+    }
+  }
 
   private init(): void {
     this.db.pragma("journal_mode = WAL");
