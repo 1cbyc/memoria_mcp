@@ -55,10 +55,11 @@ the only access control.
 - 17 MCP tools: search, read, write (with write-time dedup), daily logs, index
   rebuild, reflection, lint, compaction, entity compilation, and collector
   controls
-- Three-signal retrieval: `0.2 × recency + 0.3 × importance + 0.5 × relevance`,
+- Three-signal retrieval: `0.8 × relevance + 0.1 × recency + 0.1 × importance`,
   where relevance is `0.7 × vector cosine + 0.3 × FTS5 BM25`
-- Three embedding providers, auto-selected: OpenAI `text-embedding-3-small` →
-  local `all-MiniLM-L6-v2` (offline, one-time ~23 MB download) → n-gram hashing
+- Three embedding providers: local `all-MiniLM-L6-v2` by default (offline,
+  one-time ~23 MB download), n-gram hashing as the fallback, and OpenAI
+  `text-embedding-3-small` only with `MEMORIA_EMBEDDINGS=openai`
 - An optional collector daemon for iMessage, IMAP, Gmail, Google Calendar and
   Drive, with consent gating, privacy tiers and AES-256-GCM encryption at rest
   (**experimental** — read SECURITY.md first)

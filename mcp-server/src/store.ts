@@ -6,7 +6,7 @@
  * Features:
  * - FTS5 full-text search for proper BM25 keyword scoring
  * - Content hashing to skip re-embedding unchanged files
- * - Three-signal retrieval (weighted SUM): 0.2·recency + 0.3·importance + 0.5·relevance
+ * - Three-signal retrieval (weighted SUM): 0.1·recency + 0.1·importance + 0.8·relevance
  * - Idempotent decay/boost with last-run tracking
  * - Staleness detection based on last_accessed (not updated_at)
  */
@@ -534,7 +534,12 @@ export class MemoryStore {
   async search(
     query: string,
     maxResults: number = 10,
-    weights = { recency: 0.2, importance: 0.3, relevance: 0.5 },
+    // Relevance dominates; recency and importance are tie-breakers. They
+    // were 0.2 and 0.3, but relevance scores sit in a narrow band while the
+    // priors span 0-1, so priors at half the weight decided most rankings:
+    // eval/ measured the old default far below relevance alone on every
+    // provider (see eval/README.md).
+    weights = { recency: 0.1, importance: 0.1, relevance: 0.8 },
     // Split of the relevance signal between vector cosine and keyword score.
     // Exposed as a parameter purely so eval/ can sweep it; every caller in the
     // server uses the default, and the default is the shipped behaviour.

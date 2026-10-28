@@ -87,8 +87,8 @@ behavioural tests now cover the sync scripts and the Python ingestion hook.
 
 - **17 MCP tools** for memory management, data collection, lint, knowledge compilation, entity-page compilation, and digest compaction
 - **Sub-memory collector** with source adapters for iMessage, macOS Calendar, Email (IMAP), Gmail, Google Calendar, Google Drive, and user-defined custom sources
-- **Three-signal retrieval**: `score = 0.2 x recency + 0.3 x importance + 0.5 x relevance`
-- **Hybrid search**: Vector cosine similarity (0.7) + FTS5 BM25 keyword scoring (0.3). Three embedding providers, auto-selected: OpenAI `text-embedding-3-small` (if `OPENAI_API_KEY` set) → local `all-MiniLM-L6-v2` via `@huggingface/transformers` (true semantic, fully offline after a one-time ~23MB download) → n-gram hashing (lexical fallback). Control with `MEMORIA_EMBEDDINGS`.
+- **Three-signal retrieval**: `score = 0.8 x relevance + 0.1 x recency + 0.1 x importance` — relevance decides, recency and importance break ties ([eval](mcp-server/eval/README.md))
+- **Hybrid search**: Vector cosine similarity (0.7) + FTS5 BM25 keyword scoring (0.3). Three embedding providers: local `all-MiniLM-L6-v2` via `@huggingface/transformers` by default (true semantic, fully offline after a one-time ~23MB download), n-gram hashing as the lexical fallback, and OpenAI `text-embedding-3-small` only when explicitly selected with `MEMORIA_EMBEDDINGS=openai` (an `OPENAI_API_KEY` alone never sends content off the device).
 - **Cross-source temporal fusion**: Detects correlated activities across sources within configurable time windows
 - **Write-time dedup**: Checks top-3 similar memories before every write, returns duplicates for agent review
 - **Encrypted at rest**: All collector data encrypted with AES-256-GCM; master key auto-generated, owner-only (0600)
@@ -686,18 +686,19 @@ Memoria is designed for self-managing memory, inspired by research from Generati
 ## Search Algorithm
 
 ```
-retrieval_score = 0.2 * recency + 0.3 * importance + 0.5 * relevance
+retrieval_score = 0.8 * relevance + 0.1 * recency + 0.1 * importance
 ```
 
 Where:
-- **recency** = exponential decay, 30-day half-life from whichever is newer of `updated_at` and `last_accessed` — i.e. time since the memory was last *touched* (edited **or** read). A heavily-consulted old memory no longer ranks as permanently stale.
+- **recency** = exponential decay, 30-day half-life from whichever is newer of `updated_at` and `last_accessed` — i.e. time since the memory was last *touched* (edited **or** read). A heavily-consulted old memory no longer ranks as permanently stale. `updated_at` comes from the memory itself: frontmatter `updated` (else `created`, else the file's mtime) when it is first indexed, and the file's mtime when an indexed file is edited — never the time it was indexed, so a rebuild does not make everything look new.
+- **Why 0.8 / 0.1 / 0.1:** relevance scores fall in a narrow band while the priors span 0–1, so the previous 0.2 / 0.3 / 0.5 let recency and importance decide most rankings; the [retrieval eval](mcp-server/eval/README.md) measured it far below relevance alone.
 - **importance** = normalized 1-10 score from frontmatter. Importance is a ranking *prior only* — it is deliberately **not** used to pre-filter candidates (that triple-counted it via filter + weight + access-boost feedback and made the low-importance long tail unreachable).
 - **relevance** = 0.7 * vector_cosine_similarity + 0.3 * keyword_score, where keyword_score is a **fixed saturating transform of the FTS5 BM25 rank** (`-rank / (-rank + 10)`) — an absolute magnitude, comparable across queries (not a per-query rank position). Candidates that FTS didn't match get a capped substring-match fallback so scoring is uniform across the candidate pool.
 
 **Semantic-scan coverage is never silent:** every result carries `scannedChunks/totalChunks`. Under `MEMORIA_VECTOR_SCAN_CAP` (default 5000) the whole store is scanned; past it, an even sample of **exactly cap** rows spans the entire id range — coverage degrades continuously as the store grows (no recall cliff at cap+1), and the sample's offset is derived from the query text, so different queries reach different residues of the store and no row is permanently invisible to the vector path (the same query stays deterministic). `memory_search` appends a coverage note whenever the scan was partial.
 
 Results are position-optimized: high-importance memories placed at the start and end of output to leverage the primacy/recency effect in LLM attention.
-> **Provider caveat:** with the `hash` n-gram provider, `vector_cosine_similarity` is only a lexical approximation — the vector and FTS terms largely measure the same thing, so treat a `hash` deployment as keyword search with extra steps, not semantic search. Use `minilm` (local, default when no OpenAI key) or `openai` for true semantic retrieval; the Docker image pre-bakes the MiniLM model.
+> **Provider caveat:** with the `hash` n-gram provider, `vector_cosine_similarity` is only a lexical approximation — the vector and FTS terms largely measure the same thing, so treat a `hash` deployment as keyword search with extra steps, not semantic search. Use `minilm` (local, the default) or `openai` for true semantic retrieval; the Docker image pre-bakes the MiniLM model.
 
 ## Multi-device sync
 

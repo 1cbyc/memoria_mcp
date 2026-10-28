@@ -485,7 +485,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
   // Tool 1: memory_search
   server.tool(
     "memory_search",
-    "Semantic + keyword hybrid search across all memories. Uses three-signal scoring: 0.2·recency + 0.3·importance + 0.5·relevance.",
+    "Semantic + keyword hybrid search across all memories. Uses three-signal scoring: 0.8·relevance + 0.1·recency + 0.1·importance.",
     {
       query: z.string().min(1).max(2000).describe("Search query (max 2000 characters)"),
       max_results: z
