@@ -265,71 +265,124 @@ describe("GoogleGmailAdapter history cursor", () => {
 // ── macOS Calendar ──────────────────────────────────────────
 
 const CORE_DATA_EPOCH = 978307200;
+const nowCore = () => Date.now() / 1000 - CORE_DATA_EPOCH;
 
-function calendarDb(rows: number, modified: (i: number) => number | null) {
+function calendarDb() {
   const db = new Database(":memory:");
   db.exec(`
     CREATE TABLE ZCALENDAR (Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT);
-    CREATE TABLE ZCALENDARITEM (ZSTARTDATE REAL, ZENDDATE REAL, ZSUMMARY TEXT, ZLOCATION TEXT,
-      ZNOTES TEXT, ZALLDAY INTEGER, ZMODIFIEDDATE REAL, ZCALENDAR INTEGER);
+    CREATE TABLE ZCALENDARITEM (Z_PK INTEGER PRIMARY KEY, ZSTARTDATE REAL, ZENDDATE REAL,
+      ZSUMMARY TEXT, ZLOCATION TEXT, ZNOTES TEXT, ZALLDAY INTEGER, ZMODIFIEDDATE REAL,
+      ZCALENDAR INTEGER);
     INSERT INTO ZCALENDAR VALUES (1, 'Work');
   `);
-  const now = Date.now() / 1000 - CORE_DATA_EPOCH;
-  const ins = db.prepare("INSERT INTO ZCALENDARITEM VALUES (?, ?, ?, NULL, NULL, 0, ?, 1)");
-  for (let i = 0; i < rows; i++) {
-    ins.run(now + 3600 + i, now + 7200 + i, `Planning meeting ${i}`, modified(i));
-  }
   return db;
 }
 
-function calendarAdapter(db: Database.Database) {
+function addEvent(
+  db: Database.Database,
+  title: string,
+  startInHours: number,
+  modified: number | null,
+): number {
+  const start = nowCore() + startInHours * 3600;
+  return Number(
+    db
+      .prepare(
+        `INSERT INTO ZCALENDARITEM (ZSTARTDATE, ZENDDATE, ZSUMMARY, ZALLDAY, ZMODIFIEDDATE, ZCALENDAR)
+         VALUES (?, ?, ?, 0, ?, 1)`,
+      )
+      .run(start, start + 3600, title, modified).lastInsertRowid,
+  );
+}
+
+function calendarAdapter(db: Database.Database, lookAheadDays = 7) {
   const a = new CalendarAdapter();
   (a as any).db = db;
   (a as any).config = {
     enabled: true,
     pollIntervalSec: 300,
     importanceThreshold: 1,
-    settings: {},
+    settings: { lookAheadDays },
   };
   return a;
 }
 
-describe("CalendarAdapter cursor", () => {
+const titles = (events: Array<{ content: string }>) => events.map((e) => e.content).sort();
+
+describe("CalendarAdapter collection", () => {
   it("the first poll returns the window, including never-modified events", async () => {
-    const db = calendarDb(3, (i) => (i === 0 ? null : Date.now() / 1000 - CORE_DATA_EPOCH - 600));
-    const events = await calendarAdapter(db).poll();
-    expect(events).toHaveLength(3);
+    const db = calendarDb();
+    addEvent(db, "Planning meeting A", 2, null);
+    addEvent(db, "Planning meeting B", 3, nowCore() - 600);
+    expect(titles(await calendarAdapter(db).poll())).toEqual([
+      "Planning meeting A",
+      "Planning meeting B",
+    ]);
   });
 
-  it("a page cut off by the limit resumes after the last row returned, not at 'now'", async () => {
-    const base = Date.now() / 1000 - CORE_DATA_EPOCH - 100_000;
-    const db = calendarDb(550, (i) => base + i);
+  it("collects each event once, and again when it is edited", async () => {
+    const db = calendarDb();
+    const id = addEvent(db, "Planning meeting", 2, nowCore() - 600);
     const a = calendarAdapter(db);
-    a.setCheckpoint(new Date((base - 1 + CORE_DATA_EPOCH) * 1000).toISOString());
-    const first = await a.poll();
-    expect(first).toHaveLength(500);
-    const second = await a.poll();
-    // Rows 499..549: the boundary row is re-seen (>=) and deduped by id later.
-    expect(second.length).toBeGreaterThanOrEqual(50);
-    const titles = new Set([...first, ...second].map((e) => e.content));
-    expect(titles.size).toBe(550);
+    expect(await a.poll()).toHaveLength(1);
+    expect(await a.poll()).toEqual([]);
+    db.prepare("UPDATE ZCALENDARITEM SET ZSUMMARY = ?, ZMODIFIEDDATE = ? WHERE Z_PK = ?").run(
+      "Planning meeting moved",
+      nowCore(),
+      id,
+    );
+    expect(titles(await a.poll())).toEqual(["Planning meeting moved"]);
   });
 
-  it("a full page tied on a fractional timestamp moves on instead of repeating forever", async () => {
-    // Core Data dates carry sub-millisecond fractions the ISO cursor drops.
-    const t = Date.now() / 1000 - CORE_DATA_EPOCH - 100_000 + 0.123456;
-    const db = calendarDb(520, (i) => (i < 510 ? t : t + 10));
+  it("collects an event created later with no modification date", async () => {
+    // The modification-date cursor could never see these after the first poll.
+    const db = calendarDb();
+    addEvent(db, "Planning meeting A", 2, nowCore() - 600);
     const a = calendarAdapter(db);
-    a.setCheckpoint(new Date((t - 1 + CORE_DATA_EPOCH) * 1000).toISOString());
     await a.poll();
-    const cursors = [a.getCheckpoint()];
-    for (let i = 0; i < 3; i++) {
-      await a.poll();
-      cursors.push(a.getCheckpoint());
-    }
-    // It must not sit on the tied timestamp: it advances to the next one or
-    // (having skipped the rest of the tie, with a warning) to now.
-    expect(new Set(cursors).size).toBeGreaterThan(1);
+    addEvent(db, "Planning meeting B", 5, null);
+    expect(titles(await a.poll())).toEqual(["Planning meeting B"]);
+  });
+
+  it("collects an event created long ago once it enters the look-ahead window", async () => {
+    const db = calendarDb();
+    addEvent(db, "Planning offsite", 24 * 20, nowCore() - 86400 * 30); // 20 days out
+    const a = calendarAdapter(db, 7);
+    expect(await a.poll()).toEqual([]);
+    // Time passes: simulate by widening the window to where "now" will be.
+    (a as any).config.settings.lookAheadDays = 21;
+    expect(titles(await a.poll())).toEqual(["Planning offsite"]);
+  });
+
+  it("collects every event of a busy window in one poll, with no tie rules", async () => {
+    const db = calendarDb();
+    const t = nowCore() - 100_000 + 0.123456; // one shared, fractional modification time
+    for (let i = 0; i < 600; i++) addEvent(db, `Planning meeting ${i}`, 1 + i / 100, t);
+    const a = calendarAdapter(db);
+    expect(await a.poll()).toHaveLength(600);
+    expect(await a.poll()).toEqual([]);
+  });
+
+  it("upgrading from a modification-date cursor emits only what changed since it", async () => {
+    const db = calendarDb();
+    addEvent(db, "Planning meeting old", 2, nowCore() - 86400);
+    addEvent(db, "Planning meeting new", 3, nowCore() - 60);
+    const a = calendarAdapter(db);
+    a.setCheckpoint(new Date(Date.now() - 3600_000).toISOString()); // a v1 cursor
+    expect(titles(await a.poll())).toEqual(["Planning meeting new"]);
+    expect(a.getCheckpoint()).toMatch(/^v2:/);
+    expect(await a.poll()).toEqual([]);
+  });
+
+  it("the checkpoint round-trips, and a restored one suppresses re-collection", async () => {
+    const db = calendarDb();
+    addEvent(db, "Planning meeting", 2, null);
+    const a = calendarAdapter(db);
+    await a.poll();
+    const b = calendarAdapter(db);
+    b.setCheckpoint(a.getCheckpoint());
+    expect(await b.poll()).toEqual([]);
   });
 
   it("throws on a query error instead of returning an empty calendar", async () => {
