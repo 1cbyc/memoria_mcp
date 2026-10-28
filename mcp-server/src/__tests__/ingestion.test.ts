@@ -176,3 +176,69 @@ describe("IngestionPipeline — an unparsable timestamp (2026-09 re-review)", ()
     expect(fs.readFileSync(todayDailyPath(), "utf-8")).toContain("## 12:00 UTC");
   });
 });
+
+describe("IngestionPipeline — the dedup search never sees unredacted content (review 2026-10)", () => {
+  // The similarity search embeds its query, which leaves the device under
+  // MEMORIA_EMBEDDINGS=openai. It must only ever see what the write path
+  // would persist.
+  it("skips the similarity search for local-only events, by tier or by content", async () => {
+    const queries: string[] = [];
+    const pipeline = new IngestionPipeline({
+      memoriesDir,
+      searchMemories: async (q: string) => {
+        queries.push(q);
+        return [];
+      },
+    });
+    const result = await pipeline.ingest([
+      ev({
+        content: "Dentist appointment, bring the insurance card please.",
+        privacyTier: "local-only",
+      }),
+      // Mislabelled "send", but the content reclassifies as local-only.
+      ev({ content: "Wire transfer: routing number 021000021, account 12345678." }),
+    ]);
+    expect(result.written).toBe(2);
+    expect(queries).toEqual([]);
+    const log = fs.readFileSync(todayDailyPath(), "utf-8");
+    expect(log).not.toContain("021000021");
+    expect(log).not.toContain("Dentist");
+  });
+
+  it("distinct local-only events are all written, not deduped against each other's placeholder", async () => {
+    // Every local-only event is redacted to the same placeholder; if the
+    // search ran on it, the second would "match" the first and be skipped.
+    const pipeline = new IngestionPipeline({
+      memoriesDir,
+      searchMemories: async () => [{ file: "daily/x.md", content: "[redacted]", score: 0.99 }],
+    });
+    const result = await pipeline.ingest([
+      ev({
+        content: "First private calendar note with plenty of detail.",
+        privacyTier: "local-only",
+      }),
+      ev({
+        content: "Second private calendar note, entirely different.",
+        privacyTier: "local-only",
+      }),
+    ]);
+    expect(result.written).toBe(2);
+    expect(result.deduplicated).toBe(0);
+  });
+
+  it("searches summarize-tier events by their truncated, persisted form", async () => {
+    const queries: string[] = [];
+    const pipeline = new IngestionPipeline({
+      memoriesDir,
+      searchMemories: async (q: string) => {
+        queries.push(q);
+        return [];
+      },
+    });
+    const long = "Meeting notes. " + "x".repeat(600) + " TAIL-MARKER";
+    await pipeline.ingest([ev({ content: long, privacyTier: "summarize" })]);
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).not.toContain("TAIL-MARKER");
+    expect(queries[0].length).toBeLessThanOrEqual(200);
+  });
+});

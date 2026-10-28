@@ -214,7 +214,24 @@ export class IngestionPipeline {
         // unrelated automated events score high enough to "match" a core doc
         // and would graffiti it. decideAction therefore returns only
         // "create" (→ today's daily log) or "skip" (already captured).
-        const action = await this.decideAction(event);
+        //
+        // Privacy is enforced BEFORE this stage, not just before the write:
+        // the similarity search embeds its query, and under
+        // MEMORIA_EMBEDDINGS=openai that sends it off the device. Searching
+        // with the raw content leaked local-only text the write path redacts.
+        // Sink-side enforcement (defense in depth): adapters set a
+        // privacyTier, but we never trust it as the sole gate — re-classify
+        // the content and take the MORE restrictive tier, then redact
+        // accordingly. This closes adapters that mislabel events (e.g.
+        // calendar titles) and external /ingest callers that supply their
+        // own tier. A local-only event is redacted to a fixed placeholder, so
+        // a similarity search would match every earlier one and skip it as a
+        // duplicate; exact repeats are already caught by Stage 3's hash.
+        const safeEvent = this.enforcePrivacy(event);
+        const action: { type: "create" | "skip" } =
+          safeEvent.privacyTier === "local-only"
+            ? { type: "create" }
+            : await this.decideAction(safeEvent);
 
         // Stage 5: Write
         if (action.type === "skip") {
@@ -224,14 +241,6 @@ export class IngestionPipeline {
           result.deduplicated++;
           result.outcomes.push({ id: event.id, source: event.source, outcome: "duplicate" });
         } else {
-          // Sink-side privacy enforcement (defense in depth). Adapters set a
-          // privacyTier, but we never trust it as the sole gate: re-classify
-          // the content here and take the MORE restrictive tier, then redact
-          // accordingly before the content is persisted to a git-synced,
-          // OpenAI-embedded daily log. This closes adapters that mislabel
-          // events (e.g. calendar titles) and external /ingest callers that
-          // supply their own tier.
-          const safeEvent = this.enforcePrivacy(event);
           this.writeNewMemory(safeEvent, adjustedImportance);
           // Only now — after the write succeeded — consume budget and record
           // the event as seen.
