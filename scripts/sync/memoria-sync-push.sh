@@ -11,6 +11,10 @@
 #                            store would push on every turn. Local commits
 #                            still happen every time — only the network round
 #                            trip is rate-limited. Set 0 to push every time.
+#                            A deferred push is not left for the next turn
+#                            (there may be none: the session may be over): one
+#                            background push is scheduled for when the
+#                            interval ends.
 
 set -uo pipefail
 
@@ -20,12 +24,27 @@ LOG_FILE="${MEMORIA_SYNC_LOG:-$STORE/.sync.log}"
 MIRROR="${MEMORIA_SYNC_MIRROR:-$STORE/.memoria-mirror.sh}"
 INTERVAL="${MEMORIA_SYNC_INTERVAL_S:-900}"
 STAMP="$STORE/.last-sync"
+PENDING="$STORE/.sync-push-pending"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 trap 'echo "{\"continue\": true}"' EXIT
 
 log() {
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
   echo "[$(date -Iseconds)] push: $*" >> "$LOG_FILE" 2>/dev/null
+}
+
+# Run this script again, detached, once the push interval has passed, so
+# commits made in a session's last turns reach the remote even if no later
+# turn fires the hook. At most one is pending at a time.
+schedule_deferred_push() {
+  if [ -f "$PENDING" ] && kill -0 "$(cat "$PENDING" 2>/dev/null)" 2>/dev/null; then
+    return
+  fi
+  # shellcheck disable=SC2016 # expanded by the inner shell, on purpose
+  nohup bash -c 'sleep "$1"; MEMORIA_SYNC_INTERVAL_S=0 bash "$2" >/dev/null 2>&1; rm -f "$3"' \
+    _ "$1" "$SELF" "$PENDING" </dev/null >/dev/null 2>&1 &
+  echo "$!" > "$PENDING" 2>/dev/null
 }
 
 if [ ! -d "$STORE/.git" ]; then
@@ -62,7 +81,9 @@ if [ "$INTERVAL" != "0" ] && [ -f "$STAMP" ]; then
   NOW="$(date +%s)"
   LAST="$(date -r "$STAMP" +%s 2>/dev/null || echo 0)"
   if [ "$((NOW - LAST))" -lt "$INTERVAL" ]; then
-    log "last push $((NOW - LAST))s ago (< ${INTERVAL}s) — committed locally, deferring the push"
+    WAIT="$((INTERVAL - (NOW - LAST)))"
+    schedule_deferred_push "$WAIT"
+    log "last push $((NOW - LAST))s ago (< ${INTERVAL}s) — committed locally, push scheduled in ${WAIT}s"
     exit 0
   fi
 fi

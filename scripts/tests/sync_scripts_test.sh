@@ -64,4 +64,26 @@ echo z >> "$STORE/memories/a.md"
 MEMORIA_DIR="$STORE" MEMORIA_SYNC_INTERVAL_S=0 MEMORIA_SYNC_ALLOW_STORE_MIRROR=true bash "$REPO_ROOT/scripts/sync/memoria-sync-push.sh" >"$TMP/out7" 2>&1
 check "H-01: store mirror runs on push only with explicit opt-in" test -f "$STORE/mirror-ran"
 
+# ── A deferred push is not stranded until a later turn ──
+# A push inside the interval used to wait for the next Stop hook, which may
+# never come (the session ended), leaving the last commits on this device.
+REMOTE="$TMP/remote.git"
+git init -q --bare "$REMOTE"
+git -C "$STORE" remote add origin "$REMOTE"
+BR="$(git -C "$STORE" rev-parse --abbrev-ref HEAD)"
+git -C "$STORE" push -q origin "$BR"
+touch "$STORE/.last-sync" # a push just happened
+echo deferred >> "$STORE/memories/a.md"
+MEMORIA_DIR="$STORE" MEMORIA_SYNC_INTERVAL_S=2 bash "$REPO_ROOT/scripts/sync/memoria-sync-push.sh" >"$TMP/out8" 2>&1
+LOCAL_HEAD="$(git -C "$STORE" rev-parse HEAD)"
+check "deferral: not pushed inside the interval" test "$(git -C "$REMOTE" rev-parse "$BR")" != "$LOCAL_HEAD"
+check "deferral: one background push scheduled" test -f "$STORE/.sync-push-pending"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(git -C "$REMOTE" rev-parse "$BR")" = "$LOCAL_HEAD" ] && break
+  sleep 1
+done
+check "deferral: the scheduled push reached the remote" test "$(git -C "$REMOTE" rev-parse "$BR")" = "$LOCAL_HEAD"
+for _ in 1 2 3; do [ -f "$STORE/.sync-push-pending" ] || break; sleep 1; done
+check "deferral: the pending marker is cleared" test ! -f "$STORE/.sync-push-pending"
+
 if [ "$fail" -eq 0 ]; then echo "all sync script tests passed"; else echo "FAILURES"; exit 1; fi
