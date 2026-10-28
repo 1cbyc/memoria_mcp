@@ -1,6 +1,6 @@
 {
   "name": "@agrippa87/memoria-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Memoria — persistent, plain-text memory for Claude over MCP. Markdown files you own, hybrid semantic + keyword search, OAuth 2.1 remote transport, and agentic self-maintenance.",
   "type": "module",
   "main": "dist/index.js",

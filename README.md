@@ -18,11 +18,20 @@ Memoria is an [MCP](https://modelcontextprotocol.io) server that gives Claude Co
 - **Spec-complete remote transport.** OAuth 2.1 with PKCE, client credentials, dynamic client registration and metadata discovery — works as a claude.ai custom connector out of the box.
 - **Honest about search.** Three embedding providers (local MiniLM → n-gram fallback, plus OpenAI as an explicit opt-in), three-signal scoring, and every result reports its scan coverage.
 
-## Recent updates — security hardening (unreleased)
+## Recent updates — 0.3.0: security hardening and relevance-led search
 
-A whole-repo review hardened the server, the collector, and the sync scripts.
-Full details are in [CHANGELOG.md](CHANGELOG.md) (Unreleased) and
-[SECURITY.md](SECURITY.md). The changes most likely to affect you:
+A whole-repo review, and a critical re-review after it, hardened the
+server, the collector, and the sync scripts. Full details are in
+[CHANGELOG.md](CHANGELOG.md) (0.3.0) and [SECURITY.md](SECURITY.md). The
+changes most likely to affect you:
+
+- **Search ranks by relevance first.** Default weights are now
+  `0.8·relevance + 0.1·recency + 0.1·importance` (were 0.5/0.2/0.3), and
+  recency comes from each memory's own `updated` date rather than from when
+  it was indexed. The index is rebuilt once on first start.
+- **MCP callers can only change a source's schedule.** Hosts, credentials,
+  paths and labels change in the dashboard, so a prompt-injected agent
+  cannot point a consented source (and its stored password) elsewhere.
 
 - **Collector consent is dashboard-only.** The `memory_sources` `agree`
   action was removed: an MCP caller (including a prompt-injected one) can
@@ -43,8 +52,9 @@ Full details are in [CHANGELOG.md](CHANGELOG.md) (Unreleased) and
   are bounded, and the provenance archive stores content encrypted rather
   than plaintext. Optional: `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true`
   requires a dashboard login or the API key before `/authorize` issues a
-  code. docker-compose now also requires `MEMORIA_PUBLIC_URL` in `.env`
-  (the `.env.example` localhost value covers purely local use).
+  code, and disables the `client_credentials` grant. docker-compose now
+  also requires `MEMORIA_PUBLIC_URL` in `.env` (the `.env.example`
+  localhost value covers purely local use).
 
 Under the hood, the collector daemon gained a dedicated test suite (which
 also caught that its first poll on startup never ran — now fixed), and

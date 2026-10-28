@@ -1,7 +1,7 @@
 {
   "name": "memoria",
   "displayName": "Memoria",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Persistent, plain-text memory for Claude — Markdown files you own, hybrid semantic + keyword search, and optional git sync across devices.",
   "author": {
     "name": "Agripp87",

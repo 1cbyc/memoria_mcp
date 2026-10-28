@@ -295,7 +295,7 @@ const store = new MemoryStore(DB_PATH);
 function createServer(): McpServer {
   const server = new McpServer({
     name: "memoria",
-    version: "0.2.1",
+    version: "0.3.0",
     description: SERVER_DESCRIPTION,
   });
   registerTools(server, store);
