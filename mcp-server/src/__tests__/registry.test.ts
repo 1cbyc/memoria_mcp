@@ -278,10 +278,10 @@ describe("enabled sources resume after a restart (review 2026-10)", () => {
     reg.recordAgreement("custom-w");
     await reg.enableSource("custom-w", undefined, "user");
     const adapter = reg.getActiveAdapters().get("custom-w")!;
-    adapter.setCheckpoint("cursor-42");
+    adapter.setCheckpoint("v2:aaaaaaaaaaaa");
     reg.saveCheckpoint("custom-w");
     const reread = new SourceRegistry(dataDir);
-    expect((reread as any).state.checkpoints["custom-w"]).toBe("cursor-42");
+    expect((reread as any).state.checkpoints["custom-w"]).toBe("v2:aaaaaaaaaaaa");
     await reg.destroy();
   });
 });
@@ -349,13 +349,15 @@ describe("source lifecycle hardening (re-review 2026-10)", () => {
     await enabledWatcher();
     await reg.enableSource("custom-w", undefined, "user");
     const adapter = reg.getActiveAdapters().get("custom-w")!;
-    adapter.setCheckpoint("durable");
+    adapter.setCheckpoint("v2:dddddddddddd");
     reg.saveCheckpoint("custom-w");
-    adapter.setCheckpoint("ahead-of-the-buffer"); // a poll mid-flight
+    adapter.setCheckpoint("v2:eeeeeeeeeeee"); // a poll mid-flight
     await reg.disableSource("custom-w", "agent");
-    expect((reg as any).state.checkpoints["custom-w"]).toBe("durable");
+    expect((reg as any).state.checkpoints["custom-w"]).toBe("v2:dddddddddddd");
     await reg.destroy();
-    expect((new SourceRegistry(dataDir) as any).state.checkpoints["custom-w"]).toBe("durable");
+    expect((new SourceRegistry(dataDir) as any).state.checkpoints["custom-w"]).toBe(
+      "v2:dddddddddddd",
+    );
   });
 
   it("hasEnabledSources reflects the switched-on sources", async () => {
@@ -386,5 +388,64 @@ describe("resume never undoes a disable queued ahead of it (re-review 2026-10)",
     await Promise.all([disabling, resuming]);
     expect(reg.getActiveAdapters().has("custom-w")).toBe(false);
     expect(reg.hasEnabledSources()).toBe(false);
+  });
+});
+
+describe("custom sources emit only new records (review 2026-10)", () => {
+  beforeEach(() => {
+    process.env.MEMORIA_FILE_WATCHER_ROOTS = root;
+  });
+
+  async function watcher(file: string, format: "lines" | "json" = "lines") {
+    const { CustomAdapter } = await import("../collector/adapters/custom.js");
+    const a = new CustomAdapter(def({ id: "w", watchPath: file, fileFormat: format }), {
+      dataDir,
+    });
+    await a.init({ enabled: true, pollIntervalSec: 60, importanceThreshold: 1, settings: {} });
+    return a;
+  }
+  const bump = (file: string) => {
+    const t = new Date(Date.now() + Math.random() * 1000 + 1000);
+    fs.utimesSync(file, t, t);
+  };
+
+  it("an appended line yields only that line, not the whole file again", async () => {
+    const file = path.join(root, "log.txt");
+    fs.writeFileSync(
+      file,
+      "Decided to migrate the queue to Redis\nShipped the release on Friday\n",
+    );
+    const a = await watcher(file);
+    expect(await a.poll()).toHaveLength(2);
+    fs.appendFileSync(file, "Postmortem written for the outage\n");
+    bump(file);
+    const next = await a.poll();
+    expect(next.map((e) => e.content)).toEqual(["Postmortem written for the outage"]);
+  });
+
+  it("remembers what it read across a restart (via the checkpoint)", async () => {
+    const file = path.join(root, "log.txt");
+    fs.writeFileSync(file, "Decided to migrate the queue to Redis\n");
+    const a = await watcher(file);
+    await a.poll();
+    const b = await watcher(file);
+    b.setCheckpoint(a.getCheckpoint());
+    expect(await b.poll()).toEqual([]);
+  });
+
+  it("a source upgraded from 0.2.x records its existing file without re-emitting it", async () => {
+    const file = path.join(root, "log.txt");
+    fs.writeFileSync(file, "Decided to migrate the queue to Redis\n");
+    expect(
+      reg.addCustomSource(def({ id: "w", watchPath: file, fileFormat: "lines" })).success,
+    ).toBe(true);
+    reg.recordAgreement("custom-w");
+    (reg as any).state.eventCounts["custom-w"] = 12; // it collected before
+    await reg.enableSource("custom-w", undefined, "user");
+    const adapter = reg.getActiveAdapters().get("custom-w")!;
+    expect(await adapter.poll()).toEqual([]);
+    fs.appendFileSync(file, "Shipped the release on Friday\n");
+    bump(file);
+    expect((await adapter.poll()).map((e) => e.content)).toEqual(["Shipped the release on Friday"]);
   });
 });

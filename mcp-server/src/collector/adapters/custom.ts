@@ -18,7 +18,13 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { SourceAdapter, AdapterInfo, AdapterConfig, RawEvent } from "./base.js";
 import { estimateImportance, classifyPrivacy } from "./base.js";
-import { keyedContentHash } from "../crypto.js";
+import { contentHash, keyedContentHash } from "../crypto.js";
+
+/**
+ * Checkpoint for a source that collected before checkpoints existed: its
+ * first read records what is there without emitting it again.
+ */
+export const CUSTOM_BASELINE = "baseline";
 
 export interface CustomSourceDefinition {
   /** Unique ID for this custom source */
@@ -209,9 +215,9 @@ export class CustomAdapter implements SourceAdapter {
   async poll(): Promise<RawEvent[]> {
     switch (this.definition.mode) {
       case "file_watcher":
-        return this.pollFile();
+        return this.onlyNew(this.pollFile());
       case "shell_command":
-        return this.pollCommand();
+        return this.onlyNew(this.pollCommand());
       case "webhook":
         // Webhooks are push-based; poll returns pending events
         return this.drainWebhookQueue();
@@ -409,12 +415,65 @@ export class CustomAdapter implements SourceAdapter {
     return current;
   }
 
+  // ── What has been collected ────────────────────────────────
+
+  /**
+   * Record ids the previous read produced, as 12-hex-character fingerprints
+   * (null = no read yet). A watched file is re-read whole whenever it
+   * changes and a command's whole output on every poll; without this, every
+   * record was emitted again each time, and only the buffer's id dedup
+   * (about a day or two) stood between an appended line and a re-ingest of
+   * the whole history into today's log.
+   */
+  private seenIds: Set<string> | null = null;
+  /** Upgrading a source that collected before: the first read only records. */
+  private baselineOnly = false;
+
+  private static fingerprint(id: string): string {
+    return contentHash(id).slice(0, 12);
+  }
+
+  /**
+   * Keep the records the previous read did not have. Bounded: past
+   * MAX_TRACKED records only the newest (last read) are remembered, which
+   * for an append-only file are the ones that matter.
+   */
+  private onlyNew(events: RawEvent[]): RawEvent[] {
+    const MAX_TRACKED = 50_000;
+    // Skipped reads (unchanged file, oversized file, command error) return
+    // [] without a read having happened; they must not reset the set.
+    if (events.length === 0 && this.seenIds !== null) return events;
+    const previous = this.seenIds ?? new Set<string>();
+    const current = new Set<string>();
+    const fresh: RawEvent[] = [];
+    for (const e of events) {
+      const fp = CustomAdapter.fingerprint(String(e.id));
+      current.add(fp);
+      if (!previous.has(fp)) fresh.push(e);
+    }
+    this.seenIds = current.size > MAX_TRACKED ? new Set([...current].slice(-MAX_TRACKED)) : current;
+    if (this.baselineOnly) {
+      this.baselineOnly = false;
+      return [];
+    }
+    return fresh;
+  }
+
   getCheckpoint(): string {
-    return this.checkpoint;
+    if (this.seenIds === null) return this.baselineOnly ? CUSTOM_BASELINE : "";
+    return `v2:${[...this.seenIds].join("")}`;
   }
 
   setCheckpoint(cursor: string): void {
     this.checkpoint = cursor;
+    this.seenIds = null;
+    this.baselineOnly = cursor === CUSTOM_BASELINE;
+    if (cursor.startsWith("v2:")) {
+      const packed = cursor.slice(3);
+      const ids = new Set<string>();
+      for (let i = 0; i + 12 <= packed.length; i += 12) ids.add(packed.slice(i, i + 12));
+      this.seenIds = ids;
+    }
   }
 
   async destroy(): Promise<void> {

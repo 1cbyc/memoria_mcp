@@ -145,3 +145,35 @@ describe("utcTimeLabel beyond year 9999 (2026-09 re-review, round 3)", () => {
     expect(utcTimeLabel(new Date(1727186400000000))).toMatch(/^\d{2}:\d{2} UTC$/);
   });
 });
+
+describe("buildEntityPages slug collisions (review 2026-10)", () => {
+  it("sources that slugify alike get separate pages, and the first keeps its page", () => {
+    writeDaily(
+      "2026-06-01",
+      entry("10:00 AM", "my-source", "dash event A") +
+        entry("10:05 AM", "my-source", "dash event B") +
+        entry("10:10 AM", "my-source", "dash event C") +
+        entry("11:00 AM", "my_source", "underscore event A") +
+        entry("11:05 AM", "my_source", "underscore event B") +
+        entry("11:10 AM", "my_source", "underscore event C"),
+    );
+    buildEntityPages(MEM, { minEvents: 3 });
+    const pages = fs.readdirSync(path.join(MEM, "entities")).sort();
+    expect(pages).toHaveLength(2);
+    expect(pages).toContain("my-source.md");
+    const dash = fs.readFileSync(path.join(MEM, "entities", "my-source.md"), "utf-8");
+    expect(dash).toContain("source: my-source");
+    expect(dash).not.toContain("source: my_source");
+    const other = pages.find((p) => p !== "my-source.md")!;
+    expect(other).toMatch(/^my-source-[0-9a-f]{6}\.md$/);
+    const under = fs.readFileSync(path.join(MEM, "entities", other), "utf-8");
+    expect(under).toContain("source: my_source");
+
+    // A second run is stable: same two files, nothing overwritten across.
+    buildEntityPages(MEM, { minEvents: 3 });
+    expect(fs.readdirSync(path.join(MEM, "entities")).sort()).toEqual(pages);
+    expect(fs.readFileSync(path.join(MEM, "entities", "my-source.md"), "utf-8")).toContain(
+      "source: my-source",
+    );
+  });
+});

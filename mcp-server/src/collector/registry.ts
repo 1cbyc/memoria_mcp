@@ -21,6 +21,7 @@ import { GoogleGmailAdapter } from "./adapters/google-gmail.js";
 import { GoogleCalendarAdapter } from "./adapters/google-calendar.js";
 import { GoogleDriveAdapter } from "./adapters/google-drive.js";
 import {
+  CUSTOM_BASELINE,
   CustomAdapter,
   assertWatchPathAllowed,
   type CustomSourceDefinition,
@@ -342,6 +343,11 @@ export class SourceRegistry {
       const savedCheckpoint = this.state.checkpoints[sourceId];
       if (savedCheckpoint) {
         adapter.setCheckpoint(savedCheckpoint);
+      } else if (adapter instanceof CustomAdapter && (this.state.eventCounts[sourceId] ?? 0) > 0) {
+        // A custom source that collected under 0.2.x, which kept no record
+        // of what it had read: take what is there now as already collected
+        // rather than re-ingesting its whole history once.
+        adapter.setCheckpoint(CUSTOM_BASELINE);
       }
 
       await adapter.init(config);
