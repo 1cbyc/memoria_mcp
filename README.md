@@ -29,6 +29,8 @@ changes most likely to affect you:
   `0.8·relevance + 0.1·recency + 0.1·importance` (were 0.5/0.2/0.3), and
   recency comes from each memory's own `updated` date rather than from when
   it was indexed. The index is rebuilt once on first start.
+- **Keyword search matches any query word** (BM25 still ranks chunks that
+  match more of them first), instead of requiring every word.
 - **MCP callers can only change a source's schedule.** Hosts, credentials,
   paths and labels change in the dashboard, so a prompt-injected agent
   cannot point a consented source (and its stored password) elsewhere.
@@ -861,7 +863,11 @@ Honest accounting of what is *not* hardened or covered yet — tracked for follo
 - **~~Dashboard key in `localStorage`~~ — fixed in Phase 3 (2026-07):** the dashboard now exchanges the API key once at `POST /dashboard/login` for an **httpOnly, SameSite=Strict session cookie** scoped to `Path=/dashboard` (never sent to `/mcp`//`/ingest`, unreadable from JS). A legacy key found in localStorage is migrated to a cookie session and removed. Bearer auth is unchanged for API clients.
 - **Wiki edge cases.** `[[wikilinks]]` resolve by name/path/basename; ambiguous names resolve to the first match. A `[[link]]` inside a markdown link label renders as literal text (markdown-it can't nest anchors) rather than a navigable link — by design, to avoid producing invalid HTML.
 
-These are the known open items after the September 2026 review; [issues](https://github.com/Agripp87/memoria_mcp/issues) are welcome for anything missing here.
+- **Verified against fakes, not the real services.** The 0.3.0 fixes to the IMAP, Gmail and macOS Calendar adapters (cursors, reconnects, collection by fingerprint) are tested against fakes that follow the documented behaviour of imapflow, the Gmail API and the Calendar Cache schema, not against live accounts or a real Calendar database. Report anything they miss.
+- **Ranking defaults measured on the lexical provider.** The 0.3.0 weights (0.8 / 0.1 / 0.1) and OR keyword matching were measured with `npm run eval:hash`; the default MiniLM provider has not been re-measured since (`npm run eval` needs the one-time model download).
+- **iMessage bodies stored only in `attributedBody`.** Recent macOS versions often leave the `text` column empty and keep the message in `attributedBody`; such messages are skipped.
+
+These are the known open items after the October 2026 review; [issues](https://github.com/Agripp87/memoria_mcp/issues) are welcome for anything missing here.
 
 ## Design Decisions
 

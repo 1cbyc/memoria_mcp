@@ -82,6 +82,11 @@ start** (see below); access counts gathered so far start over.
   local-only content (calendar notes, account numbers) reached OpenAI even
   though the daily log redacted it. Privacy is enforced first; local-only
   events skip the similarity search.
+- Fingerprints that are written down (the ingest dedup sidecar,
+  provenance records, content-derived custom-source ids that reach the
+  synced daily log) are now HMACs under a key derived from the collector
+  master key; a bare SHA-256 of short local-only content was reversible
+  by guessing.
 - Dependencies: `npm audit` is clean (was 11 advisories, 1 critical and
   6 high, including `proxy-addr`, `@modelcontextprotocol/sdk`,
   `markdown-it`, `body-parser`, `zod` and `sharp`). Direct dependency
@@ -169,6 +174,43 @@ start** (see below); access counts gathered so far start over.
   old instance's connection or database handle.
 - `memory_lint`'s knowledge-gap check compared the blended search score to
   a cut tied to the old ranking weights; it now gates on relevance.
+- Keyword search required every query word to appear in a chunk (FTS5's
+  implicit AND), so natural-language queries rarely matched; words are
+  now ORed, with BM25 ranking chunks that match more and rarer words
+  first (eval, hash provider: default 60.4 -> 61.7 nDCG@10, keyword only
+  53.8 -> 66.5).
+- One file that failed to index (an embedding API error, an over-limit
+  chunk) exited the server at startup and stopped the periodic sweep;
+  failures are now logged and skipped per file. Single lines longer than
+  a chunk are split. `memory_index` takes `force: true` to re-embed every
+  file. The lexical (hash) embedding keeps non-ASCII words.
+- HTTP: an unknown or expired MCP session gets 404 (the spec's signal to
+  re-initialize) instead of 400; request bodies on /mcp, /dashboard/api
+  and /ingest are parsed only after authentication (64KB elsewhere); at
+  the session cap the idlest session is closed instead of answering 503.
+  New `MEMORIA_TRUST_PROXY` (default 1) sets the proxy hop count.
+- The macOS Calendar adapter now tracks events by fingerprint over its
+  window, so events with no modification date and events that slide into
+  the look-ahead window are collected. IMAP fetches one batch per poll
+  instead of re-downloading the whole backlog.
+- Custom file watchers and shell commands emit only records they have
+  not read before (the checkpoint keeps the last read's record ids);
+  they re-emitted the whole file or output on every change.
+- Buffer: retention compared mismatched date formats and deleted rows up
+  to a day early; rows that cannot be decrypted (a changed master key)
+  blocked the ingest queue and are now held aside, kept, and released if
+  they decrypt again.
+- Fused activities are written once: the daemon fuses only events it
+  wrote, and an activity whose events were all fused already is skipped.
+- Entity pages for sources whose names slugify alike no longer overwrite
+  each other.
+- The sync push hook schedules a deferred push for the end of its rate
+  limit instead of leaving a session's last commits on the device.
+- `deploy/gcp/deploy-demo.sh` could not start (production posture
+  checks) and ran two instances; fixed.
+- The Python ingestion hook no longer blocks `record_*` calls on the
+  network, and drops batches the server rejects with a 4xx instead of
+  retrying them forever.
 - Dashboard annotations use the atomic append helper; entity-page
   regeneration re-checks for human edits at write time; the custom
   file-watcher skips files over 10 MB instead of reading them whole.
