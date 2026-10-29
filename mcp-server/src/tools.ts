@@ -4,6 +4,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -19,14 +20,18 @@ import { SourceRegistry } from "./collector/registry.js";
 import { EventBuffer } from "./collector/buffer.js";
 import { CollectorDaemon } from "./collector/daemon.js";
 import { IngestionPipeline } from "./collector/ingestion.js";
-import { TemporalFusion, formatFusedActivity } from "./collector/fusion.js";
+import { TemporalFusion, formatFusedActivity, type FusedActivity } from "./collector/fusion.js";
 import type { CustomSourceDefinition } from "./collector/adapters/custom.js";
+import { dailyLogPath, listDailyLogNames } from "./daily-paths.js";
 
 // ─── Path resolution ────────────────────────────────────────
 
 function resolveDefaultMemoriaDir(): string {
-  // Docker / cloud: use /data/memoria if /data exists (mounted volume)
-  if (process.env.DOCKER === "true" || fs.existsSync("/data")) {
+  // Docker / cloud: the image sets DOCKER=true (and MEMORIA_DIR). Merely
+  // having a /data directory used to count too, so on an ordinary host with
+  // one the local server used /data/memoria while the sync hooks used
+  // ~/.memoria, and an unwritable /data crashed the server at import.
+  if (process.env.DOCKER === "true") {
     return "/data/memoria";
   }
   // Local: ~/.memoria
@@ -38,6 +43,9 @@ const MEMORIES_DIR = path.join(MEMORIA_DIR, "memories");
 const DB_PATH = path.join(MEMORIA_DIR, "data", "memoria.sqlite");
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+// memories/ too: path checks resolve it, and on a fresh store the first
+// memory_write into a subfolder failed with ENOENT before creating anything.
+fs.mkdirSync(MEMORIES_DIR, { recursive: true });
 
 const DATA_DIR = path.join(MEMORIA_DIR, "data");
 
@@ -187,11 +195,82 @@ export async function reindexFile(store: MemoryStore, filePath: string): Promise
   }
 
   const chunks = chunkMarkdown(content, relPath);
-  await store.indexChunks(chunks, importance, content);
+  if (chunks.length === 0) {
+    // The body was emptied (or never had one): drop what was indexed for it.
+    store.clearFile(relPath, content, importance);
+    return 0;
+  }
+  let mtimeMs: number | undefined;
+  try {
+    mtimeMs = fs.statSync(filePath).mtimeMs;
+  } catch {
+    // raced with a delete; the index date falls back to now
+  }
+  await store.indexChunks(chunks, importance, content, {
+    contentDate: [metadata.updated, metadata.created],
+    mtimeMs,
+  });
   return chunks.length;
 }
 
+/**
+ * Index every memory file, each on its own: one failure (an embedding API
+ * error, a file that cannot be read) is logged and skipped rather than
+ * aborting the pass. At startup an uncaught failure used to exit the
+ * process, and the periodic sweep stopped at the first bad file. Index state
+ * for files no longer on disk is dropped.
+ */
+export async function reindexAll(
+  store: MemoryStore,
+  opts: { shouldStop?: () => boolean } = {},
+): Promise<{ files: number; chunks: number; failed: string[] }> {
+  const files = getAllMemoryFiles();
+  let chunks = 0;
+  const failed: string[] = [];
+  for (const f of files) {
+    if (opts.shouldStop?.()) break;
+    try {
+      chunks += await reindexFile(store, f);
+    } catch (err) {
+      failed.push(getRelativePath(f));
+      process.stderr.write(
+        `Memoria: indexing ${getRelativePath(f)} failed (skipped, retried on the next sweep): ${(err as Error).message}\n`,
+      );
+    }
+  }
+  if (!opts.shouldStop?.()) {
+    store.retainFiles(files.map(getRelativePath), (rel) => {
+      try {
+        return fs.lstatSync(path.join(MEMORIES_DIR, rel)).isFile();
+      } catch {
+        return false;
+      }
+    });
+  }
+  return { files: files.length, chunks, failed };
+}
+
 // ─── File watcher (1.5s debounce) ───────────────────────────
+
+/**
+ * In a secondary server, try every 30s to take over the store lock (the
+ * primary may have exited), and resume the collector once promoted.
+ */
+export function setupPrimaryTakeover(store: MemoryStore): NodeJS.Timeout | null {
+  if (store.isPrimary) return null;
+  const timer = setInterval(() => {
+    try {
+      if (store.tryBecomePrimary()) {
+        clearInterval(timer);
+        void resumeCollectorIfConfigured(store);
+      }
+    } catch (err) {
+      process.stderr.write(`Memoria: lock takeover check failed: ${(err as Error).message}\n`);
+    }
+  }, 30_000);
+  timer.unref?.();
+  return timer;
+}
 
 export function setupWatcher(store: MemoryStore): void {
   if (!fs.existsSync(MEMORIES_DIR)) return;
@@ -249,14 +328,8 @@ export function setupPeriodicReindex(
     if (running) return;
     running = true;
     try {
-      const onDisk = new Set(getAllMemoryFiles().map(getRelativePath));
-      for (const f of getAllMemoryFiles()) {
-        await reindexFile(store, f);
-      }
-      // Drop chunks for files removed on disk since the last sweep.
-      for (const indexed of store.getIndexedFiles()) {
-        if (!onDisk.has(indexed)) store.removeFile(indexed);
-      }
+      // Per-file failures are logged inside; removed files are dropped.
+      await reindexAll(store);
       // Keep MEMORY_INDEX.md fresh so it never drifts from the territory
       // (Karpathy rule VII). Idempotent — only writes when content changed.
       rebuildMarkdownIndex();
@@ -291,6 +364,8 @@ export function setupPeriodicOptimize(
 
   let running = false;
   const run = () => {
+    // Only the primary maintains the store; a secondary sharing it skips.
+    if (!store.isPrimary) return;
     if (running) return;
     running = true;
     try {
@@ -333,6 +408,7 @@ export function setupPeriodicCompile(
 
   let running = false;
   const run = async () => {
+    if (!store.isPrimary) return; // see setupPeriodicOptimize
     if (running) return;
     running = true;
     try {
@@ -471,7 +547,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
   // Tool 1: memory_search
   server.tool(
     "memory_search",
-    "Semantic + keyword hybrid search across all memories. Uses three-signal scoring: 0.2·recency + 0.3·importance + 0.5·relevance.",
+    "Semantic + keyword hybrid search across all memories. Uses three-signal scoring: 0.8·relevance + 0.1·recency + 0.1·importance.",
     {
       query: z.string().min(1).max(2000).describe("Search query (max 2000 characters)"),
       max_results: z
@@ -729,15 +805,20 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
   // Tool 5: memory_index
   server.tool(
     "memory_index",
-    "Rebuild the vector search index and MEMORY_INDEX.md catalog from all memory files. Use after bulk changes.",
-    {},
-    async () => {
-      const files = getAllMemoryFiles();
-      let totalChunks = 0;
-
-      for (const f of files) {
-        totalChunks += await reindexFile(store, f);
-      }
+    "Re-index changed memory files, drop deleted ones, and rebuild the MEMORY_INDEX.md catalog. Use after bulk changes. force=true re-embeds every file even if unchanged (repairs a damaged index).",
+    {
+      force: z
+        .boolean()
+        .optional()
+        .describe("Re-embed every file, not only changed ones (default false)"),
+    },
+    async ({ force }) => {
+      // Unchanged files are skipped by content hash, so without force this
+      // could not repair an index whose rows were damaged.
+      if (force) store.forgetContentHashes();
+      const result = await reindexAll(store);
+      const files = { length: result.files };
+      const totalChunks = result.chunks;
 
       const indexSummary = rebuildMarkdownIndex();
 
@@ -764,10 +845,8 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
     async ({ entry }) => {
       // Daily logs are UTC days (the dashboard journal and ingestion agree).
       const today = new Date().toISOString().split("T")[0];
-      const dailyDir = path.join(MEMORIES_DIR, "daily");
-      const dailyFile = path.join(dailyDir, `${today}.md`);
-
-      fs.mkdirSync(dailyDir, { recursive: true });
+      // Refuses a symlinked daily/ or log (see daily-paths.ts).
+      const dailyFile = dailyLogPath(MEMORIES_DIR, today);
 
       // Daily logs are append-only and may be written concurrently by the
       // collector's ingestion path (which uses appendFileSync). A
@@ -837,12 +916,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: "text" as const, text: "No daily logs found." }] };
       }
 
-      const files = fs
-        .readdirSync(dailyDir)
-        .filter((f) => f.endsWith(".md"))
-        .sort()
-        .reverse()
-        .slice(0, days);
+      const files = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, days);
 
       if (files.length === 0) {
         return { content: [{ type: "text" as const, text: "No daily logs found." }] };
@@ -908,12 +982,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
       let dailyLogCount = 0;
       let totalRecentEvents = 0;
       if (fs.existsSync(dailyDir)) {
-        const recent = fs
-          .readdirSync(dailyDir)
-          .filter((f) => f.endsWith(".md"))
-          .sort()
-          .reverse()
-          .slice(0, 7);
+        const recent = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, 7);
         dailyLogCount = recent.length;
         for (const f of recent) {
           const content = fs.readFileSync(path.join(dailyDir, f), "utf-8");
@@ -1087,7 +1156,18 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
       let slug = baseSlug;
       let relFile = `${dir}/${slug}.md`;
       let counter = 2;
-      while (fs.existsSync(resolveMemoryPath(relFile))) {
+      // resolveMemoryPath throws on a symlinked path: release the lock then,
+      // or every later compile into this directory waited forever.
+      const exists = (rel: string): boolean => {
+        try {
+          return fs.existsSync(resolveMemoryPath(rel));
+        } catch (err) {
+          compileLocks.delete(dirLockKey);
+          releaseLock();
+          throw err;
+        }
+      };
+      while (exists(relFile)) {
         slug = `${baseSlug}-${counter}`;
         relFile = `${dir}/${slug}.md`;
         counter++;
@@ -1212,12 +1292,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: "text" as const, text: "No daily logs to compact." }] };
       }
 
-      const files = fs
-        .readdirSync(dailyDir)
-        .filter((f) => f.endsWith(".md"))
-        .sort()
-        .reverse()
-        .slice(0, days);
+      const files = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, days);
 
       if (files.length === 0) {
         return { content: [{ type: "text" as const, text: "No daily logs to compact." }] };
@@ -1622,22 +1697,109 @@ export function rebuildMarkdownIndex(): string {
 
 // ─── Collector subsystem (sub-memory agent) ───────────────────
 
+/** Member events already written as part of a fused activity: key -> epoch ms. */
+const FUSED_SIDECAR = ".fused-events.json";
+const FUSED_WINDOW_MS = 3 * 24 * 3600 * 1000;
+
+function fusedEventKey(e: { source: string; id: string }): string {
+  return createHash("sha256").update(`${e.source}:${e.id}`).digest("hex").slice(0, 24);
+}
+
+function loadFusedEvents(): Record<string, number> {
+  const now = Date.now();
+  let seen: Record<string, number> = {};
+  try {
+    seen = JSON.parse(fs.readFileSync(path.join(DATA_DIR, FUSED_SIDECAR), "utf-8")) as Record<
+      string,
+      number
+    >;
+  } catch {
+    // none yet, or unreadable: start fresh
+  }
+  for (const [k, t] of Object.entries(seen)) {
+    if (typeof t !== "number" || now - t > FUSED_WINDOW_MS) delete seen[k];
+  }
+  return seen;
+}
+
+/**
+ * The events not yet part of a written fused activity. Fusion runs over
+ * these only: memory_fuse fuses unsynced events that the daemon later
+ * ingests and fuses again (with its own window), so clusters overlapped
+ * and the shared events were written into a second activity.
+ */
+export function unfusedEvents<T extends { source: string; id: string }>(events: T[]): T[] {
+  const seen = loadFusedEvents();
+  return events.filter((e) => !(fusedEventKey(e) in seen));
+}
+
+/**
+ * Write fused activities to today's daily log and record their events as
+ * fused (3-day window). An activity made only of already-fused events is
+ * skipped. Returns the activities written.
+ */
+export function writeFusedActivities(activities: FusedActivity[]): FusedActivity[] {
+  if (activities.length === 0) return [];
+  const seen = loadFusedEvents();
+  const now = Date.now();
+  const fresh = activities.filter((a) => a.sourceEvents.some((e) => !(fusedEventKey(e) in seen)));
+  if (fresh.length > 0) {
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyFile = dailyLogPath(MEMORIES_DIR, today);
+    // createOrAppend, not a bare append: when no event has been written
+    // today yet, a bare append created a daily log with no frontmatter.
+    for (const activity of fresh) {
+      const entry = formatFusedActivity(activity);
+      createOrAppend(dailyFile, collectorDailyHeader(today) + entry, `\n${entry}`);
+      for (const e of activity.sourceEvents) seen[fusedEventKey(e)] = now;
+    }
+  }
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    writeFileAtomic(path.join(DATA_DIR, FUSED_SIDECAR), JSON.stringify(seen));
+  } catch {
+    // best effort: worst case a later run writes an activity twice
+  }
+  return fresh;
+}
+
 let registry: SourceRegistry | null = null;
 let buffer: EventBuffer | null = null;
 let daemon: CollectorDaemon | null = null;
 let ingestion: IngestionPipeline | null = null;
 let fusion: TemporalFusion | null = null;
 let collectorInitPromise: Promise<void> | null = null;
+let collectorReady = false;
+let resumeRetryTimer: NodeJS.Timeout | null = null;
+
+/** How often enabled sources that failed to start are tried again. */
+const RESUME_RETRY_MS = 10 * 60 * 1000;
+
+/** Thrown when a secondary server is asked for the collector. */
+export const COLLECTOR_IN_PRIMARY =
+  "The collector runs in the Memoria server that opened this store first; this " +
+  "session's server shares its memories but not its collector. Use the dashboard, or " +
+  "retry after that server exits (this one then takes over).";
 
 async function ensureCollector(store: MemoryStore): Promise<void> {
-  if (registry) return;
+  // One collector per store: its registry state file is last-writer-wins
+  // and two daemons would poll every source twice.
+  if (!store.isPrimary) throw new Error(COLLECTOR_IN_PRIMARY);
+  // The fast path keys on completion, not on `registry` being set: the
+  // registry is assigned before init's first await, so callers used to
+  // proceed against a half-built collector (no ingestion yet, buffer not
+  // initialised).
+  if (collectorReady) return;
   // If init is already in flight, wait for it instead of starting a second one
-  if (collectorInitPromise) return collectorInitPromise;
-
-  collectorInitPromise = doInitCollector(store).finally(() => {
-    // Clear the promise once done so future calls hit the registry-set fast path
-    collectorInitPromise = null;
-  });
+  if (!collectorInitPromise) {
+    collectorInitPromise = doInitCollector(store)
+      .then(() => {
+        collectorReady = true;
+      })
+      .finally(() => {
+        collectorInitPromise = null;
+      });
+  }
   return collectorInitPromise;
 }
 
@@ -1680,23 +1842,19 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
       enqueueCompileSources(result.writtenSources);
     }
 
-    // Run cross-source fusion (best-effort — fusion failure shouldn't block ingestion)
-    if (fusion && events.length >= 2) {
+    // Run cross-source fusion (best-effort — fusion failure shouldn't block
+    // ingestion) over the events this cycle actually wrote. Fusing the whole
+    // batch also fused events scored below threshold, and rate-limited ones,
+    // which come back next cycle and were fused (and written) again.
+    const written = new Set(
+      (result?.outcomes ?? [])
+        .filter((o) => o.outcome === "written")
+        .map((o) => `${o.source}:${o.id}`),
+    );
+    const fusable = unfusedEvents(events.filter((e) => written.has(`${e.source}:${e.id}`)));
+    if (fusion && fusable.length >= 2) {
       try {
-        const activities = fusion.fuse(events);
-        if (activities.length > 0) {
-          const today = new Date().toISOString().slice(0, 10);
-          const fusionDir = path.join(MEMORIES_DIR, "daily");
-          fs.mkdirSync(fusionDir, { recursive: true });
-          const fusionFile = path.join(fusionDir, `${today}.md`);
-
-          // createOrAppend, not a bare append: when no event has been written
-          // today yet, a bare append created a daily log with no frontmatter.
-          for (const activity of activities) {
-            const entry = formatFusedActivity(activity);
-            createOrAppend(fusionFile, collectorDailyHeader(today) + entry, `\n${entry}`);
-          }
-        }
+        writeFusedActivities(fusion.fuse(fusable));
       } catch (err) {
         process.stderr.write(
           `Memoria: fusion write failed (non-fatal): ${(err as Error).message}\n`,
@@ -1716,6 +1874,44 @@ async function doInitCollector(store: MemoryStore): Promise<void> {
   });
 
   daemon.start();
+
+  // Resume the sources left enabled before a restart, each on its own and
+  // in the background: a slow login or dependency install must not hold up
+  // the collector, and the registry serializes a resume against a
+  // concurrent enable of the same source. Sources that fail (offline at
+  // boot, say) are retried periodically rather than staying dead until the
+  // next restart.
+  const reg = registry;
+  const d = daemon;
+  const resume = () =>
+    reg
+      .restoreEnabledSources(() => d.syncPollTimers())
+      .catch((err) =>
+        process.stderr.write(`Memoria: resuming sources failed: ${(err as Error).message}\n`),
+      );
+  void resume();
+  resumeRetryTimer = setInterval(resume, RESUME_RETRY_MS);
+  resumeRetryTimer.unref();
+}
+
+/**
+ * Start the collector at server startup when it has been used before, so
+ * enabled sources resume collecting without waiting for a collector tool,
+ * the dashboard or /ingest to initialise it. A store that never used the
+ * collector has no config file, and starting it would create a master key
+ * for nothing.
+ */
+export async function resumeCollectorIfConfigured(store: MemoryStore): Promise<void> {
+  if (!store.isPrimary) return;
+  if (!fs.existsSync(path.join(DATA_DIR, "collector-config.enc"))) return;
+  try {
+    // A config can exist with every source off; then there is nothing to
+    // resume and no reason to run the daemon.
+    if (!new SourceRegistry(DATA_DIR).hasEnabledSources()) return;
+    await ensureCollector(store);
+  } catch (err) {
+    process.stderr.write(`Memoria: collector did not start: ${(err as Error).message}\n`);
+  }
 }
 
 /**
@@ -1737,7 +1933,9 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
       config: z
         .record(z.string(), z.unknown())
         .optional()
-        .describe("Configuration overrides (for enable/configure)"),
+        .describe(
+          "Scheduling overrides for enable/configure: pollIntervalSec (>= 10) and importanceThreshold (1-10). Source settings such as hosts, credentials and paths can only be changed in the Memoria dashboard.",
+        ),
       custom_definition: z
         .object({
           id: z.string(),
@@ -1790,7 +1988,7 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
         case "enable": {
           if (!source)
             return { content: [{ type: "text" as const, text: "Error: source ID required" }] };
-          const result = await registry!.enableSource(source, config as any);
+          const result = await registry!.enableSource(source, config, "agent");
           if (result.success) daemon!.syncPollTimers();
           return { content: [{ type: "text" as const, text: result.message }] };
         }
@@ -1826,7 +2024,7 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
             return { content: [{ type: "text" as const, text: "Error: source ID required" }] };
           if (!config)
             return { content: [{ type: "text" as const, text: "Error: config required" }] };
-          const result = registry!.updateSourceConfig(source, config);
+          const result = registry!.updateSourceConfig(source, config, "agent");
           return { content: [{ type: "text" as const, text: result.message }] };
         }
 
@@ -1951,7 +2149,7 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
         windowMs: window_minutes * 60_000,
       });
 
-      const activities = fusionEngine.fuse(recentEvents);
+      const activities = writeFusedActivities(fusionEngine.fuse(unfusedEvents(recentEvents)));
 
       if (activities.length === 0) {
         return {
@@ -1962,17 +2160,6 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
             },
           ],
         };
-      }
-
-      // Write fused activities to daily log
-      const today = new Date().toISOString().slice(0, 10);
-      const dailyDir = path.join(MEMORIES_DIR, "daily");
-      fs.mkdirSync(dailyDir, { recursive: true });
-      const dailyFile = path.join(dailyDir, `${today}.md`);
-
-      for (const activity of activities) {
-        const entry = formatFusedActivity(activity);
-        createOrAppend(dailyFile, collectorDailyHeader(today) + entry, `\n${entry}`);
       }
 
       const summary = activities
@@ -2053,9 +2240,11 @@ export function registerCollectorTools(server: McpServer, store: MemoryStore): v
           if (threshold === undefined || threshold < 1 || threshold > 10) {
             return { content: [{ type: "text" as const, text: "Error: threshold must be 1-10" }] };
           }
-          const result = registry!.updateSourceConfig(source, {
-            importanceThreshold: threshold,
-          });
+          const result = registry!.updateSourceConfig(
+            source,
+            { importanceThreshold: threshold },
+            "agent",
+          );
           return { content: [{ type: "text" as const, text: result.message }] };
         }
 
@@ -2117,6 +2306,9 @@ export async function destroyCollector(): Promise<void> {
   } catch {
     // best-effort
   }
+  if (resumeRetryTimer) clearInterval(resumeRetryTimer);
+  resumeRetryTimer = null;
+  collectorReady = false;
   if (daemon) await daemon.stop();
   if (buffer) await buffer.destroy();
   if (registry) await registry.destroy();

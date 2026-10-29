@@ -105,7 +105,9 @@ export class GoogleGmailAdapter implements SourceAdapter {
         const listEvents = await this.pollList(labels, excludeLabels, maxResults);
         events.push(...listEvents);
       } else {
-        process.stderr.write(`Memoria: Gmail poll error: ${err.message}\n`);
+        // Propagate: the daemon backs off, surfaces the error and restores
+        // the cursor, instead of this poll reporting "no new mail".
+        throw new Error(`Gmail poll failed: ${err.message}`, { cause: err });
       }
     }
 
@@ -123,7 +125,15 @@ export class GoogleGmailAdapter implements SourceAdapter {
     const events: RawEvent[] = [];
     const messageIds: string[] = [];
 
+    // The cursor only moves past history records whose messages were all
+    // taken. It used to jump to response.historyId (the mailbox's CURRENT
+    // history id) after the first page, and messages beyond maxResults
+    // were sliced off, so 120 mails arriving during a laptop sleep lost 70
+    // for good. Records come oldest first, and startHistoryId is exclusive.
+    let cursor = startHistoryId;
     let pageToken: string | undefined;
+    let full = false;
+    let currentHistoryId: string | undefined;
     do {
       const response = await this.gmail.users.history.list({
         userId: "me",
@@ -134,34 +144,39 @@ export class GoogleGmailAdapter implements SourceAdapter {
         pageToken,
       });
 
-      const history = response.data.history || [];
-      for (const record of history) {
+      for (const record of response.data.history || []) {
+        const ids: string[] = [];
         for (const msg of record.messagesAdded || []) {
-          if (msg.message?.id) {
-            // Skip excluded labels
-            const msgLabels = msg.message.labelIds || [];
-            const hasExcluded = msgLabels.some((l: string) => excludeLabels.includes(l));
-            if (!hasExcluded) {
-              messageIds.push(msg.message.id);
-            }
-          }
+          if (!msg.message?.id) continue;
+          // Skip excluded labels
+          const msgLabels = msg.message.labelIds || [];
+          if (!msgLabels.some((l: string) => excludeLabels.includes(l))) ids.push(msg.message.id);
         }
+        // Never split a record: take all of it, or stop before it so the
+        // next poll starts here. A single record larger than the batch is
+        // taken whole rather than stalling the cursor on it forever.
+        if (messageIds.length > 0 && messageIds.length + ids.length > maxResults) {
+          full = true;
+          break;
+        }
+        messageIds.push(...ids);
+        if (record.id) cursor = String(record.id);
       }
 
-      // Update checkpoint to latest historyId
-      if (response.data.historyId) {
-        this.checkpoint = String(response.data.historyId);
-      }
-
+      currentHistoryId = response.data.historyId ? String(response.data.historyId) : undefined;
       pageToken = response.data.nextPageToken;
-    } while (pageToken && messageIds.length < maxResults);
+    } while (!full && pageToken);
 
-    // Fetch message details
-    for (const msgId of messageIds.slice(0, maxResults)) {
+    // Fetch message details. A failure throws (see fetchMessage) so the
+    // daemon restores the cursor and the batch is retried.
+    for (const msgId of messageIds) {
       const event = await this.fetchMessage(msgId);
       if (event) events.push(event);
     }
 
+    // Everything up to the mailbox's current state was consumed: jump the
+    // cursor there, past records that matched no message at all.
+    this.checkpoint = !full && !pageToken && currentHistoryId ? currentHistoryId : cursor;
     return events;
   }
 
@@ -173,6 +188,12 @@ export class GoogleGmailAdapter implements SourceAdapter {
     maxResults: number,
   ): Promise<RawEvent[]> {
     const events: RawEvent[] = [];
+
+    // Take the mailbox's history id BEFORE listing, so mail that arrives
+    // while the list is fetched is picked up by the next history poll
+    // rather than skipped by a cursor taken afterwards.
+    const profile = await this.gmail.users.getProfile({ userId: "me" });
+    const historyIdBeforeList = profile.data.historyId ? String(profile.data.historyId) : "";
 
     // Build query to exclude unwanted labels
     const excludeQuery = excludeLabels.map((l) => `-label:${l.toLowerCase()}`).join(" ");
@@ -192,17 +213,7 @@ export class GoogleGmailAdapter implements SourceAdapter {
       if (event) events.push(event);
     }
 
-    // Update historyId from profile
-    try {
-      const profile = await this.gmail.users.getProfile({ userId: "me" });
-      if (profile.data.historyId) {
-        this.checkpoint = String(profile.data.historyId);
-      }
-    } catch (err) {
-      process.stderr.write(
-        `Memoria gmail: failed to update historyId: ${(err as Error).message}\n`,
-      );
-    }
+    if (historyIdBeforeList) this.checkpoint = historyIdBeforeList;
 
     return events;
   }
@@ -274,8 +285,11 @@ export class GoogleGmailAdapter implements SourceAdapter {
         privacyTier: privacy,
       };
     } catch (err: any) {
-      process.stderr.write(`Memoria: Gmail fetch error for ${messageId}: ${err.message}\n`);
-      return null;
+      // A message deleted since its history record was written is gone for
+      // good; skip it. Anything else fails the poll so the cursor is
+      // restored and the message retried, rather than silently lost.
+      if (err.code === 404) return null;
+      throw new Error(`Gmail fetch failed for ${messageId}: ${err.message}`, { cause: err });
     }
   }
 

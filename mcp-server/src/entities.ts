@@ -17,11 +17,13 @@
  * been privacy-enforced at ingestion time. No raw/source data is read here.
  */
 
+import { createHash } from "node:crypto";
 import fs from "fs";
 import path from "path";
 import { parseFrontmatter } from "./chunker.js";
 import { TIME_LABEL_SRC } from "./daily-format.js";
 import { writeFileAtomic } from "./atomic-fs.js";
+import { listDailyLogNames } from "./daily-paths.js";
 
 /** Marker placed in entity-page frontmatter so we only ever overwrite our own
  * generated files — never something a human took over. */
@@ -95,13 +97,7 @@ function aggregate(
   let eventsScanned = 0;
   if (!fs.existsSync(dailyDir)) return { bySource, eventsScanned };
 
-  const files = fs
-    .readdirSync(dailyDir)
-    .filter((f) => f.endsWith(".md"))
-    .sort()
-    .reverse()
-    .slice(0, days)
-    .reverse(); // chronological so firstSeen/lastSeen are correct
+  const files = listDailyLogNames(memoriesDir).sort().reverse().slice(0, days).reverse(); // chronological so firstSeen/lastSeen are correct
 
   for (const file of files) {
     const date = path.basename(file, ".md");
@@ -165,6 +161,7 @@ function renderPage(agg: EntityAgg, today: string): string {
       `Auto-compiled rollup of ${agg.events.length} events from "${agg.source}" (${agg.firstSeen}→${agg.lastSeen}).`,
     )}`,
     "type: source-rollup",
+    `source: ${escapeYaml(agg.source)}`,
     `importance: ${importance}`,
     `created: ${today}`,
     `updated: ${today}`,
@@ -228,6 +225,41 @@ function renderPage(agg: EntityAgg, today: string): string {
 }
 
 /** True if an existing entity file is ours to regenerate (carries the marker). */
+/**
+ * The source a rollup page belongs to: its `source:` field, or for an older
+ * generated page its name. A page a human took over (marker removed) with
+ * no `source:` is not claimed for anyone else (null): it is skipped as
+ * before, not treated as another source's page.
+ */
+function pageSource(absPath: string): string | null {
+  try {
+    const { metadata } = parseFrontmatter(fs.readFileSync(absPath, "utf-8"));
+    if (typeof metadata.source === "string") return metadata.source;
+    if (metadata.generated === GENERATED_MARKER && typeof metadata.name === "string") {
+      return metadata.name.replace(/ — activity rollup$/, "");
+    }
+  } catch {
+    // unreadable: unknown owner
+  }
+  return null;
+}
+
+/**
+ * The page slug for a source. Sources whose names slugify alike ("my_source"
+ * and "my-source", or "Foo" and "foo") used to share one page and overwrite
+ * each other on every run. The page at the plain slug stays with whichever
+ * source owns it, so no existing page is renamed; another source gets a
+ * short, stable hash suffix.
+ */
+function slugFor(source: string, entitiesDir: string): string {
+  const base = slugify(source);
+  const abs = path.join(entitiesDir, `${base}.md`);
+  if (!fs.existsSync(abs)) return base;
+  const owner = pageSource(abs);
+  if (owner === null || owner === source) return base;
+  return `${base}-${createHash("sha256").update(source).digest("hex").slice(0, 6)}`;
+}
+
 function isGenerated(absPath: string): boolean {
   try {
     const { metadata } = parseFrontmatter(fs.readFileSync(absPath, "utf-8"));
@@ -265,8 +297,9 @@ export function buildEntityPages(
     if (only && !only.has(agg.source)) continue;
     if (agg.events.length < minEvents) continue;
 
-    const rel = `entities/${slugify(agg.source)}.md`;
-    const abs = path.join(memoriesDir, "entities", `${slugify(agg.source)}.md`);
+    const slug = slugFor(agg.source, entitiesDir);
+    const rel = `entities/${slug}.md`;
+    const abs = path.join(entitiesDir, `${slug}.md`);
 
     // Don't clobber a page a human has taken ownership of.
     if (fs.existsSync(abs) && !isGenerated(abs)) {

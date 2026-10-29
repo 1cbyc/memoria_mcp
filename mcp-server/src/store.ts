@@ -6,13 +6,13 @@
  * Features:
  * - FTS5 full-text search for proper BM25 keyword scoring
  * - Content hashing to skip re-embedding unchanged files
- * - Three-signal retrieval (weighted SUM): 0.2·recency + 0.3·importance + 0.5·relevance
+ * - Three-signal retrieval (weighted SUM): 0.1·recency + 0.1·importance + 0.8·relevance
  * - Idempotent decay/boost with last-run tracking
  * - Staleness detection based on last_accessed (not updated_at)
  */
 
 import Database from "better-sqlite3";
-import { acquireStoreLock } from "./store-lock.js";
+import { acquireStoreLock, StoreInUseError } from "./store-lock.js";
 import { Chunk } from "./chunker.js";
 import { embed, embedBatch, cosineSimilarity, getDimension, getProvider } from "./embeddings.js";
 import crypto from "crypto";
@@ -126,8 +126,15 @@ export function headWithoutCutWord(text: string, max: number): string {
 
 /**
  * Turn free text into a safe FTS5 MATCH expression: each word becomes a
- * quoted string, and the strings are joined by spaces, FTS5's implicit AND.
- * Returns "" when the text has no words.
+ * quoted string, and the strings are joined with OR. Returns "" when the
+ * text has no words.
+ *
+ * OR, not FTS5's implicit AND: a natural-language query ("what did we
+ * decide about the queue") almost never has every one of its words in one
+ * chunk, so AND returned no keyword matches for most real queries. BM25
+ * still ranks chunks matching more (and rarer) terms first. On the eval
+ * corpus (hash provider) keyword-only nDCG@10 went from 53.8 to 66.5 and
+ * the shipped default from 60.4 to 61.7.
  *
  * The previous sanitiser, `text.replace(/[^\w\s]/g, " ")`, had two failures.
  * JavaScript's \w is ASCII-only, so it cut "Müller" to "M ller" and "café" to
@@ -144,18 +151,101 @@ export function toFtsQuery(text: string, maxTerms = FTS_MAX_TERMS): string {
   return terms
     .slice(0, maxTerms)
     .map((t) => `"${t}"`)
-    .join(" ");
+    .join(" OR ");
+}
+
+/**
+ * Bumped when indexed rows need rebuilding from the files. 2: recency dates
+ * come from the memory (frontmatter `updated`/`created`, else file mtime)
+ * instead of the time it was indexed, so every row indexed by version 1
+ * carries an index-time date. 3: the lexical (hash) embedding keeps
+ * non-ASCII words instead of mapping them to nothing.
+ */
+const INDEX_VERSION = "3";
+
+/**
+ * Whether an index written at `stored` version must be rebuilt. Version 3
+ * changed only the lexical (hash, provider "local") vectors, so a version 2
+ * index from another provider is current and is not re-embedded (a full
+ * re-embed costs OpenAI users money and leaves search empty meanwhile).
+ */
+export function indexVersionOutdated(stored: string | undefined, provider: string): boolean {
+  if (stored === INDEX_VERSION) return false;
+  if (stored === "2" && provider !== "local") return false;
+  return true;
+}
+
+/** When a memory was indexed: the inputs for its recency date. */
+export interface IndexDates {
+  /**
+   * The memory's own date candidates, best first (frontmatter `updated`,
+   * then `created`); the first one that parses as an ISO date wins.
+   */
+  contentDate?: unknown | unknown[];
+  /** The file's mtime, in epoch ms. */
+  mtimeMs?: number;
+}
+
+function toDay(ms: number): string {
+  return new Date(ms).toISOString().split("T")[0];
+}
+
+// ISO dates only: V8's Date parser also accepts "January 5" (as 2001) or
+// "1", which would silently misdate a memory.
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+
+function parseDateMs(value: unknown): number | undefined {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+  if (typeof value !== "string" || !ISO_DATE.test(value.trim())) return undefined;
+  const ms = new Date(value.trim()).getTime();
+  return Number.isFinite(ms) ? ms : undefined;
 }
 
 export class MemoryStore {
   private db: Database.Database;
   private dimension: number;
   private releaseLock: () => void;
+  private readonly dbPath: string;
+  /**
+   * Whether this process holds the store lock. Only the primary runs what
+   * must not run twice over one store: the collector (its whole-state
+   * registry file is last-writer-wins) and scheduled maintenance.
+   */
+  isPrimary = true;
 
-  constructor(dbPath: string) {
-    // One process per store directory (review H3): fail loudly here rather
-    // than racing another server's writers and collector state.
-    this.releaseLock = acquireStoreLock(dbPath);
+  /**
+   * @param opts.shared When the store is held by another live server, open
+   *   it as a secondary instead of failing. Each Claude Code window or
+   *   Claude Desktop session starts its own stdio server on the same store;
+   *   refusing the second one left that session with no memory tools.
+   *   SQLite (WAL, busy_timeout) makes concurrent reads and writes from
+   *   processes on one host safe; see isPrimary for what stays with the
+   *   primary. A secondary takes over the lock when the primary exits
+   *   (tryBecomePrimary).
+   */
+  constructor(dbPath: string, opts: { shared?: boolean } = {}) {
+    this.dbPath = dbPath;
+    // One process per store directory (review H3) unless shared: without
+    // `shared`, fail loudly rather than race another server.
+    try {
+      this.releaseLock = acquireStoreLock(dbPath);
+    } catch (err) {
+      // Secondary mode is for processes on ONE host, where SQLite's locking
+      // is sound. A holder on another host (two replicas on a network
+      // mount) is still refused: SQLite's WAL is not safe across hosts.
+      if (!opts.shared || !(err instanceof StoreInUseError) || err.foreign) throw err;
+      this.isPrimary = false;
+      this.releaseLock = () => {};
+      process.stderr.write(
+        `Memoria: another Memoria server` +
+          (Number.isFinite(err.holderPid) ? ` (pid ${err.holderPid})` : "") +
+          ` holds this store; running as a secondary. Search, reading and writing work; ` +
+          `the collector and scheduled maintenance run in that server.\n`,
+      );
+    }
     try {
       this.db = new Database(dbPath);
     } catch (err: any) {
@@ -185,6 +275,24 @@ export class MemoryStore {
   }
 
   needsReindex: boolean = false;
+
+  /**
+   * A secondary tries to take the store lock (the primary may have exited).
+   * Returns whether this process is now the primary.
+   */
+  tryBecomePrimary(): boolean {
+    if (this.isPrimary) return true;
+    try {
+      // No waiting on another host's lock: this runs on a timer.
+      this.releaseLock = acquireStoreLock(this.dbPath, { foreignWaitMs: 0 });
+      this.isPrimary = true;
+      process.stderr.write("Memoria: took over the store lock; this server is now the primary.\n");
+      return true;
+    } catch (err) {
+      if (err instanceof StoreInUseError) return false;
+      throw err;
+    }
+  }
 
   private init(): void {
     this.db.pragma("journal_mode = WAL");
@@ -288,9 +396,21 @@ export class MemoryStore {
       .prepare("SELECT value FROM store_meta WHERE key = 'embedding_dimension'")
       .get() as { value: string } | undefined;
 
-    if (storedProvider?.value !== currentProvider || storedDim?.value !== currentDim) {
+    const storedIndexVersion = this.db
+      .prepare("SELECT value FROM store_meta WHERE key = 'index_version'")
+      .get() as { value: string } | undefined;
+    const providerChanged =
+      storedProvider?.value !== currentProvider || storedDim?.value !== currentDim;
+    // A store that already has an index from an older version is rebuilt;
+    // a brand-new one (no provider recorded yet) is not announced twice.
+    const indexOutdated =
+      !!storedProvider && indexVersionOutdated(storedIndexVersion?.value, currentProvider);
+
+    if (providerChanged || indexOutdated) {
       process.stderr.write(
-        `Memoria: embedding provider changed (${storedProvider?.value ?? "none"}→${currentProvider}, dim ${storedDim?.value ?? "?"}→${currentDim}). Will reindex.\n`,
+        providerChanged
+          ? `Memoria: embedding provider changed (${storedProvider?.value ?? "none"}→${currentProvider}, dim ${storedDim?.value ?? "?"}→${currentDim}). Will reindex.\n`
+          : `Memoria: index format updated (v${storedIndexVersion?.value ?? "1"}→v${INDEX_VERSION}). Will reindex.\n`,
       );
       this.db.prepare("DELETE FROM chunks").run();
       // Rebuild FTS after clearing chunks
@@ -299,7 +419,11 @@ export class MemoryStore {
       } catch {
         /* FTS5 not available */
       }
-      this.db.prepare("DELETE FROM file_meta").run();
+      // Forget the content hashes so every file is re-embedded, but keep the
+      // access history: file_meta is the only record of access_count and
+      // last_accessed, and wiping it made every memory look never-read
+      // (stale, decayed, recency 0) after an upgrade or provider switch.
+      this.db.prepare("UPDATE file_meta SET content_hash = NULL").run();
       this.needsReindex = true;
     }
 
@@ -310,6 +434,9 @@ export class MemoryStore {
     this.db
       .prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('embedding_dimension', ?)")
       .run(currentDim);
+    this.db
+      .prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('index_version', ?)")
+      .run(INDEX_VERSION);
   }
 
   /**
@@ -327,26 +454,97 @@ export class MemoryStore {
   /**
    * Store the content hash for a file after indexing.
    */
-  private storeContentHash(file: string, content: string, importance: number): void {
+  private storeContentHash(
+    file: string,
+    content: string,
+    importance: number,
+    updatedAt: string,
+    lastAccessed: string,
+  ): void {
     const hash = crypto.createHash("sha256").update(content).digest("hex");
-    const now = new Date().toISOString().split("T")[0];
+    // last_accessed is computed by indexDatesFor (never "now" for merely
+    // being indexed); access_count is left as it is.
     this.db
       .prepare(
-        `INSERT INTO file_meta (file, content_hash, importance, updated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO file_meta (file, content_hash, importance, updated_at, last_accessed)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(file) DO UPDATE SET
-           content_hash = ?,
-           importance = ?,
-           updated_at = ?`,
+           content_hash = excluded.content_hash,
+           importance = excluded.importance,
+           updated_at = excluded.updated_at,
+           last_accessed = excluded.last_accessed`,
       )
-      .run(file, hash, importance, now, hash, importance, now);
+      .run(file, hash, importance, updatedAt, lastAccessed);
+  }
+
+  /**
+   * The recency inputs for a file about to be (re)indexed. Recency used to
+   * be the time a row was inserted, so every edit, provider switch or
+   * rebuild made every memory look brand new and restarted the decay and
+   * staleness clocks.
+   *
+   * - An edit to a file already in the index happened at its mtime.
+   * - On a first index (a new file, or a rebuild after the index was
+   *   dropped) the frontmatter date is the memory's own record of when it
+   *   was written. mtime is only the fallback there: a git clone or pull
+   *   stamps every file with the checkout time.
+   *
+   * Access history (last_accessed, access_count) lives in file_meta and is
+   * carried onto the new chunk rows. last_accessed is "last touched": the
+   * later of the last read and this content date, so an edit counts as a
+   * touch for staleness and decay as it does for search recency. A
+   * last_accessed with no recorded access is ignored: indexes before
+   * version 2 stamped it with the time of indexing.
+   */
+  private indexDatesFor(
+    file: string,
+    dates: IndexDates | undefined,
+  ): { updatedAt: string; lastAccessed: string; accessCount: number } {
+    const now = Date.now();
+    const meta = this.db
+      .prepare("SELECT content_hash, access_count, last_accessed FROM file_meta WHERE file = ?")
+      .get(file) as
+      | { content_hash: string | null; access_count: number; last_accessed: string | null }
+      | undefined;
+    const mtimeMs = Math.min(dates?.mtimeMs ?? now, now);
+    const candidates = Array.isArray(dates?.contentDate) ? dates.contentDate : [dates?.contentDate];
+    const contentMs = candidates.map(parseDateMs).find((ms) => ms !== undefined);
+    const updatedMs = meta?.content_hash ? mtimeMs : Math.min(contentMs ?? mtimeMs, now);
+    const updatedAt = toDay(updatedMs);
+    const accessCount = meta?.access_count ?? 0;
+    const lastRead = accessCount > 0 ? meta?.last_accessed : null;
+    return {
+      updatedAt,
+      lastAccessed: lastRead && lastRead > updatedAt ? lastRead : updatedAt,
+      accessCount,
+    };
+  }
+
+  /**
+   * Drop a file's chunks while keeping its content hash, for a file that
+   * now has no indexable body. Leaving the old chunks made text a user
+   * deleted (e.g. to redact it) searchable indefinitely.
+   */
+  clearFile(file: string, content: string, importance: number = 5): void {
+    const { updatedAt, lastAccessed } = this.indexDatesFor(file, undefined);
+    this.db
+      .transaction(() => {
+        this.db.prepare("DELETE FROM chunks WHERE file = ?").run(file);
+        this.storeContentHash(file, content, importance, updatedAt, lastAccessed);
+      })
+      .immediate();
   }
 
   /**
    * Index chunks from a file, replacing any existing chunks for that file.
    * Skips re-embedding if content hasn't changed (use force=true to override).
    */
-  async indexChunks(chunks: Chunk[], importance: number = 5, content?: string): Promise<void> {
+  async indexChunks(
+    chunks: Chunk[],
+    importance: number = 5,
+    content?: string,
+    dates?: IndexDates,
+  ): Promise<void> {
     if (chunks.length === 0) return;
 
     const file = chunks[0].file;
@@ -360,10 +558,15 @@ export class MemoryStore {
 
     const deleteStmt = this.db.prepare("DELETE FROM chunks WHERE file = ?");
     const insertStmt = this.db.prepare(
-      "INSERT INTO chunks (text, file, start_line, end_line, embedding, importance) VALUES (?, ?, ?, ?, ?, ?)",
+      `INSERT INTO chunks (text, file, start_line, end_line, embedding, importance,
+                           updated_at, access_count, last_accessed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     const transaction = this.db.transaction(() => {
+      // Read inside the transaction, after the embedding await, so the
+      // dates match the file_meta row this write replaces.
+      const { updatedAt, lastAccessed, accessCount } = this.indexDatesFor(file, dates);
       deleteStmt.run(file);
       for (let i = 0; i < chunks.length; i++) {
         const embBuffer = Buffer.from(embeddings[i].buffer);
@@ -374,16 +577,19 @@ export class MemoryStore {
           chunks[i].endLine,
           embBuffer,
           importance,
+          updatedAt,
+          accessCount,
+          lastAccessed,
         );
       }
+      if (content) this.storeContentHash(file, content, importance, updatedAt, lastAccessed);
     });
 
-    transaction();
-
-    // Store content hash
-    if (content) {
-      this.storeContentHash(file, content, importance);
-    }
+    // IMMEDIATE: this transaction reads (indexDatesFor) before it writes,
+    // and a deferred transaction that must upgrade from a read to a write
+    // lock while another process writes fails with SQLITE_BUSY at once,
+    // bypassing busy_timeout. Shared stores have several writers.
+    transaction.immediate();
   }
 
   /**
@@ -428,7 +634,12 @@ export class MemoryStore {
   async search(
     query: string,
     maxResults: number = 10,
-    weights = { recency: 0.2, importance: 0.3, relevance: 0.5 },
+    // Relevance dominates; recency and importance are tie-breakers. They
+    // were 0.2 and 0.3, but relevance scores sit in a narrow band while the
+    // priors span 0-1, so priors at half the weight decided most rankings:
+    // eval/ measured the old default far below relevance alone on every
+    // provider (see eval/README.md).
+    weights = { recency: 0.1, importance: 0.1, relevance: 0.8 },
     // Split of the relevance signal between vector cosine and keyword score.
     // Exposed as a parameter purely so eval/ can sweep it; every caller in the
     // server uses the default, and the default is the shipped behaviour.
@@ -634,7 +845,7 @@ export class MemoryStore {
       // Known tradeoff (kept deliberately): search itself bumps last_accessed
       // on returned files, so being returned refreshes recency — a mild
       // rich-get-richer effect. Unlike the removed importance feedback loop
-      // this one is bounded (0.2 weight) and self-decaying (30-day half-life;
+      // this one is bounded (0.1 weight) and self-decaying (30-day half-life;
       // nothing ratchets), and the alternative — reads not counting as
       // "recent" — is what B6 was filed about. Revisit if the relevance
       // fixture ever shows entrenchment.
@@ -795,7 +1006,7 @@ export class MemoryStore {
         upsertMeta.run(f, now, now);
       }
     });
-    tx(files);
+    tx.immediate(files);
   }
 
   /**
@@ -804,6 +1015,37 @@ export class MemoryStore {
   removeFile(file: string): void {
     this.db.prepare("DELETE FROM chunks WHERE file = ?").run(file);
     this.db.prepare("DELETE FROM file_meta WHERE file = ?").run(file);
+  }
+
+  /** Make every file count as changed, so the next pass re-embeds it all. */
+  forgetContentHashes(): void {
+    this.db.prepare("UPDATE file_meta SET content_hash = NULL").run();
+  }
+
+  /**
+   * Forget files that no longer exist. A rebuild drops every chunk but keeps
+   * file_meta (it holds the access history), so a file deleted while the
+   * server was down left a row no sweep would see, and a new file later
+   * created at that path inherited its access count.
+   */
+  retainFiles(existing: string[], stillExists: (file: string) => boolean = () => false): number {
+    const keep = new Set(existing);
+    const rows = this.db.prepare("SELECT file FROM file_meta").all() as Array<{ file: string }>;
+    // `existing` is a listing taken before a pass that may run for minutes;
+    // a file written meanwhile is not in it, so ask again before dropping.
+    const gone = rows.map((r) => r.file).filter((f) => !keep.has(f) && !stillExists(f));
+    if (gone.length === 0) return 0;
+    const del = this.db.prepare("DELETE FROM file_meta WHERE file = ?");
+    const delChunks = this.db.prepare("DELETE FROM chunks WHERE file = ?");
+    this.db
+      .transaction(() => {
+        for (const f of gone) {
+          del.run(f);
+          delChunks.run(f);
+        }
+      })
+      .immediate();
+    return gone.length;
   }
 
   /**
@@ -970,9 +1212,15 @@ export class MemoryStore {
       return 0; // Already ran today
     }
 
+    // Bounded at two above the memory's own (frontmatter) importance, kept in
+    // file_meta. Every search result counts as an access, so a file that
+    // keeps being returned was boosted +1 on every run day and drifted to 10
+    // under MEMORIA_AUTO_OPTIMIZE, whatever its author rated it.
+    const cap = `MIN(10, COALESCE((SELECT fm.importance FROM file_meta fm WHERE fm.file = chunks.file), 5) + 2)`;
     const result = this.db
       .prepare(
-        "UPDATE chunks SET importance = MIN(10, importance + 1) WHERE access_count >= ? AND importance < 10",
+        `UPDATE chunks SET importance = MIN(${cap}, importance + 1)
+         WHERE access_count >= ? AND importance < ${cap}`,
       )
       .run(accessThreshold);
 
@@ -1007,7 +1255,10 @@ export class MemoryStore {
         const ftsQuery = toFtsQuery(headWithoutCutWord(text, 200));
         if (ftsQuery) {
           const ftsRows = this.db
-            .prepare(`SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?`)
+            // ORDER BY rank: with OR-joined terms nearly every chunk matches
+            // a common word, so an unordered LIMIT returned the lowest
+            // rowids and missed the actual duplicate.
+            .prepare(`SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?`)
             .all(ftsQuery, topN * 20) as Array<{ rowid: number }>;
           for (const row of ftsRows) candidateIds.add(row.rowid);
         }

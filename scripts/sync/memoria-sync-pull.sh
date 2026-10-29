@@ -128,6 +128,44 @@ if [ -z "$CONFLICTS" ]; then
   exit 0
 fi
 
+# 4a. Conflicts only in GENERATED files resolve themselves: Memoria rewrites
+#     MEMORY_INDEX.md and auto-compiled entity pages from the memory files,
+#     so either side will do and the next regeneration is exact. Leaving
+#     these to a human stalled sync between two devices for good: every pull
+#     re-conflicted, every push was rejected.
+#     A page counts as generated only if BOTH sides carry the marker in their
+#     frontmatter: a page a human took over (marker removed) on either
+#     device, or a note that merely mentions the marker in its body, is a
+#     real conflict and is left for a person.
+has_generated_marker() { # <stage> <path>: frontmatter has `generated: auto-compiled`
+  git show ":$1:$2" 2>/dev/null | awk '
+    NR == 1 { if ($0 != "---") exit 1; next }
+    $0 == "---" { exit found ? 0 : 1 }
+    $0 == "generated: auto-compiled" { found = 1 }
+    END { if (NR <= 1) exit 1 }
+  '
+}
+generated_only=1
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  if [ "$f" = "memories/MEMORY_INDEX.md" ] \
+    || { has_generated_marker 2 "$f" && has_generated_marker 3 "$f"; }; then
+    if ! { git checkout --ours -- "$f" && git add -- "$f"; } 2>>"$LOG_FILE"; then
+      generated_only=0
+    fi
+  else
+    generated_only=0
+  fi
+done <<CONFLICT_LIST
+$CONFLICTS
+CONFLICT_LIST
+if [ "$generated_only" = "1" ] && [ -z "$(git diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+  if git commit -q --no-edit 2>>"$LOG_FILE"; then
+    log "merged $BEHIND commit(s) from $REMOTE/$BRANCH; kept this device's copy of generated file(s): $(echo "$CONFLICTS" | tr '\n' ' ')"
+    exit 0
+  fi
+fi
+
 git merge --abort 2>>"$LOG_FILE"
 log "SYNC CONFLICT — merge aborted. Conflicting: $(echo "$CONFLICTS" | tr '\n' ' ')"
 

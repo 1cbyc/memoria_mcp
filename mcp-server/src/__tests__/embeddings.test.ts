@@ -72,3 +72,24 @@ describe("embedBatch", () => {
     expect(Math.sqrt(norm)).toBeCloseTo(1.0, 2);
   });
 });
+
+describe("lexical embedding keeps non-ASCII text (review 2026-10)", () => {
+  it("embeds CJK, Cyrillic and Greek text as non-zero, distinguishable vectors", async () => {
+    const texts = ["東京の会議は金曜日です", "Встреча в пятницу", "Συνάντηση την Παρασκευή"];
+    const vecs = await Promise.all(texts.map((t) => embed(t)));
+    for (const v of vecs) expect(v.some((x) => x !== 0)).toBe(true);
+    expect(cosineSimilarity(vecs[1], await embed("Встреча в пятницу"))).toBeGreaterThan(0.99);
+    expect(cosineSimilarity(vecs[1], vecs[2])).toBeLessThan(0.5);
+  });
+});
+
+describe("lexical embedding keeps combining marks (re-review 2026-10)", () => {
+  it("embeds composed and decomposed text alike, and keeps vowel signs", async () => {
+    const nfc = await embed("résumé review");
+    const nfd = await embed("résumé review");
+    expect(cosineSimilarity(nfc, nfd)).toBeGreaterThan(0.99);
+    const a = await embed("किताब मेज़ पर है");
+    const b = await embed("कतब मज पर ह"); // the same with its marks stripped
+    expect(cosineSimilarity(a, b)).toBeLessThan(0.9);
+  });
+});

@@ -32,7 +32,7 @@ import {
   DB_PATH,
   DATA_DIR,
   MEMORIES_DIR,
-  getAllMemoryFiles,
+  reindexAll,
   reindexFile,
   setupPeriodicReindex,
   setupPeriodicOptimize,
@@ -42,6 +42,9 @@ import {
   registerCollectorTools,
   destroyCollector,
   getCollectorPipeline,
+  resumeCollectorIfConfigured,
+  setupPrimaryTakeover,
+  COLLECTOR_IN_PRIMARY,
   SERVER_DESCRIPTION,
 } from "./tools.js";
 import { createDashboardRouter } from "./dashboard.js";
@@ -289,12 +292,15 @@ interface AuthCodeEntry {
 
 // ─── Store + Server factory ─────────────────────────────────
 
-const store = new MemoryStore(DB_PATH);
+// Shared, like the stdio server: a second server on the same store (a local
+// stdio session, a rollout without MEMORIA_LOCK_TAKEOVER) runs as a
+// secondary rather than failing; see MemoryStore.
+const store = new MemoryStore(DB_PATH, { shared: true });
 
 function createServer(): McpServer {
   const server = new McpServer({
     name: "memoria",
-    version: "0.2.1",
+    version: "0.3.0",
     description: SERVER_DESCRIPTION,
   });
   registerTools(server, store);
@@ -317,9 +323,20 @@ export const app = express();
 // X-Forwarded-For padding: the platform APPENDS the real client IP as the
 // rightmost entry, which is precisely the one this setting selects — client-
 // supplied left-side entries are ignored. If you deploy behind a DIFFERENT
-// proxy chain (e.g. a CDN in front of Cloud Run), update this to match the
-// real hop count or the limiter keys on the wrong IP.
-app.set("trust proxy", 1);
+// proxy chain (e.g. a CDN in front of Cloud Run), set MEMORIA_TRUST_PROXY to
+// the real hop count, or the limiter keys on the wrong IP. With nothing in
+// front (a LAN or VPS deployment reached directly), set it to 0: otherwise a
+// client's own X-Forwarded-For chooses its rate-limit bucket.
+const TRUST_PROXY = (() => {
+  const raw = process.env.MEMORIA_TRUST_PROXY;
+  if (raw === undefined || raw === "") return 1;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 10) {
+    throw new Error("MEMORIA_TRUST_PROXY must be a whole number of proxy hops (0-10).");
+  }
+  return n;
+})();
+app.set("trust proxy", TRUST_PROXY);
 
 // Baseline limiter for EVERY route. The dedicated limiters below cover /mcp,
 // the OAuth endpoints and the write/ingest paths, but the unauthenticated
@@ -339,9 +356,21 @@ app.use(
   }),
 );
 
-// Body parsing
-app.use(express.json({ limit: "5mb" }));
-app.use(express.urlencoded({ extended: false }));
+// Body parsing. Bodies are parsed before a route's handlers run, so a global
+// 5MB parser let unauthenticated clients make the only instance parse 5MB
+// JSON per request. The routes that need large bodies parse them themselves,
+// AFTER authenticate(): /mcp (memory_write content up to 100KB, JSON-escaped)
+// and /dashboard/api at 1MB, /ingest at 5MB. Everything else is small.
+const AUTHED_BODY_ROUTES = ["/mcp", "/dashboard/api", "/ingest"];
+const smallJson = express.json({ limit: "64kb" });
+app.use((req, res, next) => {
+  if (AUTHED_BODY_ROUTES.some((r) => req.path === r || req.path.startsWith(`${r}/`))) {
+    next();
+    return;
+  }
+  smallJson(req, res, next);
+});
+app.use(express.urlencoded({ extended: false, limit: "64kb" }));
 
 // Rate limiting: 30 requests per minute per IP
 app.use(
@@ -380,6 +409,19 @@ const writeLimiter = rateLimit({
 });
 
 // ─── OAuth 2.0 endpoints (for claude.ai custom connector) ──
+
+// The optional human-approval gate (review M5). Read per request so tests and
+// operators can toggle it without restarting.
+function approvalRequired(): boolean {
+  return process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL === "true";
+}
+
+// client_credentials mints a token from the client secret alone, which is
+// exactly what the approval gate exists to prevent, so it is withdrawn while
+// the gate is on.
+function supportedGrantTypes(): string[] {
+  return approvalRequired() ? ["authorization_code"] : ["authorization_code", "client_credentials"];
+}
 
 // Token endpoint — client credentials grant
 app.post("/token", (req, res) => {
@@ -465,6 +507,14 @@ app.post("/token", (req, res) => {
   }
 
   if (grantType === "client_credentials") {
+    if (approvalRequired()) {
+      res.status(400).json({
+        error: "unauthorized_client",
+        error_description:
+          "client_credentials is disabled while MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true; use the authorization_code flow.",
+      });
+      return;
+    }
     if (!validateClientCredentials(body.client_id, body.client_secret)) {
       res.status(401).json({ error: "invalid_client" });
       return;
@@ -524,7 +574,7 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
     token_endpoint: `${baseUrl}/token`,
     registration_endpoint: `${baseUrl}/register`,
     token_endpoint_auth_methods_supported: ["client_secret_post"],
-    grant_types_supported: ["authorization_code", "client_credentials"],
+    grant_types_supported: supportedGrantTypes(),
     response_types_supported: ["code"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: ["mcp:tools"],
@@ -537,19 +587,36 @@ app.post("/register", (_req, res) => {
   res.status(201).json({
     client_id: OAUTH_CLIENT_ID,
     client_name: "Memoria MCP Client",
-    grant_types: ["authorization_code", "client_credentials"],
+    grant_types: supportedGrantTypes(),
     response_types: ["code"],
     token_endpoint_auth_method: "client_secret_post",
   });
 });
 
-// Authorization endpoint — auto-approves and redirects with code
-// (needed for authorization_code flow that claude.ai may use)
-app.get("/authorize", (req, res) => {
+// Authorization endpoint. Without the approval gate it auto-approves and
+// redirects with a code (the client secret, required at /token, is what
+// gates access). With MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true it requires
+// the operator: the API key (programmatic), or a dashboard login AND an
+// explicit click on a same-origin consent page. A login cookie alone is not
+// approval: it is sent on any cross-site navigation, so any page could
+// otherwise trigger a code for the attacker's own pending flow.
+
+interface AuthorizeRequest {
+  redirectUri: string;
+  state: string | undefined;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+}
+
+/** Validate authorize parameters; on failure the response has been sent. */
+function readAuthorizeRequest(
+  source: Record<string, unknown>,
+  res: express.Response,
+): AuthorizeRequest | null {
   // A repeated parameter (?state=a&state=b) arrives as an array; treat it as
   // absent rather than letting an array reach new URL() or a SQLite bind.
   const param = (name: string): string | undefined => {
-    const v = req.query[name];
+    const v = source[name];
     return typeof v === "string" ? v : undefined;
   };
   const redirectUri = param("redirect_uri");
@@ -559,7 +626,7 @@ app.get("/authorize", (req, res) => {
 
   if (!redirectUri) {
     res.status(400).json({ error: "missing redirect_uri" });
-    return;
+    return null;
   }
 
   // Only deliver codes to allowlisted redirect targets (prevents code exfil).
@@ -567,18 +634,130 @@ app.get("/authorize", (req, res) => {
     res
       .status(400)
       .json({ error: "invalid_request", error_description: "redirect_uri not allowed" });
-    return;
+    return null;
   }
 
-  // Optional human approval (review M5): with
-  // MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true, issuing a code additionally
-  // requires a logged-in dashboard session or the API key, so a leaked
-  // OAuth client secret alone is not sufficient to obtain a token.
-  if (process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL === "true") {
-    const bearer = req.headers.authorization?.startsWith("Bearer ")
-      ? req.headers.authorization.slice(7)
-      : "";
-    if (!hasValidDashboardSession(req) && !(bearer && API_KEY && safeEqual(bearer, API_KEY))) {
+  // PKCE is mandatory and must be S256 — codes are useless without a verifier,
+  // which (combined with client auth at /token) closes the open-dispenser hole.
+  // A real S256 challenge is 43 base64url characters; bound it so an
+  // unauthenticated caller cannot store arbitrary blobs.
+  if (
+    !codeChallenge ||
+    codeChallengeMethod !== "S256" ||
+    !/^[A-Za-z0-9_-]{43,128}$/.test(codeChallenge)
+  ) {
+    res.status(400).json({
+      error: "invalid_request",
+      error_description: "code_challenge with code_challenge_method=S256 is required",
+    });
+    return null;
+  }
+  if (state !== undefined && state.length > 1024) {
+    res.status(400).json({ error: "invalid_request", error_description: "state too long" });
+    return null;
+  }
+  return { redirectUri, state, codeChallenge, codeChallengeMethod };
+}
+
+function issueAuthorizationCode(
+  res: express.Response,
+  ar: AuthorizeRequest,
+  status: 302 | 303 = 302,
+): void {
+  // Generate an authorization code and store it with the PKCE challenge (persisted)
+  const code = randomUUID();
+  codeOps.set(code, {
+    redirectUri: ar.redirectUri,
+    codeChallenge: ar.codeChallenge,
+    codeChallengeMethod: ar.codeChallengeMethod,
+    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
+  });
+
+  const url = new URL(ar.redirectUri);
+  url.searchParams.set("code", code);
+  if (ar.state) url.searchParams.set("state", ar.state);
+  res.redirect(status, url.toString());
+}
+
+function approvalSessionToken(req: express.Request): string | null {
+  const token = parseCookies(req.headers.cookie)["memoria_approve"];
+  return token && hasValidDashboardSession(req, "memoria_approve") ? token : null;
+}
+
+function hasApiKeyBearer(req: express.Request): boolean {
+  const bearer = req.headers.authorization?.startsWith("Bearer ")
+    ? req.headers.authorization.slice(7)
+    : "";
+  return !!bearer && !!API_KEY && safeEqual(bearer, API_KEY);
+}
+
+/** Binds a consent form to the session and to exactly these parameters. */
+function consentCsrf(sessionToken: string, ar: AuthorizeRequest): string {
+  return createHash("sha256")
+    .update(
+      ["memoria-consent", sessionToken, ar.redirectUri, ar.codeChallenge, ar.state ?? ""].join(
+        "\n",
+      ),
+    )
+    .digest("hex");
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderConsentPage(res: express.Response, ar: AuthorizeRequest, csrf: string): void {
+  const target = new URL(ar.redirectUri);
+  const hidden = (name: string, value: string) =>
+    `<input type="hidden" name="${name}" value="${escapeHtml(value)}">`;
+  // form-action must allow the redirect target too: Chrome applies it to the
+  // redirect that follows the form submission.
+  res
+    .status(200)
+    .set({
+      "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${target.origin}; frame-ancestors 'none'; base-uri 'none'`,
+      "X-Frame-Options": "DENY",
+      "Cache-Control": "no-store",
+      // Not no-referrer: under that policy browsers send `Origin: null` on
+      // the form POST, which the Origin check below would reject.
+      "Referrer-Policy": "same-origin",
+    })
+    .type("html").send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize access to Memoria</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem}code{word-break:break-all}button{font:inherit;padding:.5rem 1.25rem}</style>
+</head><body>
+<h1>Authorize access to Memoria?</h1>
+<p>An application wants full access to this Memoria server (read and write every memory). The authorization will be sent to:</p>
+<p><code>${escapeHtml(target.origin)}</code></p>
+<p>Approve only if you started this connection yourself just now.</p>
+<form method="post" action="/authorize">
+${hidden("redirect_uri", ar.redirectUri)}
+${hidden("code_challenge", ar.codeChallenge)}
+${hidden("code_challenge_method", ar.codeChallengeMethod)}
+${ar.state !== undefined ? hidden("state", ar.state) : ""}
+${hidden("csrf", csrf)}
+<button type="submit">Approve</button>
+</form>
+</body></html>`);
+}
+
+app.get("/authorize", (req, res) => {
+  const ar = readAuthorizeRequest(req.query as Record<string, unknown>, res);
+  if (!ar) return;
+
+  if (approvalRequired()) {
+    if (hasApiKeyBearer(req)) {
+      issueAuthorizationCode(res, ar);
+      return;
+    }
+    const session = approvalSessionToken(req);
+    if (!session) {
       res.status(401).json({
         error: "access_denied",
         error_description:
@@ -586,31 +765,44 @@ app.get("/authorize", (req, res) => {
       });
       return;
     }
-  }
-
-  // PKCE is mandatory and must be S256 — codes are useless without a verifier,
-  // which (combined with client auth at /token) closes the open-dispenser hole.
-  if (!codeChallenge || codeChallengeMethod !== "S256") {
-    res.status(400).json({
-      error: "invalid_request",
-      error_description: "code_challenge with code_challenge_method=S256 is required",
-    });
+    renderConsentPage(res, ar, consentCsrf(session, ar));
     return;
   }
 
-  // Generate an authorization code and store it with the PKCE challenge (persisted)
-  const code = randomUUID();
-  codeOps.set(code, {
-    redirectUri,
-    codeChallenge,
-    codeChallengeMethod,
-    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
-  });
+  issueAuthorizationCode(res, ar);
+});
 
-  const url = new URL(redirectUri);
-  url.searchParams.set("code", code);
-  if (state) url.searchParams.set("state", state);
-  res.redirect(url.toString());
+// The consent page's Approve button. The memoria_approve cookie is
+// SameSite=Lax, which browsers withhold from cross-site POSTs; the Origin
+// check and the session-bound CSRF token make that independent of browser
+// behaviour.
+app.post("/authorize", (req, res) => {
+  if (!approvalRequired()) {
+    res.status(405).json({ error: "invalid_request" });
+    return;
+  }
+  // The origin the browser is on: the configured public URL, or the host it
+  // actually used (an operator may reach the server under a second name).
+  const origin = req.headers.origin;
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const sameOrigins = new Set([
+    new URL(getBaseUrl(req)).origin,
+    req.headers.host ? `${proto}://${req.headers.host}` : "",
+  ]);
+  if (origin !== undefined && !sameOrigins.has(origin)) {
+    res.status(403).json({ error: "access_denied", error_description: "cross-origin approval" });
+    return;
+  }
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const ar = readAuthorizeRequest(body, res);
+  if (!ar) return;
+  const session = approvalSessionToken(req);
+  const csrf = typeof body.csrf === "string" ? body.csrf : "";
+  if (!session || !csrf || !safeEqual(csrf, consentCsrf(session, ar))) {
+    res.status(403).json({ error: "access_denied", error_description: "approval not verified" });
+    return;
+  }
+  issueAuthorizationCode(res, ar, 303);
 });
 
 // ─── Dashboard browser sessions (httpOnly cookie) ───────────
@@ -638,11 +830,15 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return out;
 }
 
-function hasValidDashboardSession(req: express.Request): boolean {
+// memoria_approve carries the same session token as memoria_session, but is
+// scoped Path=/authorize and honoured only there; memoria_session is honoured
+// only on /dashboard. Each check names the one cookie it accepts.
+function hasValidDashboardSession(
+  req: express.Request,
+  cookieName: "memoria_session" | "memoria_approve",
+): boolean {
   const cookies = parseCookies(req.headers.cookie);
-  // memoria_approve carries the same session token, scoped Path=/authorize
-  // so browsers present it there; memoria_session stays Path=/dashboard.
-  const token = cookies["memoria_session"] || cookies["memoria_approve"];
+  const token = cookies[cookieName];
   if (!token) return false;
   const expiry = dashboardSessions.get(token);
   if (expiry === undefined) return false;
@@ -696,7 +892,8 @@ function authenticate(
     // than just dashboard access.
     const reqPath = req.originalUrl.split("?")[0];
     const onDashboard = reqPath === "/dashboard" || reqPath.startsWith("/dashboard/");
-    if (onDashboard && hasValidDashboardSession(req)) {
+    if (onDashboard && hasValidDashboardSession(req, "memoria_session")) {
+      res.locals.authKind = "session";
       next();
       return;
     }
@@ -731,7 +928,10 @@ function authenticate(
         });
       return;
     }
-    // Valid OAuth token
+    // Valid OAuth token. Recorded so operator-only dashboard routes (source
+    // consent, credentials) can refuse it: a token issued to an MCP client
+    // is not the operator.
+    res.locals.authKind = "oauth";
     next();
     return;
   }
@@ -752,11 +952,12 @@ function authenticate(
     return;
   }
 
+  res.locals.authKind = "apikey";
   next();
 }
 
 // Apply auth to all /mcp routes
-app.use("/mcp", authenticate);
+app.use("/mcp", authenticate, express.json({ limit: "1mb" }));
 
 // ─── Session management ─────────────────────────────────────
 
@@ -765,7 +966,44 @@ interface SessionInfo {
   lastActivity: number;
 }
 
-const sessions: Record<string, SessionInfo> = {};
+// Null prototype: a client-chosen session id such as "__proto__" or
+// "constructor" must not resolve to an Object.prototype member (a 500, and a
+// write onto Object.prototype).
+const sessions: Record<string, SessionInfo> = Object.create(null);
+/** Initializations between the cap check and the session's registration. */
+let pendingSessions = 0;
+
+/**
+ * Make room for a session that has just been established. At the cap, the
+ * least recently active session is closed rather than refusing the
+ * newcomer: clients that never send DELETE (most of them) otherwise filled
+ * the cap and locked every client out with 503s until the 30-minute idle
+ * expiry. Its client gets a 404 on its next request, which tells it to
+ * re-initialize. Called only once the SDK has accepted the initialize
+ * request, so a rejected one (a bad Accept header, say) evicts nobody.
+ */
+function makeRoomForSession(): void {
+  while (Object.keys(sessions).length >= MAX_SESSIONS) {
+    const oldest = Object.entries(sessions).sort(
+      ([, a], [, b]) => a.lastActivity - b.lastActivity,
+    )[0];
+    if (!oldest) break;
+    process.stderr.write(
+      `Memoria: session cap reached; closing idlest ${oldest[0].slice(0, 8)}...\n`,
+    );
+    delete sessions[oldest[0]];
+    void oldest[1].transport.close?.();
+  }
+}
+
+/** Streamable HTTP: an unknown or expired session is 404, the client's cue to re-initialize. */
+function sessionNotFound(res: express.Response): void {
+  res.status(404).json({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "Session not found" },
+    id: null,
+  });
+}
 
 // Periodic session + token cleanup. unref so it never keeps the process alive
 // (matters for tests that import this module without starting the server).
@@ -795,23 +1033,36 @@ app.post("/mcp", async (req, res) => {
     if (sessionId && sessions[sessionId]) {
       sessions[sessionId].lastActivity = Date.now();
       transport = sessions[sessionId].transport;
-    } else if (!sessionId && isInitializeRequest(req.body)) {
-      // Check session cap
-      if (Object.keys(sessions).length >= MAX_SESSIONS) {
+    } else if (sessionId) {
+      // A session id we do not hold (expired, evicted, or lost in a restart).
+      sessionNotFound(res);
+      return;
+    } else if (isInitializeRequest(req.body)) {
+      // Bound initializations in flight, so a burst cannot open unbounded
+      // transports before any of them registers.
+      if (pendingSessions >= MAX_SESSIONS) {
         res.status(503).json({
           jsonrpc: "2.0",
-          error: { code: -32000, message: "Too many active sessions. Try again later." },
+          error: { code: -32000, message: "Too many sessions initializing. Try again shortly." },
           id: null,
         });
         return;
       }
-
+      pendingSessions++;
+      let reserved = true;
+      const release = () => {
+        if (reserved) pendingSessions--;
+        reserved = false;
+      };
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
+          release();
+          makeRoomForSession();
           sessions[sid] = { transport, lastActivity: Date.now() };
         },
       });
+      res.on("close", release);
 
       transport.onclose = () => {
         const sid = Object.entries(sessions).find(([, s]) => s.transport === transport)?.[0];
@@ -844,8 +1095,12 @@ app.post("/mcp", async (req, res) => {
 // GET /mcp — SSE stream
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !sessions[sessionId]) {
-    res.status(400).send("Invalid or missing session ID");
+  if (!sessionId) {
+    res.status(400).send("Missing session ID");
+    return;
+  }
+  if (!sessions[sessionId]) {
+    sessionNotFound(res);
     return;
   }
   sessions[sessionId].lastActivity = Date.now();
@@ -855,8 +1110,12 @@ app.get("/mcp", async (req, res) => {
 // DELETE /mcp — session termination
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !sessions[sessionId]) {
-    res.status(400).send("Invalid or missing session ID");
+  if (!sessionId) {
+    res.status(400).send("Missing session ID");
+    return;
+  }
+  if (!sessions[sessionId]) {
+    sessionNotFound(res);
     return;
   }
   await sessions[sessionId].transport.handleRequest(req, res, req.body);
@@ -895,19 +1154,26 @@ app.post("/dashboard/login", authLimiter, express.json(), (req, res) => {
   }
   const token = issueDashboardSession();
   const secure = req.secure || req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
-  const attrs = `HttpOnly; SameSite=Strict; Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}${secure}`;
+  const attrs = `HttpOnly; Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}${secure}`;
   res.setHeader("Set-Cookie", [
-    `memoria_session=${token}; Path=/dashboard; ${attrs}`,
+    `memoria_session=${token}; Path=/dashboard; SameSite=Strict; ${attrs}`,
     // Same session, scoped to /authorize only, so the approval gate there
     // (MEMORIA_AUTHORIZE_REQUIRE_APPROVAL) can see a dashboard login in a
     // real browser — the Path=/dashboard cookie is never sent to /authorize.
-    // Neither cookie is honoured on /mcp or /ingest (see authenticate()).
-    `memoria_approve=${token}; Path=/authorize; ${attrs}`,
+    // SameSite=Lax, not Strict: the OAuth flow reaches /authorize by a
+    // top-level navigation from claude.ai, and browsers withhold Strict
+    // cookies on cross-site navigations, so a Strict cookie could never
+    // satisfy the gate. Because Lax IS sent on any cross-site GET, the
+    // cookie only unlocks a consent page; the code is issued by its
+    // same-origin, CSRF-bound POST. Neither cookie is honoured on /mcp or
+    // /ingest (see authenticate()).
+    `memoria_approve=${token}; Path=/authorize; SameSite=Lax; ${attrs}`,
   ]);
   res.json({ ok: true });
 });
 
-app.use("/dashboard/api", writeLimiter, authenticate); // gate API subtree only
+// gate API subtree only; its bodies are parsed after authentication
+app.use("/dashboard/api", writeLimiter, authenticate, express.json({ limit: "1mb" }));
 app.use("/dashboard", dashboardRouter); // page "/" + API "/api/*"
 
 // Root convenience redirect → the human-facing dashboard. (MCP clients use
@@ -969,105 +1235,116 @@ export function normalizeTimestamp(v: unknown, now: Date = new Date()): string {
   return (plausible ? d : now).toISOString();
 }
 
-app.post("/ingest", writeLimiter, authenticate, async (req, res) => {
-  const events = req.body?.events;
-  if (!Array.isArray(events) || events.length === 0) {
-    res.status(400).json({ error: "Request body must contain 'events' array" });
-    return;
-  }
-
-  // Validate event shape — all three must be non-empty strings
-  for (const event of events) {
-    const id = typeof event.id === "string" ? event.id.trim() : "";
-    const source = typeof event.source === "string" ? event.source.trim() : "";
-    const content = typeof event.content === "string" ? event.content.trim() : "";
-    if (!id || !source || !content) {
-      res.status(400).json({
-        error: "Each event must have non-empty string id, source, and content fields",
-      });
+app.post(
+  "/ingest",
+  writeLimiter,
+  authenticate,
+  express.json({ limit: "5mb" }),
+  async (req, res) => {
+    if (!store.isPrimary) {
+      // Ingestion goes through the collector, which only the primary runs.
+      res.status(503).json({ error: COLLECTOR_IN_PRIMARY });
       return;
     }
-  }
-
-  // Cap batch size
-  if (events.length > 200) {
-    res.status(400).json({ error: "Max 200 events per request" });
-    return;
-  }
-
-  try {
-    // Normalize events to RawEvent shape with defaults. Caller-supplied
-    // importance and privacyTier are untrusted: clamp importance to [1,10] and
-    // reject any privacyTier outside the known enum (the ingestion sink also
-    // re-classifies content and takes the most-restrictive tier).
-    const VALID_TIERS = new Set(["send", "summarize", "local-only"]);
-    const clampImportance = (v: unknown): number => {
-      const n = typeof v === "number" && Number.isFinite(v) ? v : 5;
-      return Math.max(1, Math.min(10, Math.round(n)));
-    };
-    const normalized = events.map((e: any) => ({
-      id: String(e.id),
-      source: String(e.source),
-      eventType: String(e.eventType || "external"),
-      content: String(e.content),
-      timestamp: normalizeTimestamp(e.timestamp),
-      meta: sanitizeIngestMeta(e.meta),
-      importanceEstimate: clampImportance(e.importance),
-      privacyTier: VALID_TIERS.has(e.privacyTier) ? e.privacyTier : "send",
-    }));
-
-    // Buffer events and run ingestion
-    const { buffer, ingestion } = await getCollectorPipeline(store);
-    const { inserted: buffered, dropped: bufferDropped } = buffer.pushBatch(normalized);
-    const result = await ingestion.ingest(normalized);
-
-    // Reindex today's daily log so new events are searchable immediately
-    if (result.written > 0) {
-      const today = new Date().toISOString().slice(0, 10);
-      const dailyFile = path.join(MEMORIES_DIR, "daily", `${today}.md`);
-      if (fs.existsSync(dailyFile)) {
-        await reindexFile(store, dailyFile);
-      }
-      // Propagate to the entity pages these sources touch (rule V).
-      enqueueCompileSources(result.writtenSources);
+    const events = req.body?.events;
+    if (!Array.isArray(events) || events.length === 0) {
+      res.status(400).json({ error: "Request body must contain 'events' array" });
+      return;
     }
 
-    process.stderr.write(
-      `Memoria: /ingest received ${events.length} events, buffered ${buffered}, ` +
-        `written ${result.written}, deduped ${result.deduplicated}, failed ${result.errors.length}` +
-        (bufferDropped > 0 ? `, BUFFER FULL: ${bufferDropped} dropped` : "") +
-        "\n" +
-        result.errors
-          .slice(0, 5)
-          .map((e) => `  failed: ${e}\n`)
-          .join(""),
-    );
+    // Validate event shape — all three must be non-empty strings
+    for (const event of events) {
+      const id = typeof event.id === "string" ? event.id.trim() : "";
+      const source = typeof event.source === "string" ? event.source.trim() : "";
+      const content = typeof event.content === "string" ? event.content.trim() : "";
+      if (!id || !source || !content) {
+        res.status(400).json({
+          error: "Each event must have non-empty string id, source, and content fields",
+        });
+        return;
+      }
+    }
 
-    // Warn the caller if buffer is near capacity
-    const total = buffer.totalCount();
-    const cap = buffer.maxCapacity();
-    const nearCapacity = total >= cap * 0.9;
+    // Cap batch size
+    if (events.length > 200) {
+      res.status(400).json({ error: "Max 200 events per request" });
+      return;
+    }
 
-    res.json({
-      accepted: events.length,
-      buffered,
-      written: result.written,
-      deduplicated: result.deduplicated,
-      rateLimited: result.rateLimited,
-      // Events that failed to write. They stay buffered and are retried; the
-      // messages are logged server-side, not returned (they can hold paths).
-      failed: result.errors.length,
-      bufferDropped,
-      bufferUsage: { current: total, max: cap, nearCapacity },
-      ...(bufferDropped > 0 && {
-        warning: `${bufferDropped} oldest events dropped due to buffer capacity`,
-      }),
-    });
-  } catch (err: any) {
-    process.stderr.write(`Memoria: /ingest error: ${err.message}\n`);
-    res.status(500).json({ error: "Ingestion failed" });
-  }
-});
+    try {
+      // Normalize events to RawEvent shape with defaults. Caller-supplied
+      // importance and privacyTier are untrusted: clamp importance to [1,10] and
+      // reject any privacyTier outside the known enum (the ingestion sink also
+      // re-classifies content and takes the most-restrictive tier).
+      const VALID_TIERS = new Set(["send", "summarize", "local-only"]);
+      const clampImportance = (v: unknown): number => {
+        const n = typeof v === "number" && Number.isFinite(v) ? v : 5;
+        return Math.max(1, Math.min(10, Math.round(n)));
+      };
+      const normalized = events.map((e: any) => ({
+        id: String(e.id),
+        source: String(e.source),
+        eventType: String(e.eventType || "external"),
+        content: String(e.content),
+        timestamp: normalizeTimestamp(e.timestamp),
+        meta: sanitizeIngestMeta(e.meta),
+        importanceEstimate: clampImportance(e.importance),
+        privacyTier: VALID_TIERS.has(e.privacyTier) ? e.privacyTier : "send",
+      }));
+
+      // Buffer events and run ingestion
+      const { buffer, ingestion } = await getCollectorPipeline(store);
+      const { inserted: buffered, dropped: bufferDropped } = buffer.pushBatch(normalized);
+      const result = await ingestion.ingest(normalized);
+
+      // Reindex today's daily log so new events are searchable immediately
+      if (result.written > 0) {
+        const today = new Date().toISOString().slice(0, 10);
+        const dailyFile = path.join(MEMORIES_DIR, "daily", `${today}.md`);
+        if (fs.existsSync(dailyFile)) {
+          await reindexFile(store, dailyFile);
+        }
+        // Propagate to the entity pages these sources touch (rule V).
+        enqueueCompileSources(result.writtenSources);
+      }
+
+      process.stderr.write(
+        `Memoria: /ingest received ${events.length} events, buffered ${buffered}, ` +
+          `written ${result.written}, deduped ${result.deduplicated}, failed ${result.errors.length}` +
+          (bufferDropped > 0 ? `, BUFFER FULL: ${bufferDropped} dropped` : "") +
+          "\n" +
+          result.errors
+            .slice(0, 5)
+            .map((e) => `  failed: ${e}\n`)
+            .join(""),
+      );
+
+      // Warn the caller if buffer is near capacity
+      const total = buffer.totalCount();
+      const cap = buffer.maxCapacity();
+      const nearCapacity = total >= cap * 0.9;
+
+      res.json({
+        accepted: events.length,
+        buffered,
+        written: result.written,
+        deduplicated: result.deduplicated,
+        rateLimited: result.rateLimited,
+        // Events that failed to write. They stay buffered and are retried; the
+        // messages are logged server-side, not returned (they can hold paths).
+        failed: result.errors.length,
+        bufferDropped,
+        bufferUsage: { current: total, max: cap, nearCapacity },
+        ...(bufferDropped > 0 && {
+          warning: `${bufferDropped} oldest events dropped due to buffer capacity`,
+        }),
+      });
+    } catch (err: any) {
+      process.stderr.write(`Memoria: /ingest error: ${err.message}\n`);
+      res.status(500).json({ error: "Ingestion failed" });
+    }
+  },
+);
 
 // ─── Error handler ──────────────────────────────────────────
 //
@@ -1094,29 +1371,33 @@ app.use(errorHandler);
 // ─── Start ──────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const files = getAllMemoryFiles();
   if (store.needsReindex) {
-    process.stderr.write("Memoria: full reindex triggered by provider change...\n");
+    process.stderr.write("Memoria: full reindex (embedding provider or index format changed)...\n");
   }
-  for (const f of files) {
-    // A stop signal during a long first index: stop here, before shutdown()
-    // closes the store under the next reindexFile.
-    if (shuttingDown) return;
-    await reindexFile(store, f);
-  }
+  // Per file: one failure is logged and skipped instead of exiting. A stop
+  // signal during a long first index stops before shutdown() closes the
+  // store under the next reindexFile. Files deleted while the server was
+  // down are dropped.
+  const indexed = await reindexAll(store, { shouldStop: () => shuttingDown });
   if (shuttingDown) return;
-  process.stderr.write(`Indexed ${files.length} memory files.\n`);
+  process.stderr.write(
+    `Indexed ${indexed.files} memory files` +
+      (indexed.failed.length ? ` (${indexed.failed.length} failed, see above).\n` : ".\n"),
+  );
 
   // fs.watch is inert on the GCS FUSE / Cloud Run mount, so sweep periodically
   // to pick up memory files changed by `git pull` from other devices.
   setupPeriodicReindex(store);
   setupPeriodicOptimize(store); // no-op unless MEMORIA_AUTO_OPTIMIZE=true
   setupPeriodicCompile(store); // no-op unless MEMORIA_AUTO_COMPILE=true
+  setupPrimaryTakeover(store); // no-op in the primary
 
   // Bind to 0.0.0.0 when BIND_ALL=true (for cloud/Docker), else localhost only
   const host = process.env.BIND_ALL === "true" ? "0.0.0.0" : "127.0.0.1";
   httpServer = app.listen(PORT, host, () => {
     process.stderr.write(`Memoria HTTP server listening on http://${host}:${PORT}/mcp\n`);
+    // Resume enabled collector sources; errors are logged inside.
+    void resumeCollectorIfConfigured(store);
   });
 }
 

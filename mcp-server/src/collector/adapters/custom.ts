@@ -18,7 +18,13 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { SourceAdapter, AdapterInfo, AdapterConfig, RawEvent } from "./base.js";
 import { estimateImportance, classifyPrivacy } from "./base.js";
-import { contentHash } from "../crypto.js";
+import { contentHash, keyedContentHash } from "../crypto.js";
+
+/**
+ * Checkpoint for a source that collected before checkpoints existed: its
+ * first read records what is there without emitting it again.
+ */
+export const CUSTOM_BASELINE = "baseline";
 
 export interface CustomSourceDefinition {
   /** Unique ID for this custom source */
@@ -209,9 +215,9 @@ export class CustomAdapter implements SourceAdapter {
   async poll(): Promise<RawEvent[]> {
     switch (this.definition.mode) {
       case "file_watcher":
-        return this.pollFile();
+        return this.onlyNew(this.pollFile());
       case "shell_command":
-        return this.pollCommand();
+        return this.onlyNew(this.pollCommand());
       case "webhook":
         // Webhooks are push-based; poll returns pending events
         return this.drainWebhookQueue();
@@ -222,12 +228,13 @@ export class CustomAdapter implements SourceAdapter {
 
   // ── File watcher mode ──────────────────────────────────────
 
-  private pollFile(): RawEvent[] {
+  /** null when no read happened (unchanged, missing or oversized file). */
+  private pollFile(): RawEvent[] | null {
     const watchPath = this.definition.watchPath;
-    if (!watchPath || !fs.existsSync(watchPath)) return [];
+    if (!watchPath || !fs.existsSync(watchPath)) return null;
 
     const stat = fs.statSync(watchPath);
-    if (stat.mtimeMs <= this.lastModified) return []; // no change
+    if (stat.mtimeMs <= this.lastModified) return null; // no change
     this.lastModified = stat.mtimeMs;
 
     // Never read an unbounded file into memory on the single instance (L5).
@@ -237,7 +244,7 @@ export class CustomAdapter implements SourceAdapter {
         `Memoria custom adapter "${this.definition.id}": watch file is ${stat.size} bytes ` +
           `(cap ${MAX_WATCH_BYTES}); skipping this poll.\n`,
       );
-      return [];
+      return null;
     }
 
     const raw = fs.readFileSync(watchPath, "utf-8");
@@ -246,8 +253,9 @@ export class CustomAdapter implements SourceAdapter {
 
   // ── Shell command mode ─────────────────────────────────────
 
-  private pollCommand(): RawEvent[] {
-    if (!this.definition.command) return [];
+  /** null when no read happened (disabled, failed or empty command). */
+  private pollCommand(): RawEvent[] | null {
+    if (!this.definition.command) return null;
 
     // Defense in depth: refuse to execute unless explicitly opted in, even if a
     // shell_command definition was persisted before this guard existed.
@@ -256,14 +264,14 @@ export class CustomAdapter implements SourceAdapter {
         `Memoria custom adapter "${this.definition.id}": shell_command execution is disabled ` +
           `(set MEMORIA_ALLOW_SHELL_SOURCES=true to allow). Skipping.\n`,
       );
-      return [];
+      return null;
     }
 
     try {
       // Split command into executable + args to avoid shell injection
       const parts = this.definition.command.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
       const [cmd, ...args] = parts.map((p) => p.replace(/^"|"$/g, ""));
-      if (!cmd) return [];
+      if (!cmd) return null;
 
       const output = execFileSync(cmd, args, {
         encoding: "utf-8",
@@ -275,7 +283,7 @@ export class CustomAdapter implements SourceAdapter {
       process.stderr.write(
         `Memoria custom adapter "${this.definition.id}" command error: ${err.message}\n`,
       );
-      return [];
+      return null;
     }
   }
 
@@ -286,7 +294,7 @@ export class CustomAdapter implements SourceAdapter {
   /** Called by the HTTP server when a webhook POST arrives */
   pushWebhookEvent(body: unknown): void {
     const events = this.parseRawData(typeof body === "string" ? body : JSON.stringify(body));
-    this.webhookQueue.push(...events);
+    this.webhookQueue.push(...(events ?? []));
   }
 
   private drainWebhookQueue(): RawEvent[] {
@@ -297,7 +305,8 @@ export class CustomAdapter implements SourceAdapter {
 
   // ── Data parsing ───────────────────────────────────────────
 
-  private parseRawData(raw: string): RawEvent[] {
+  /** null on a parse error: a half-written file is not "no records". */
+  private parseRawData(raw: string): RawEvent[] | null {
     const format = this.definition.fileFormat ?? "json";
     const events: RawEvent[] = [];
 
@@ -337,7 +346,7 @@ export class CustomAdapter implements SourceAdapter {
             // Derive a stable id from content so a re-read of unchanged lines
             // collapses at the buffer's UNIQUE(source, event_id) constraint
             // (a random id every poll would re-admit identical lines forever).
-            id: `${this.definition.id}-${contentHash(trimmed).slice(0, 16)}`,
+            id: `${this.definition.id}-${keyedContentHash(trimmed, this.dataDir).slice(0, 16)}`,
             source: this.info.id, // registry key (`custom-<id>`), for correct stats/rate/dedup
             eventType: "custom_entry",
             content: trimmed,
@@ -352,6 +361,7 @@ export class CustomAdapter implements SourceAdapter {
       process.stderr.write(
         `Memoria custom adapter "${this.definition.id}" parse error: ${err.message}\n`,
       );
+      return null;
     }
 
     // Apply importance filter
@@ -379,7 +389,7 @@ export class CustomAdapter implements SourceAdapter {
     // reads of the same record dedup at the buffer instead of piling up.
     const id = fm.id
       ? this.getNestedValue(item, fm.id)
-      : `${this.definition.id}-${contentHash(String(content)).slice(0, 16)}`;
+      : `${this.definition.id}-${keyedContentHash(String(content), this.dataDir).slice(0, 16)}`;
 
     const meta: Record<string, unknown> = {};
     if (fm.meta) {
@@ -409,12 +419,86 @@ export class CustomAdapter implements SourceAdapter {
     return current;
   }
 
+  // ── What has been collected ────────────────────────────────
+
+  /**
+   * Record ids the previous read produced, as 12-hex-character fingerprints
+   * (null = no read yet). A watched file is re-read whole whenever it
+   * changes and a command's whole output on every poll; without this, every
+   * record was emitted again each time, and only the buffer's id dedup
+   * (about a day or two) stood between an appended line and a re-ingest of
+   * the whole history into today's log.
+   */
+  private seenIds: Set<string> | null = null;
+  /** Upgrading a source that collected before: the first read only records. */
+  private baselineOnly = false;
+
+  private static fingerprint(id: string): string {
+    return contentHash(id).slice(0, 12);
+  }
+
+  /** The previous read had more than MAX_TRACKED records; only its newest are known. */
+  private seenCapped = false;
+
+  /**
+   * Keep the records not seen before. `null` means no read
+   * happened (unchanged, missing or oversized file, a failed or disabled
+   * command, a parse error): nothing is learned and nothing is reset, so a
+   * skipped read can neither forget what was collected nor use up an
+   * upgrade's baseline.
+   *
+   * Bounded: past MAX_TRACKED records only the newest are remembered. When
+   * the previous read was capped, records before the first remembered one
+   * in this read are older than that window (a log keeps its order) and are
+   * treated as collected, instead of all being emitted again.
+   */
+  private onlyNew(events: RawEvent[] | null): RawEvent[] {
+    const MAX_TRACKED = 50_000;
+    if (events === null) return [];
+    const previous = this.seenIds ?? new Set<string>();
+    const fps = events.map((e) => CustomAdapter.fingerprint(String(e.id)));
+    let firstNew = 0;
+    if (this.seenCapped) {
+      const firstKnown = fps.findIndex((fp) => previous.has(fp));
+      if (firstKnown > 0) firstNew = firstKnown;
+    }
+    const fresh = events.filter((_, i) => i >= firstNew && !previous.has(fps[i]));
+    // Remember what was seen before AND now, not only this read: a read that
+    // catches a file mid-rewrite (empty or half written), or a command that
+    // printed nothing this time, replaced the set and the next full read
+    // emitted the whole history again. Older ids first, so the cap keeps
+    // the most recently seen.
+    const current = new Set<string>(fps);
+    const seen = [...[...previous].filter((fp) => !current.has(fp)), ...current];
+    this.seenCapped = seen.length > MAX_TRACKED;
+    this.seenIds = new Set(this.seenCapped ? seen.slice(-MAX_TRACKED) : seen);
+    if (this.baselineOnly) {
+      this.baselineOnly = false;
+      return [];
+    }
+    return fresh;
+  }
+
   getCheckpoint(): string {
-    return this.checkpoint;
+    if (this.seenIds === null) return this.baselineOnly ? CUSTOM_BASELINE : "";
+    return `${this.seenCapped ? "v2c:" : "v2:"}${[...this.seenIds].join("")}`;
   }
 
   setCheckpoint(cursor: string): void {
     this.checkpoint = cursor;
+    this.seenIds = null;
+    this.seenCapped = cursor.startsWith("v2c:");
+    this.baselineOnly = cursor === CUSTOM_BASELINE;
+    const packed = cursor.startsWith("v2:")
+      ? cursor.slice(3)
+      : cursor.startsWith("v2c:")
+        ? cursor.slice(4)
+        : null;
+    if (packed !== null) {
+      const ids = new Set<string>();
+      for (let i = 0; i + 12 <= packed.length; i += 12) ids.add(packed.slice(i, i + 12));
+      this.seenIds = ids;
+    }
   }
 
   async destroy(): Promise<void> {

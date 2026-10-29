@@ -18,11 +18,22 @@ Memoria is an [MCP](https://modelcontextprotocol.io) server that gives Claude Co
 - **Spec-complete remote transport.** OAuth 2.1 with PKCE, client credentials, dynamic client registration and metadata discovery — works as a claude.ai custom connector out of the box.
 - **Honest about search.** Three embedding providers (local MiniLM → n-gram fallback, plus OpenAI as an explicit opt-in), three-signal scoring, and every result reports its scan coverage.
 
-## Recent updates — security hardening (unreleased)
+## Recent updates — 0.3.0: security hardening and relevance-led search
 
-A whole-repo review hardened the server, the collector, and the sync scripts.
-Full details are in [CHANGELOG.md](CHANGELOG.md) (Unreleased) and
-[SECURITY.md](SECURITY.md). The changes most likely to affect you:
+A whole-repo review, and a critical re-review after it, hardened the
+server, the collector, and the sync scripts. Full details are in
+[CHANGELOG.md](CHANGELOG.md) (0.3.0) and [SECURITY.md](SECURITY.md). The
+changes most likely to affect you:
+
+- **Search ranks by relevance first.** Default weights are now
+  `0.8·relevance + 0.1·recency + 0.1·importance` (were 0.5/0.2/0.3), and
+  recency comes from each memory's own `updated` date rather than from when
+  it was indexed. The index is rebuilt once on first start.
+- **Keyword search matches any query word** (BM25 still ranks chunks that
+  match more of them first), instead of requiring every word.
+- **MCP callers can only change a source's schedule.** Hosts, credentials,
+  paths and labels change in the dashboard, so a prompt-injected agent
+  cannot point a consented source (and its stored password) elsewhere.
 
 - **Collector consent is dashboard-only.** The `memory_sources` `agree`
   action was removed: an MCP caller (including a prompt-injected one) can
@@ -31,9 +42,13 @@ Full details are in [CHANGELOG.md](CHANGELOG.md) (Unreleased) and
 - **Remote embeddings are opt-in.** Setting `OPENAI_API_KEY` no longer
   sends memory content and search queries to OpenAI by itself; only
   `MEMORIA_EMBEDDINGS=openai` does. `auto` now stays on this device.
-- **One server per store.** A second process opening the same store now
-  fails at startup with a clear message instead of racing the first
-  (SQLite also waits on contention, and compile-queue drains are atomic).
+- **One collector per store, any number of sessions.** Each Claude Code
+  window or Claude Desktop session starts its own server on the same
+  store. The first holds the store lock and runs the collector and
+  scheduled maintenance; the others run as secondaries that search, read
+  and write the same memories, and take over when the first exits. A
+  stdio server exits when its client goes away, so it never holds the lock
+  for a session that is gone.
 - **Sync scripts are safer.** The pull hook executes a mirror script from
   inside the synced store only with `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true`,
   and `sync-from-claude-memory.sh` overwrites only newer files, backing up
@@ -42,9 +57,11 @@ Full details are in [CHANGELOG.md](CHANGELOG.md) (Unreleased) and
   pinned versions, tool inputs (`days`, `batch_size`, query length, …)
   are bounded, and the provenance archive stores content encrypted rather
   than plaintext. Optional: `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true`
-  requires a dashboard login or the API key before `/authorize` issues a
-  code. docker-compose now also requires `MEMORIA_PUBLIC_URL` in `.env`
-  (the `.env.example` localhost value covers purely local use).
+  requires the API key, or a dashboard login plus a click on a consent
+  page, before `/authorize` issues a code, and disables the
+  `client_credentials` grant. docker-compose now
+  also requires `MEMORIA_PUBLIC_URL` in `.env` (the `.env.example`
+  localhost value covers purely local use).
 
 Under the hood, the collector daemon gained a dedicated test suite (which
 also caught that its first poll on startup never ran — now fixed), and
@@ -87,8 +104,8 @@ behavioural tests now cover the sync scripts and the Python ingestion hook.
 
 - **17 MCP tools** for memory management, data collection, lint, knowledge compilation, entity-page compilation, and digest compaction
 - **Sub-memory collector** with source adapters for iMessage, macOS Calendar, Email (IMAP), Gmail, Google Calendar, Google Drive, and user-defined custom sources
-- **Three-signal retrieval**: `score = 0.2 x recency + 0.3 x importance + 0.5 x relevance`
-- **Hybrid search**: Vector cosine similarity (0.7) + FTS5 BM25 keyword scoring (0.3). Three embedding providers, auto-selected: OpenAI `text-embedding-3-small` (if `OPENAI_API_KEY` set) → local `all-MiniLM-L6-v2` via `@huggingface/transformers` (true semantic, fully offline after a one-time ~23MB download) → n-gram hashing (lexical fallback). Control with `MEMORIA_EMBEDDINGS`.
+- **Three-signal retrieval**: `score = 0.8 x relevance + 0.1 x recency + 0.1 x importance` — relevance decides, recency and importance break ties ([eval](mcp-server/eval/README.md))
+- **Hybrid search**: Vector cosine similarity (0.7) + FTS5 BM25 keyword scoring (0.3). Three embedding providers: local `all-MiniLM-L6-v2` via `@huggingface/transformers` by default (true semantic, fully offline after a one-time ~23MB download), n-gram hashing as the lexical fallback, and OpenAI `text-embedding-3-small` only when explicitly selected with `MEMORIA_EMBEDDINGS=openai` (an `OPENAI_API_KEY` alone never sends content off the device).
 - **Cross-source temporal fusion**: Detects correlated activities across sources within configurable time windows
 - **Write-time dedup**: Checks top-3 similar memories before every write, returns duplicates for agent review
 - **Encrypted at rest**: All collector data encrypted with AES-256-GCM; master key auto-generated, owner-only (0600)
@@ -220,7 +237,9 @@ For a durable cloud deployment see [`deploy/gcp/README.md`](deploy/gcp/README.md
 | `MEMORIA_API_KEY` | *(required for HTTP)* | Bearer token for HTTP transport authentication (`/mcp`, `/ingest`, `/dashboard/api`). Distinct from the OAuth client secret below. |
 | `OPENAI_API_KEY` | *(none)* | API key for OpenAI embeddings. On its own it does **not** enable remote embeddings (see `MEMORIA_EMBEDDINGS`); when remote embeddings are enabled, memory content and search queries are sent to OpenAI. |
 | `MEMORIA_EMBEDDINGS` | `auto` | Embedding provider: `auto` (local MiniLM if installed, else hash — never remote), `openai` (explicit opt-in: sends content to OpenAI), `minilm` (local all-MiniLM-L6-v2, 384-dim, true semantic), or `hash` (n-gram lexical fallback, 384-dim). |
-| `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL` | `false` | When `true`, `/authorize` additionally requires a dashboard session or the API key, so a leaked OAuth client secret alone cannot obtain a token. |
+| `MEMORIA_TRUST_PROXY` | `1` | Proxy hops in front of the HTTP server, used to find the client IP for rate limiting. `1` suits Cloud Run or one reverse proxy; set `0` when clients reach the server directly (a LAN or VPS deployment), or a client's own `X-Forwarded-For` picks its rate-limit bucket. |
+| `MEMORIA_LOCK_TAKEOVER` | `false` | When `true`, a server takes over a store lock held by a live server on another host instead of waiting for it to stop. Only for deployments that overlap instances on one shared store by design, such as a Cloud Run rollout (set in `deploy/gcp/cloudbuild.yaml`). |
+| `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL` | `false` | When `true`, `/authorize` additionally requires the operator: the API key, or a dashboard login in the same browser followed by a click on a consent page. The `client_credentials` grant is disabled. A leaked OAuth client secret alone cannot obtain a token. |
 | `MEMORIA_MODEL_CACHE` | *(package default)* | Directory for the cached MiniLM model. The Docker image pre-bakes it at `/app/mcp-server/.models`; the build fails if the download does, unless you pass `--build-arg PREFETCH_MODEL=false` (for OpenAI or hash embeddings, or offline builds). |
 | `MEMORIA_MODEL_OFFLINE` | `false` | Set to `true` to forbid model downloads (use only the cached/pre-baked model). |
 | `MEMORIA_OAUTH_CLIENT_SECRET` | *(required when `BIND_ALL=true`)* | OAuth client secret. Keep it distinct from the API key so rotating one doesn't rotate the other. Locally (loopback) it falls back to the API key with a warning. |
@@ -243,7 +262,7 @@ For a durable cloud deployment see [`deploy/gcp/README.md`](deploy/gcp/README.md
 | `MEMORIA_PUBLIC_URL` | *(none)* | Pins the OAuth issuer/endpoint metadata base URL. Without it, the base URL is derived from request headers (`Host`/`X-Forwarded-Host`), which reflects attacker-supplied hosts into the discovery document. **Set this in any network-exposed deployment.** |
 | `MEMORIA_INSECURE_ALLOW_FALLBACKS` | `false` | **Escape hatch.** With `BIND_ALL=true` the server refuses to start unless `MEMORIA_OAUTH_CLIENT_SECRET`, `MEMORIA_ENCRYPTION_KEY` and `MEMORIA_PUBLIC_URL` are all set, rather than falling back to the API key, an on-disk key, or a base URL taken from request headers. Self-hosted setups that accept those risks can set this to `true`. |
 | `MEMORIA_VECTOR_SCAN_CAP` | `5000` | Max chunks scanned per query for semantic candidate selection. |
-| `MEMORIA_DIR` | Auto-detected | The root Memoria directory. Defaults to `/data/memoria` when `DOCKER=true` or a `/data` directory exists, otherwise `~/.memoria`. |
+| `MEMORIA_DIR` | Auto-detected | The root Memoria directory. Defaults to `/data/memoria` when `DOCKER=true` (the image sets it), otherwise `~/.memoria`. |
 | `MEMORIA_REPO_URL` | `https://github.com/Agripp87/memoria_mcp` | Link shown in the dashboard's About card (forks: point it at your repo/docs). |
 | `PORT` | `3100` | HTTP server port |
 | `BIND_ALL` | `false` | Set to `true` to bind to `0.0.0.0` instead of `127.0.0.1` (required for Docker/Cloud Run) |
@@ -273,7 +292,7 @@ For a durable cloud deployment see [`deploy/gcp/README.md`](deploy/gcp/README.md
 
 | Tool | Description |
 |------|-------------|
-| `memory_sources` | List, enable, disable, add custom, remove, or configure data sources. Includes user agreement flow. |
+| `memory_sources` | List, enable, disable, add custom, remove, or configure data sources. Consent is granted only in the dashboard, and through MCP only a source's schedule can be changed. |
 | `memory_ingest` | Manually trigger ingestion of buffered events into core memory |
 | `memory_fuse` | Run cross-source temporal fusion to detect correlated activities |
 | `memory_priority` | View collector status, adjust importance thresholds, flush buffer |
@@ -473,7 +492,7 @@ curl -X POST https://<your-host>/ingest \
 Response: `{ "accepted": 1, "buffered": 1, "written": 1, "deduplicated": 0, "rateLimited": 0, "failed": 0, "bufferDropped": 0, "bufferUsage": { … } }`
 
 
-**Python hook.** [`integrations/orchestrator_hook.py`](integrations/orchestrator_hook.py) is a dependency-light (`httpx` or `requests`) client that buffers events and flushes them every 30 s in the background — originally written for a multi-agent orchestrator, but generic: `record_agent_result`, `record_metric`, `record_conversation`, `record_training_eval`, plus raw `record(...)`. All calls are best-effort; a Memoria outage never breaks the caller.
+**Python hook.** [`integrations/orchestrator_hook.py`](integrations/orchestrator_hook.py) is a dependency-light (`httpx` or `requests`) client that buffers events and flushes them every 30 s in the background — originally written for a multi-agent orchestrator, but generic: `record_agent_result`, `record_metric`, `record_conversation`, `record_training_eval`, `record_prompt_change` and `record_discovery`. All calls are best-effort and never wait on the network; a Memoria outage never breaks the caller.
 
 ```python
 from integrations.orchestrator_hook import MemoriaHook
@@ -686,18 +705,19 @@ Memoria is designed for self-managing memory, inspired by research from Generati
 ## Search Algorithm
 
 ```
-retrieval_score = 0.2 * recency + 0.3 * importance + 0.5 * relevance
+retrieval_score = 0.8 * relevance + 0.1 * recency + 0.1 * importance
 ```
 
 Where:
-- **recency** = exponential decay, 30-day half-life from whichever is newer of `updated_at` and `last_accessed` — i.e. time since the memory was last *touched* (edited **or** read). A heavily-consulted old memory no longer ranks as permanently stale.
+- **recency** = exponential decay, 30-day half-life from whichever is newer of `updated_at` and `last_accessed` — i.e. time since the memory was last *touched* (edited **or** read). A heavily-consulted old memory no longer ranks as permanently stale. `updated_at` comes from the memory itself: frontmatter `updated` (else `created`, else the file's mtime) when it is first indexed, and the file's mtime when an indexed file is edited — never the time it was indexed, so a rebuild does not make everything look new.
+- **Why 0.8 / 0.1 / 0.1:** relevance scores fall in a narrow band while the priors span 0–1, so the previous 0.2 / 0.3 / 0.5 let recency and importance decide most rankings; the [retrieval eval](mcp-server/eval/README.md) measured it far below relevance alone.
 - **importance** = normalized 1-10 score from frontmatter. Importance is a ranking *prior only* — it is deliberately **not** used to pre-filter candidates (that triple-counted it via filter + weight + access-boost feedback and made the low-importance long tail unreachable).
 - **relevance** = 0.7 * vector_cosine_similarity + 0.3 * keyword_score, where keyword_score is a **fixed saturating transform of the FTS5 BM25 rank** (`-rank / (-rank + 10)`) — an absolute magnitude, comparable across queries (not a per-query rank position). Candidates that FTS didn't match get a capped substring-match fallback so scoring is uniform across the candidate pool.
 
 **Semantic-scan coverage is never silent:** every result carries `scannedChunks/totalChunks`. Under `MEMORIA_VECTOR_SCAN_CAP` (default 5000) the whole store is scanned; past it, an even sample of **exactly cap** rows spans the entire id range — coverage degrades continuously as the store grows (no recall cliff at cap+1), and the sample's offset is derived from the query text, so different queries reach different residues of the store and no row is permanently invisible to the vector path (the same query stays deterministic). `memory_search` appends a coverage note whenever the scan was partial.
 
 Results are position-optimized: high-importance memories placed at the start and end of output to leverage the primacy/recency effect in LLM attention.
-> **Provider caveat:** with the `hash` n-gram provider, `vector_cosine_similarity` is only a lexical approximation — the vector and FTS terms largely measure the same thing, so treat a `hash` deployment as keyword search with extra steps, not semantic search. Use `minilm` (local, default when no OpenAI key) or `openai` for true semantic retrieval; the Docker image pre-bakes the MiniLM model.
+> **Provider caveat:** with the `hash` n-gram provider, `vector_cosine_similarity` is only a lexical approximation — the vector and FTS terms largely measure the same thing, so treat a `hash` deployment as keyword search with extra steps, not semantic search. Use `minilm` (local, the default) or `openai` for true semantic retrieval; the Docker image pre-bakes the MiniLM model.
 
 ## Multi-device sync
 
@@ -722,7 +742,7 @@ memories/daily/*.md merge=union
 
 With that in place, same-day entries from two devices merge silently and none are lost. Core memories (`user/`, `project/`, `decisions/`, …) deliberately keep the normal three-way merge: those files are edited rather than appended, so a both-sides change is a real disagreement that deserves a human. (Union merge keeps every entry but does not reorder them chronologically — see the [sync guide](scripts/sync/README.md#why-daily-logs-never-conflict).)
 
-**Object storage is optional.** If you also run a hosted instance backed by a bucket, drop an executable at `$MEMORIA_DIR/.memoria-mirror.sh` and both scripts will call it with `pull` / `push` around the git sync.
+**Object storage is optional.** If you also run a hosted instance backed by a bucket, drop an executable at `$MEMORIA_DIR/.memoria-mirror.sh` and set `MEMORIA_SYNC_ALLOW_STORE_MIRROR=true`; both scripts then call it with `pull` / `push` around the git sync. (Without that opt-in it is never run: it lives inside the synced store, so anyone able to push to the store could otherwise run code on your machine.)
 
 **From Claude Code's built-in memory.** [`scripts/sync-from-claude-memory.sh`](scripts/sync-from-claude-memory.sh) one-way-pulls a project's `~/.claude/projects/<project>/memory/*.md` into the store (`MEMORIA_DIR`, default `~/.memoria`) so existing auto-memory is not lost. Pass the memory directory as an argument when more than one project has one.
 
@@ -735,8 +755,8 @@ See [SECURITY.md](SECURITY.md) for the trust model (single-tenant, one static ke
 | **Authentication** | OAuth 2.1 (authorization_code + PKCE, client_credentials) and static Bearer token. 24h token TTL. |
 | **Persistent tokens** | OAuth tokens and codes stored in SQLite as SHA-256 hashes, so a copied database holds no usable credential. They survive restarts when the database is on persistent disk; the Docker image keeps it on container-local `/tmp` (see `MEMORIA_TOKEN_DB_DIR`), so a restart there means one re-auth |
 | **Encryption at rest** | AES-256-GCM for all collector data, configs, and the ring buffer |
-| **Rate limiting** | Per client IP: `/mcp` 30/min, `/token`+`/authorize`+`/register` 20/min, `/ingest`+`/dashboard/api` 120/min (trusts one proxy hop for the real client IP) |
-| **Body size limit** | 5 MB max request body (sized for batched `/ingest` payloads) |
+| **Rate limiting** | Per client IP: `/mcp` 30/min, `/token`+`/authorize`+`/register` 20/min, `/ingest`+`/dashboard/api` 120/min (trusts `MEMORIA_TRUST_PROXY` proxy hops, default 1, for the real client IP) |
+| **Body size limit** | 64 KB for unauthenticated routes; 1 MB on `/mcp` and `/dashboard/api` and 5 MB on `/ingest`, parsed only after authentication |
 | **Session management** | Max 10 concurrent sessions, 30-minute idle TTL |
 | **Localhost binding** | HTTP server binds to `127.0.0.1` by default; set `BIND_ALL=true` for Docker/cloud. NOTE: every shipped Docker/Cloud Run config sets `BIND_ALL=true`, so in production the network is open and Bearer auth is the only access control. |
 | **Non-root container** | Docker image runs as unprivileged `memoria` user (UID 1001), which owns only its data and the model cache; the application code is root-owned |
@@ -847,7 +867,11 @@ Honest accounting of what is *not* hardened or covered yet — tracked for follo
 - **~~Dashboard key in `localStorage`~~ — fixed in Phase 3 (2026-07):** the dashboard now exchanges the API key once at `POST /dashboard/login` for an **httpOnly, SameSite=Strict session cookie** scoped to `Path=/dashboard` (never sent to `/mcp`//`/ingest`, unreadable from JS). A legacy key found in localStorage is migrated to a cookie session and removed. Bearer auth is unchanged for API clients.
 - **Wiki edge cases.** `[[wikilinks]]` resolve by name/path/basename; ambiguous names resolve to the first match. A `[[link]]` inside a markdown link label renders as literal text (markdown-it can't nest anchors) rather than a navigable link — by design, to avoid producing invalid HTML.
 
-These are the known open items after the September 2026 review; [issues](https://github.com/Agripp87/memoria_mcp/issues) are welcome for anything missing here.
+- **Verified against fakes, not the real services.** The 0.3.0 fixes to the IMAP, Gmail and macOS Calendar adapters (cursors, reconnects, collection by fingerprint) are tested against fakes that follow the documented behaviour of imapflow, the Gmail API and the Calendar Cache schema, not against live accounts or a real Calendar database. Report anything they miss.
+- **Ranking defaults measured on the lexical provider.** The 0.3.0 weights (0.8 / 0.1 / 0.1) and OR keyword matching were measured with `npm run eval:hash`; the default MiniLM provider has not been re-measured since (`npm run eval` needs the one-time model download).
+- **iMessage bodies stored only in `attributedBody`.** Recent macOS versions often leave the `text` column empty and keep the message in `attributedBody`; such messages are skipped.
+
+These are the known open items after the October 2026 review; [issues](https://github.com/Agripp87/memoria_mcp/issues) are welcome for anything missing here.
 
 ## Design Decisions
 

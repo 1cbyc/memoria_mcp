@@ -36,28 +36,50 @@ export class EmailAdapter implements SourceAdapter {
 
   private client: any = null;
   private checkpoint: number = 0; // UID of last processed message
+  // UIDs are only meaningful within one UIDVALIDITY. When the mailbox is
+  // recreated, the server migrates, or the mailbox setting changes, a stale
+  // high UID made "N:*" match only the newest message, which the cursor
+  // then skipped: collection stopped silently.
+  private uidValidity: string = "";
   private config!: AdapterConfig;
 
   async init(config: AdapterConfig): Promise<void> {
     this.config = config;
 
-    const { host, port, secure, user, password } = config.settings as Record<string, any>;
+    const { host, user, password } = config.settings as Record<string, any>;
 
     if (!host || !user || !password) {
       throw new Error("Email adapter requires host, user, and password in settings.");
     }
 
+    await this.connect();
+  }
+
+  /**
+   * (Re)connect. imapflow does not reconnect on its own: once the server
+   * drops an idle connection the client stays unusable, and every later
+   * poll failed until the source was disabled and re-enabled.
+   */
+  private async connect(): Promise<void> {
+    const { host, port, secure, user, password } = this.config.settings as Record<string, any>;
+    if (this.client) {
+      const stale = this.client;
+      this.client = null;
+      await Promise.resolve(stale.logout?.()).catch(() => {});
+    }
     try {
       const { ImapFlow } = await importDependency<typeof import("imapflow")>("imapflow");
-      this.client = new ImapFlow({
+      const client = new ImapFlow({
         host,
         port: port ?? 993,
         secure: secure !== false,
         auth: { user, pass: password },
         logger: false,
       });
-
-      await this.client.connect();
+      // An 'error' event with no listener would crash the process.
+      client.on?.("error", () => {});
+      await client.connect();
+      this.client = client;
     } catch (err: any) {
       throw new Error(
         `Email connection failed: ${err.message}. ` +
@@ -68,26 +90,65 @@ export class EmailAdapter implements SourceAdapter {
   }
 
   async poll(): Promise<RawEvent[]> {
-    if (!this.client) return [];
+    if (!this.config) return [];
+    if (!this.client || this.client.usable === false) await this.connect();
 
     const mailbox = (this.config.settings?.mailbox as string) ?? "INBOX";
     const maxFetch = (this.config.settings?.maxFetch as number) ?? 50;
 
     const events: RawEvent[] = [];
 
+    // Errors propagate: the daemon backs off, records the error, and
+    // restores the cursor this poll advanced. Swallowing them here made a
+    // dead connection look like an empty mailbox forever.
     try {
       const lock = await this.client.getMailboxLock(mailbox);
 
       try {
-        // Fetch messages with UID greater than checkpoint
-        const query = this.checkpoint > 0 ? `${this.checkpoint + 1}:*` : `*`;
+        const validity = String(this.client.mailbox?.uidValidity ?? "");
+        if (validity && this.uidValidity && validity !== this.uidValidity) {
+          process.stderr.write(
+            `Memoria email: UIDVALIDITY of ${mailbox} changed; restarting from the newest message.\n`,
+          );
+          this.checkpoint = 0;
+        }
+        if (validity) this.uidValidity = validity;
 
-        for await (const message of this.client.fetch(query, {
-          uid: true,
-          envelope: true,
-          bodyStructure: true,
-          source: { maxBytes: 1024 }, // first 1KB of body only
-        })) {
+        // Messages with a UID above the checkpoint. Ranges are only read as
+        // UIDs when `uid: true` is in the options argument; in the fetch
+        // query object it merely asks for the UID attribute. With no
+        // checkpoint, "*" is the newest message: collection starts from now
+        // rather than ingesting the whole mailbox.
+        //
+        // The new UIDs are found with UID SEARCH first and at most maxFetch
+        // of them fetched. Fetching "N:*" directly downloaded headers and
+        // 1KB of every newer message on each poll, however far behind the
+        // cursor was, only to stop after maxFetch events.
+        let range = "*";
+        if (this.checkpoint > 0) {
+          const found = (await this.client.search(
+            { uid: `${this.checkpoint + 1}:*` },
+            { uid: true },
+          )) as number[] | false | undefined;
+          // "N:*" also matches the newest message when nothing is newer.
+          const fresh = (found || [])
+            .filter((uid) => uid > this.checkpoint)
+            .sort((a, b) => a - b)
+            .slice(0, maxFetch);
+          if (fresh.length === 0) return events;
+          range = fresh.join(",");
+        }
+
+        for await (const message of this.client.fetch(
+          range,
+          {
+            uid: true,
+            envelope: true,
+            bodyStructure: true,
+            source: { maxBytes: 1024 }, // first 1KB of body only
+          },
+          { uid: true },
+        )) {
           if (message.uid <= this.checkpoint && this.checkpoint > 0) continue;
           this.checkpoint = Math.max(this.checkpoint, message.uid);
 
@@ -147,18 +208,23 @@ export class EmailAdapter implements SourceAdapter {
         lock.release();
       }
     } catch (err: any) {
-      process.stderr.write(`Memoria email poll error: ${err.message}\n`);
+      // Force a fresh connection next time; the daemon handles the error.
+      if (this.client && this.client.usable === false) this.client = null;
+      throw new Error(`email poll failed: ${err.message}`, { cause: err });
     }
 
     return events;
   }
 
   getCheckpoint(): string {
-    return String(this.checkpoint);
+    return this.uidValidity ? `${this.uidValidity}:${this.checkpoint}` : String(this.checkpoint);
   }
 
+  /** "<uidvalidity>:<uid>", or a bare UID from before UIDVALIDITY was kept. */
   setCheckpoint(cursor: string): void {
-    this.checkpoint = parseInt(cursor, 10) || 0;
+    const sep = cursor.indexOf(":");
+    this.uidValidity = sep === -1 ? "" : cursor.slice(0, sep);
+    this.checkpoint = parseInt(sep === -1 ? cursor : cursor.slice(sep + 1), 10) || 0;
   }
 
   async destroy(): Promise<void> {

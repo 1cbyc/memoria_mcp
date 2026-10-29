@@ -4,6 +4,7 @@
 data/
 .sync.log
 .last-sync
+.sync-push-pending
 
 # The object-storage mirror hook, if you use one: it tends to hold bucket
 # names and account details specific to one person.

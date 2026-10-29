@@ -171,8 +171,9 @@ export class CollectorDaemon {
       await this.runIngestion();
     }
 
-    // Save registry checkpoints
-    this.registry.saveCheckpoints();
+    // Cursors were persisted as each poll's events reached the buffer;
+    // saving live cursors here could record one ahead of a poll still in
+    // flight (see registry.saveCheckpoints).
 
     process.stderr.write("Memoria: daemon stopped\n");
   }
@@ -202,7 +203,9 @@ export class CollectorDaemon {
       const effective = this.registry.getEffectiveConfig(sourceId);
       const rawSec = effective?.pollIntervalSec ?? adapter.info.defaultConfig.pollIntervalSec ?? 60;
       const MIN_POLL_SEC = 10;
-      const pollSec = Number.isFinite(rawSec) && rawSec >= MIN_POLL_SEC ? rawSec : 60;
+      const MAX_POLL_SEC = 86_400; // beyond 2^31-1 ms setInterval fires every 1ms
+      const pollSec =
+        Number.isFinite(rawSec) && rawSec >= MIN_POLL_SEC && rawSec <= MAX_POLL_SEC ? rawSec : 60;
       const intervalMs = pollSec * 1000;
 
       const pt: PollTimer = {
@@ -273,6 +276,11 @@ export class CollectorDaemon {
     const adapter = this.registry.getActiveAdapters().get(sourceId);
     if (!adapter) return;
 
+    // Adapters advance their cursor while polling. Until the events are in
+    // the buffer that advance is a promise, not a fact: if the poll or the
+    // buffer write fails, put the cursor back so the same range is read
+    // again instead of being skipped for good.
+    const cursorBefore = adapter.getCheckpoint();
     try {
       const events = await adapter.poll();
 
@@ -289,11 +297,17 @@ export class CollectorDaemon {
         }
       }
 
+      // The events are durable; persist the cursor now. It used to be saved
+      // only on a clean shutdown, so a crash or forced exit rewound it to
+      // when the source was enabled and replayed weeks of history.
+      this.registry.saveCheckpoint(sourceId);
+
       // Reset error state on success
       pt.consecutiveErrors = 0;
       pt.backoffUntil = 0;
       pt.lastPoll = Date.now();
     } catch (err: any) {
+      adapter.setCheckpoint(cursorBefore);
       pt.consecutiveErrors++;
 
       // Exponential backoff with jitter

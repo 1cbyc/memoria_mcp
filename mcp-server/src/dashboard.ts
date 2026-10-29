@@ -12,7 +12,7 @@
  */
 
 import { Router } from "express";
-import type { Response } from "express";
+import type { NextFunction, Response } from "express";
 import { randomBytes, randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
@@ -37,6 +37,7 @@ import {
   resolveLink,
   type StoreEntry,
 } from "./wiki.js";
+import { dailyLogPath, existingDailyLogPath, listDailyLogNames } from "./daily-paths.js";
 
 // scanStore() reads + parses EVERY memory file, and the wiki link graph
 // (outgoing edges + backlinks) is O(N²) to resolve. Both are computed once and
@@ -337,6 +338,20 @@ export function createDashboardRouter(store: MemoryStore): Router {
 
   // ── API: Data sources ────────────────────────────────────
 
+  // Consent, credentials and what a source reads are the operator's to set:
+  // a dashboard session or the API key. An OAuth token issued to an MCP
+  // client authenticates /dashboard/api too, but a leaked or prompt-driven
+  // client must not grant itself consent or redirect stored credentials.
+  const operatorOnly = (_req: unknown, res: Response, next: NextFunction): void => {
+    if (res.locals.authKind === "oauth") {
+      res.status(403).json({
+        error: "Source settings and consent need a dashboard login or the API key.",
+      });
+      return;
+    }
+    next();
+  };
+
   router.get("/api/sources", async (_req, res) => {
     try {
       const { registry } = await getCollector(store);
@@ -347,7 +362,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.post("/api/sources/:id/agree", async (req, res) => {
+  router.post("/api/sources/:id/agree", operatorOnly, async (req, res) => {
     try {
       const { registry } = await getCollector(store);
       registry.recordAgreement(req.params.id);
@@ -357,10 +372,10 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.post("/api/sources/:id/enable", async (req, res) => {
+  router.post("/api/sources/:id/enable", operatorOnly, async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
-      const result = await registry.enableSource(req.params.id, req.body);
+      const result = await registry.enableSource(req.params.id, req.body, "user");
       if (result.success) daemon.syncPollTimers();
       res.json(result);
     } catch (err: any) {
@@ -371,7 +386,12 @@ export function createDashboardRouter(store: MemoryStore): Router {
   router.post("/api/sources/:id/disable", async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
-      const result = await registry.disableSource(req.params.id);
+      const result = await registry.disableSource(
+        req.params.id,
+        // Disabling as the operator withdraws consent; an MCP client's OAuth
+        // token may switch a source off but not revoke what the user agreed.
+        res.locals.authKind === "oauth" ? "agent" : "user",
+      );
       if (result.success) daemon.syncPollTimers();
       res.json(result);
     } catch (err: any) {
@@ -379,17 +399,17 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.post("/api/sources/:id/configure", async (req, res) => {
+  router.post("/api/sources/:id/configure", operatorOnly, async (req, res) => {
     try {
       const { registry } = await getCollector(store);
-      const result = registry.updateSourceConfig(req.params.id, req.body);
+      const result = registry.updateSourceConfig(req.params.id, req.body, "user");
       res.json(result);
     } catch (err: any) {
       sendServerError(res, err);
     }
   });
 
-  router.post("/api/sources/custom", async (req, res) => {
+  router.post("/api/sources/custom", operatorOnly, async (req, res) => {
     try {
       const { registry } = await getCollector(store);
       const result = registry.addCustomSource(req.body);
@@ -399,7 +419,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
     }
   });
 
-  router.delete("/api/sources/custom/:id", async (req, res) => {
+  router.delete("/api/sources/custom/:id", operatorOnly, async (req, res) => {
     try {
       const { registry, daemon } = await getCollector(store);
       const result = await registry.removeCustomSource(req.params.id);
@@ -432,12 +452,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
         return;
       }
 
-      const files = fs
-        .readdirSync(dailyDir)
-        .filter((f) => f.endsWith(".md"))
-        .sort()
-        .reverse()
-        .slice(0, 30);
+      const files = listDailyLogNames(MEMORIES_DIR).sort().reverse().slice(0, 30);
 
       const logs = files.map((f) => {
         const content = fs.readFileSync(path.join(dailyDir, f), "utf-8");
@@ -463,8 +478,10 @@ export function createDashboardRouter(store: MemoryStore): Router {
         res.status(400).json({ error: "Invalid date format (YYYY-MM-DD)" });
         return;
       }
-      const filePath = path.join(MEMORIES_DIR, "daily", `${dateStr}.md`);
-      const { content, exists } = readMemoryFile(filePath);
+      const filePath = existingDailyLogPath(MEMORIES_DIR, dateStr);
+      const { content, exists } = filePath
+        ? readMemoryFile(filePath)
+        : { content: "", exists: false };
       if (!exists) {
         res.json({ date: dateStr, content: "", exists: false });
         return;
@@ -517,9 +534,7 @@ export function createDashboardRouter(store: MemoryStore): Router {
         return;
       }
 
-      const dailyDir = path.join(MEMORIES_DIR, "daily");
-      fs.mkdirSync(dailyDir, { recursive: true });
-      const dailyFile = path.join(dailyDir, `${today}.md`);
+      const dailyFile = dailyLogPath(MEMORIES_DIR, today);
 
       // UTC, like the file's date: daily logs are UTC days everywhere in
       // Memoria. A server-local label made an evening entry west of UTC read
@@ -1238,7 +1253,10 @@ async function enableSource(id) {
   const source = sources.find(s => s.id === id);
   if (!source) return;
 
+  // What the source actually does first: name and description are free
+  // text chosen by whoever added it.
   const agreed = confirm(
+    (source.detail ? source.detail + '\\n\\n' : '') +
     'Enable "' + source.name + '"?\\n\\n' +
     'This source will collect: ' + source.description + '\\n' +
     'Permissions: ' + (source.requiredPermissions.join(', ') || 'none') + '\\n\\n' +

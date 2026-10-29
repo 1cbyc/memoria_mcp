@@ -12,7 +12,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { contentHash } from "./crypto.js";
+import { keyedContentHash } from "./crypto.js";
+import { dailyLogPath } from "../daily-paths.js";
 import { collectorDailyHeader, utcTimeLabel } from "../daily-format.js";
 import { createOrAppend, writeFileAtomic } from "../atomic-fs.js";
 import { getProvider } from "../embeddings.js";
@@ -188,7 +189,9 @@ export class IngestionPipeline {
         // write (or a deliberate skip) — recording before the write meant a
         // failed write left the event marked "seen", so its retry would be
         // deduped away (silent loss).
-        const hash = contentHash(event.content);
+        // Keyed, because it is persisted (the sidecar): a bare hash of the
+        // raw, possibly local-only content could be reversed by guessing.
+        const hash = keyedContentHash(event.content, this.dataDir);
         const sourceKey = `${event.source}:${hash}`;
         const lastSeen = this.recentBySource.get(sourceKey);
         const now = Date.now();
@@ -214,7 +217,24 @@ export class IngestionPipeline {
         // unrelated automated events score high enough to "match" a core doc
         // and would graffiti it. decideAction therefore returns only
         // "create" (→ today's daily log) or "skip" (already captured).
-        const action = await this.decideAction(event);
+        //
+        // Privacy is enforced BEFORE this stage, not just before the write:
+        // the similarity search embeds its query, and under
+        // MEMORIA_EMBEDDINGS=openai that sends it off the device. Searching
+        // with the raw content leaked local-only text the write path redacts.
+        // Sink-side enforcement (defense in depth): adapters set a
+        // privacyTier, but we never trust it as the sole gate — re-classify
+        // the content and take the MORE restrictive tier, then redact
+        // accordingly. This closes adapters that mislabel events (e.g.
+        // calendar titles) and external /ingest callers that supply their
+        // own tier. A local-only event is redacted to a fixed placeholder, so
+        // a similarity search would match every earlier one and skip it as a
+        // duplicate; exact repeats are already caught by Stage 3's hash.
+        const safeEvent = this.enforcePrivacy(event);
+        const action: { type: "create" | "skip" } =
+          safeEvent.privacyTier === "local-only"
+            ? { type: "create" }
+            : await this.decideAction(safeEvent);
 
         // Stage 5: Write
         if (action.type === "skip") {
@@ -224,14 +244,6 @@ export class IngestionPipeline {
           result.deduplicated++;
           result.outcomes.push({ id: event.id, source: event.source, outcome: "duplicate" });
         } else {
-          // Sink-side privacy enforcement (defense in depth). Adapters set a
-          // privacyTier, but we never trust it as the sole gate: re-classify
-          // the content here and take the MORE restrictive tier, then redact
-          // accordingly before the content is persisted to a git-synced,
-          // OpenAI-embedded daily log. This closes adapters that mislabel
-          // events (e.g. calendar titles) and external /ingest callers that
-          // supply their own tier.
-          const safeEvent = this.enforcePrivacy(event);
           this.writeNewMemory(safeEvent, adjustedImportance);
           // Only now — after the write succeeded — consume budget and record
           // the event as seen.
@@ -272,7 +284,15 @@ export class IngestionPipeline {
   private loadDedupState(): void {
     try {
       if (!fs.existsSync(this.dedupPath)) return;
-      const raw = JSON.parse(fs.readFileSync(this.dedupPath, "utf-8")) as Record<string, number>;
+      const parsed = JSON.parse(fs.readFileSync(this.dedupPath, "utf-8"));
+      // Version 1 was a flat map of bare SHA-256 keys. Those are not reused
+      // (they would not match keyed hashes) and are dropped, so the
+      // reversible fingerprints leave the disk at the next save.
+      if (parsed?.v !== 2 || typeof parsed.entries !== "object") {
+        this.dedupDirty = true;
+        return;
+      }
+      const raw = parsed.entries as Record<string, number>;
       const now = Date.now();
       for (const [k, t] of Object.entries(raw)) {
         // Drop entries already outside the window on load
@@ -297,7 +317,7 @@ export class IngestionPipeline {
       fs.mkdirSync(path.dirname(this.dedupPath), { recursive: true });
       const obj: Record<string, number> = {};
       for (const [k, t] of this.recentBySource) obj[k] = t;
-      writeFileAtomic(this.dedupPath, JSON.stringify(obj));
+      writeFileAtomic(this.dedupPath, JSON.stringify({ v: 2, entries: obj }));
       this.dedupDirty = false;
     } catch {
       // best-effort — never block ingestion on dedup persistence
@@ -406,10 +426,8 @@ export class IngestionPipeline {
 
   private writeNewMemory(event: RawEvent, importance: number): void {
     const today = new Date().toISOString().slice(0, 10);
-    const dailyDir = path.join(this.config.memoriesDir, "daily");
-    fs.mkdirSync(dailyDir, { recursive: true });
-
-    const dailyFile = path.join(dailyDir, `${today}.md`);
+    // Refuses a symlinked daily/ or log (see daily-paths.ts).
+    const dailyFile = dailyLogPath(this.config.memoriesDir, today);
 
     // Format the event as a daily log entry
     const entry = this.formatDailyEntry(event, importance);

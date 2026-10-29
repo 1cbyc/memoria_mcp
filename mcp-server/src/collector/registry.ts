@@ -21,6 +21,7 @@ import { GoogleGmailAdapter } from "./adapters/google-gmail.js";
 import { GoogleCalendarAdapter } from "./adapters/google-calendar.js";
 import { GoogleDriveAdapter } from "./adapters/google-drive.js";
 import {
+  CUSTOM_BASELINE,
   CustomAdapter,
   assertWatchPathAllowed,
   type CustomSourceDefinition,
@@ -41,6 +42,12 @@ export interface SourceStatus {
   eventCount: number;
   lastPoll: string | null;
   error: string | null;
+  /**
+   * For a custom source, what it actually reads or runs (the watched path
+   * or the command). Shown in the consent dialog: the name and description
+   * are free text chosen by whoever added the source, possibly an agent.
+   */
+  detail: string | null;
 }
 
 export interface UserAgreement {
@@ -57,6 +64,79 @@ interface RegistryState {
   eventCounts: Record<string, number>;
 }
 
+/**
+ * Who asked for a source change. "user" is the dashboard: a person at a
+ * logged-in browser. "agent" is any MCP caller, which may be acting on
+ * prompt-injected instructions, so it is held to scheduling changes only.
+ */
+export type ChangeOrigin = "user" | "agent";
+
+const MIN_POLL_SEC = 10;
+/** One day. Larger values overflow setInterval (2^31-1 ms) into a 1ms loop. */
+export const MAX_POLL_SEC = 86_400;
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Apply a config change to a source's effective config. Accepts both shapes
+ * callers send: `{ settings: {...} }` and the flat form the dashboard posts
+ * (`{ host, user, password }`), where every key other than the two
+ * scheduling knobs is a source setting. Before this, enable spread the flat
+ * form onto the top level, so a dashboard-configured email or Google source
+ * never saw its own settings.
+ *
+ * `settingsChanged` reports whether anything under `settings` changed. That
+ * is where hosts, TLS, credentials, watch paths and labels live, i.e. what is
+ * collected and where credentials are sent, so only the user may change it.
+ */
+export function applyConfigChange(
+  base: AdapterConfig,
+  change: Record<string, unknown> | undefined,
+): { config: AdapterConfig; settingsChanged: boolean } | { error: string } {
+  const settings: Record<string, unknown> = { ...base.settings };
+  const config: AdapterConfig = { ...base, settings };
+  let settingsChanged = false;
+  const setSetting = (key: string, value: unknown) => {
+    if (UNSAFE_KEYS.has(key)) return;
+    if (JSON.stringify(settings[key]) !== JSON.stringify(value)) settingsChanged = true;
+    settings[key] = value;
+  };
+
+  for (const [key, value] of Object.entries(change ?? {})) {
+    if (UNSAFE_KEYS.has(key) || key === "enabled") continue;
+    if (key === "pollIntervalSec") {
+      if (
+        typeof value !== "number" ||
+        !Number.isFinite(value) ||
+        value < MIN_POLL_SEC ||
+        value > MAX_POLL_SEC
+      ) {
+        return {
+          error: `pollIntervalSec must be a number of seconds from ${MIN_POLL_SEC} to ${MAX_POLL_SEC}.`,
+        };
+      }
+      config.pollIntervalSec = value;
+    } else if (key === "importanceThreshold") {
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 10) {
+        return { error: "importanceThreshold must be an integer from 1 to 10." };
+      }
+      config.importanceThreshold = value;
+    } else if (key === "settings" && isPlainObject(value)) {
+      for (const [k, v] of Object.entries(value)) setSetting(k, v);
+    } else {
+      setSetting(key, value);
+    }
+  }
+  return { config, settingsChanged };
+}
+
+const AGENT_SETTINGS_REFUSAL =
+  "Source settings (hosts, credentials, paths, labels) can only be changed in the Memoria " +
+  "dashboard (Sources tab). Through MCP, only pollIntervalSec and importanceThreshold can be changed.";
+
 // ── Registry ───────────────────────────────────────────────
 
 export class SourceRegistry {
@@ -66,6 +146,9 @@ export class SourceRegistry {
   private configPath: string;
   private dataDir: string;
   private errors = new Map<string, string>();
+  /** Serializes enable/disable/remove per source (see withSourceLock). */
+  private sourceOps = new Map<string, Promise<unknown>>();
+  private resumeErrorsLogged = new Map<string, string>();
   private lastPolled = new Map<string, string>();
 
   /**
@@ -127,19 +210,56 @@ export class SourceRegistry {
         eventCount: this.state.eventCounts[id] ?? 0,
         lastPoll: this.lastPolled.get(id) ?? null,
         error: this.errors.get(id) ?? null,
+        detail: this.customDetail(id),
       });
     }
 
     return statuses;
   }
 
+  private customDetail(sourceId: string): string | null {
+    const def = this.state.customSources.find((d) => `custom-${d.id}` === sourceId);
+    if (!def) return null;
+    if (def.mode === "shell_command") return `Runs the command: ${def.command ?? ""}`;
+    if (def.mode === "file_watcher") return `Reads the file: ${def.watchPath ?? ""}`;
+    return `Mode: ${def.mode}`;
+  }
+
   /**
    * Enable a data source. Requires user agreement.
    * Auto-installs dependencies if needed.
    */
-  async enableSource(
+  /**
+   * Run lifecycle operations on one source one at a time. Two enables of the
+   * same source (the startup resume and a dashboard click, say) both saw no
+   * running instance and both ran init on the one adapter object, orphaning
+   * the first IMAP connection.
+   */
+  private withSourceLock<T>(sourceId: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.sourceOps.get(sourceId) ?? Promise.resolve();
+    const next = prev.then(op, op);
+    const tail = next.catch(() => {});
+    this.sourceOps.set(sourceId, tail);
+    void tail.then(() => {
+      if (this.sourceOps.get(sourceId) === tail) this.sourceOps.delete(sourceId);
+    });
+    return next;
+  }
+
+  enableSource(
     sourceId: string,
-    configOverrides?: Partial<AdapterConfig>,
+    configOverrides?: Record<string, unknown>,
+    origin: ChangeOrigin = "agent",
+  ): Promise<{ success: boolean; message: string }> {
+    return this.withSourceLock(sourceId, () =>
+      this.enableSourceUnlocked(sourceId, configOverrides, origin),
+    );
+  }
+
+  private async enableSourceUnlocked(
+    sourceId: string,
+    configOverrides: Record<string, unknown> | undefined,
+    origin: ChangeOrigin,
   ): Promise<{ success: boolean; message: string }> {
     const adapter = this.adapters.get(sourceId);
     if (!adapter) {
@@ -190,6 +310,19 @@ export class SourceRegistry {
       }
     }
 
+    // Resolve the config before doing anything with side effects. An agent
+    // may not change settings: consent was given for the source as the user
+    // configured it, and reusing that consent with an attacker's host would
+    // send the stored credentials there (review 2026-10, credential redirect).
+    const change = applyConfigChange(
+      { ...adapter.info.defaultConfig, ...this.state.configs[sourceId] },
+      configOverrides,
+    );
+    if ("error" in change) return { success: false, message: change.error };
+    if (change.settingsChanged && origin !== "user") {
+      return { success: false, message: AGENT_SETTINGS_REFUSAL };
+    }
+
     // Auto-install dependencies
     if (adapter.info.dependencies.length > 0) {
       const installResult = await this.installDependencies(adapter.info.dependencies);
@@ -201,14 +334,23 @@ export class SourceRegistry {
       }
     }
 
-    // Merge config
-    const config: AdapterConfig = {
-      ...adapter.info.defaultConfig,
-      ...this.state.configs[sourceId],
-      ...configOverrides,
-      enabled: true,
-    };
+    const config: AdapterConfig = { ...change.config, enabled: true };
     this.state.configs[sourceId] = config;
+
+    // Re-enabling a running source: release the old instance (its IMAP
+    // connection or SQLite handle) before re-initialising. Its live cursor
+    // is NOT kept: a poll may be mid-flight and have advanced it past events
+    // that never reached the buffer. The persisted cursor (saved by the
+    // daemon once events are buffered) is the truth.
+    const running = this.activeAdapters.get(sourceId);
+    if (running) {
+      this.activeAdapters.delete(sourceId);
+      try {
+        await running.destroy();
+      } catch {
+        // best effort: a failed teardown must not block the re-init
+      }
+    }
 
     // Initialize adapter
     try {
@@ -216,6 +358,11 @@ export class SourceRegistry {
       const savedCheckpoint = this.state.checkpoints[sourceId];
       if (savedCheckpoint) {
         adapter.setCheckpoint(savedCheckpoint);
+      } else if (adapter instanceof CustomAdapter && (this.state.eventCounts[sourceId] ?? 0) > 0) {
+        // A custom source that collected under 0.2.x, which kept no record
+        // of what it had read: take what is there now as already collected
+        // rather than re-ingesting its whole history once.
+        adapter.setCheckpoint(CUSTOM_BASELINE);
       }
 
       await adapter.init(config);
@@ -239,18 +386,34 @@ export class SourceRegistry {
   /**
    * Disable a data source.
    */
-  async disableSource(sourceId: string): Promise<{ success: boolean; message: string }> {
+  /**
+   * Disable a source. When the user does it (the dashboard), consent is
+   * withdrawn too: otherwise an agent could switch straight back on a
+   * source the user had turned off. An agent disabling leaves consent as is.
+   */
+  disableSource(
+    sourceId: string,
+    origin: ChangeOrigin = "agent",
+  ): Promise<{ success: boolean; message: string }> {
+    return this.withSourceLock(sourceId, () => this.disableSourceUnlocked(sourceId, origin));
+  }
+
+  private async disableSourceUnlocked(
+    sourceId: string,
+    origin: ChangeOrigin,
+  ): Promise<{ success: boolean; message: string }> {
+    // The live cursor is not saved here (see enableSourceUnlocked): the
+    // daemon persists it once a poll's events are buffered.
     const adapter = this.activeAdapters.get(sourceId);
     if (adapter) {
-      // Save checkpoint before stopping
-      this.state.checkpoints[sourceId] = adapter.getCheckpoint();
-      await adapter.destroy();
       this.activeAdapters.delete(sourceId);
+      await adapter.destroy();
     }
 
     if (this.state.configs[sourceId]) {
       this.state.configs[sourceId].enabled = false;
     }
+    if (origin === "user") this.revokeAgreement(sourceId);
 
     this.saveState();
     return {
@@ -264,18 +427,23 @@ export class SourceRegistry {
    */
   updateSourceConfig(
     sourceId: string,
-    settings: Record<string, unknown>,
+    changes: Record<string, unknown>,
+    origin: ChangeOrigin = "agent",
   ): { success: boolean; message: string } {
     const adapter = this.adapters.get(sourceId);
     if (!adapter) {
       return { success: false, message: `Unknown source: ${sourceId}` };
     }
 
-    const existing = this.state.configs[sourceId] ?? adapter.info.defaultConfig;
-    this.state.configs[sourceId] = {
-      ...existing,
-      settings: { ...existing.settings, ...settings },
-    };
+    const change = applyConfigChange(
+      { ...adapter.info.defaultConfig, ...this.state.configs[sourceId] },
+      changes,
+    );
+    if ("error" in change) return { success: false, message: change.error };
+    if (change.settingsChanged && origin !== "user") {
+      return { success: false, message: AGENT_SETTINGS_REFUSAL };
+    }
+    this.state.configs[sourceId] = change.config;
 
     this.saveState();
     return {
@@ -289,7 +457,22 @@ export class SourceRegistry {
   /**
    * Add a user-defined custom data source.
    */
-  addCustomSource(definition: CustomSourceDefinition): { success: boolean; message: string } {
+  addCustomSource(input: CustomSourceDefinition): { success: boolean; message: string } {
+    // Name and description are free text from whoever adds the source,
+    // possibly an agent, and the consent dialog shows them: one line each,
+    // bounded, so they cannot carry a fake "Reads the file: ..." line or
+    // push the real one out of view.
+    const oneLine = (v: unknown, max: number) =>
+      String(v ?? "")
+        // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+        .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
+        .trim()
+        .slice(0, max);
+    const definition: CustomSourceDefinition = {
+      ...input,
+      name: oneLine(input.name, 80),
+      description: oneLine(input.description, 300),
+    };
     // Validate
     if (!definition.id || !/^[a-z0-9_-]+$/.test(definition.id)) {
       return {
@@ -351,6 +534,11 @@ export class SourceRegistry {
       }
     }
 
+    // A new definition is a new consent decision. Consent left behind by an
+    // earlier source with this id (removed before removal revoked it) must
+    // not carry over to whatever this one watches or runs.
+    this.revokeAgreement(`custom-${definition.id}`);
+
     // Register the adapter
     const adapter = new CustomAdapter(definition, { dataDir: this.dataDir });
     this.adapters.set(`custom-${definition.id}`, adapter);
@@ -368,15 +556,21 @@ export class SourceRegistry {
   /**
    * Remove a custom data source.
    */
-  async removeCustomSource(sourceId: string): Promise<{ success: boolean; message: string }> {
+  removeCustomSource(sourceId: string): Promise<{ success: boolean; message: string }> {
     const fullId = sourceId.startsWith("custom-") ? sourceId : `custom-${sourceId}`;
+    return this.withSourceLock(fullId, () => this.removeCustomSourceUnlocked(sourceId, fullId));
+  }
 
+  private async removeCustomSourceUnlocked(
+    sourceId: string,
+    fullId: string,
+  ): Promise<{ success: boolean; message: string }> {
     if (!this.adapters.has(fullId)) {
       return { success: false, message: `Custom source "${sourceId}" not found.` };
     }
 
     // Disable first
-    await this.disableSource(fullId);
+    await this.disableSourceUnlocked(fullId, "agent");
 
     // Remove from registry
     this.adapters.delete(fullId);
@@ -384,6 +578,9 @@ export class SourceRegistry {
     delete this.state.configs[fullId];
     delete this.state.checkpoints[fullId];
     delete this.state.eventCounts[fullId];
+    // Consent was for this definition; a later add_custom with the same id
+    // must be agreed to afresh in the dashboard.
+    this.revokeAgreement(fullId);
 
     this.saveState();
     return { success: true, message: `Custom source "${sourceId}" removed.` };
@@ -409,6 +606,13 @@ export class SourceRegistry {
     }
 
     this.saveState();
+  }
+
+  revokeAgreement(sourceId: string): void {
+    if (!this.state.agreement) return;
+    const before = this.state.agreement.sources.length;
+    this.state.agreement.sources = this.state.agreement.sources.filter((s) => s !== sourceId);
+    if (this.state.agreement.sources.length !== before) this.saveState();
   }
 
   hasAgreement(sourceId: string): boolean {
@@ -444,13 +648,81 @@ export class SourceRegistry {
   }
 
   /**
+   * Persist one active adapter's cursor (after its events reached the buffer).
+   */
+  saveCheckpoint(sourceId: string): void {
+    const adapter = this.activeAdapters.get(sourceId);
+    if (!adapter) return;
+    const cursor = adapter.getCheckpoint();
+    if (this.state.checkpoints[sourceId] === cursor) return;
+    this.state.checkpoints[sourceId] = cursor;
+    this.saveState();
+  }
+
+  /**
+   * Re-initialise every source the user left enabled, after a restart.
+   * Nothing did this before: the dashboard kept showing "Enabled" while no
+   * adapter ran, so collection silently stopped at every restart. A source
+   * whose consent is gone is switched off; one that fails to start keeps
+   * its enabled flag and shows the error, and is retried on the next start.
+   */
+  async restoreEnabledSources(onEnabled?: (sourceId: string) => void): Promise<void> {
+    const pending: Array<Promise<void>> = [];
+    for (const [sourceId, config] of Object.entries(this.state.configs)) {
+      if (!config?.enabled || this.activeAdapters.has(sourceId)) continue;
+      if (!this.adapters.has(sourceId)) continue;
+      if (!this.hasAgreement(sourceId)) {
+        config.enabled = false;
+        this.saveState();
+        continue;
+      }
+      // Each source on its own: one slow login must not hold up the rest.
+      // The checks above are repeated under the source's lock: a disable
+      // queued ahead of this resume (the retry timer can fire mid-disable)
+      // must win, not be undone.
+      pending.push(
+        this.withSourceLock(sourceId, async () => {
+          if (
+            !this.state.configs[sourceId]?.enabled ||
+            this.activeAdapters.has(sourceId) ||
+            !this.hasAgreement(sourceId)
+          ) {
+            return null;
+          }
+          return this.enableSourceUnlocked(sourceId, undefined, "agent");
+        }).then((result) => {
+          if (!result) return;
+          if (result.success) {
+            this.resumeErrorsLogged.delete(sourceId);
+            onEnabled?.(sourceId);
+            return;
+          }
+          this.errors.set(sourceId, result.message);
+          // Retried periodically (see tools.ts); say so once per distinct error.
+          if (this.resumeErrorsLogged.get(sourceId) !== result.message) {
+            this.resumeErrorsLogged.set(sourceId, result.message);
+            process.stderr.write(
+              `Memoria: could not resume source ${sourceId} (will retry): ${result.message}\n`,
+            );
+          }
+        }),
+      );
+    }
+    await Promise.all(pending);
+  }
+
+  /** Whether any source is switched on (whether or not it is running). */
+  hasEnabledSources(): boolean {
+    return Object.values(this.state.configs).some((c) => c?.enabled);
+  }
+
+  /**
    * Save checkpoints for all active adapters.
    */
   saveCheckpoints(): void {
-    for (const [id, adapter] of this.activeAdapters) {
-      this.state.checkpoints[id] = adapter.getCheckpoint();
-    }
-    this.saveState();
+    // Deliberately a no-op beyond what saveCheckpoint already persisted: a
+    // live cursor read at shutdown may be ahead of a poll still in flight,
+    // whose events never reached the buffer. Kept for callers' symmetry.
   }
 
   // ── Dependency auto-installer ────────────────────────────
@@ -516,10 +788,14 @@ export class SourceRegistry {
   // ── Cleanup ──────────────────────────────────────────────
 
   async destroy(): Promise<void> {
-    this.saveCheckpoints();
-    for (const [_, adapter] of this.activeAdapters) {
+    // No saveState here: cursors are persisted as polls complete, and
+    // writing state on every shutdown created the collector config (the
+    // signal that resumes the collector at boot) for anyone who merely
+    // listed sources.
+    const adapters = [...this.activeAdapters.values()];
+    this.activeAdapters.clear();
+    for (const adapter of adapters) {
       await adapter.destroy();
     }
-    this.activeAdapters.clear();
   }
 }

@@ -50,6 +50,9 @@ const DEFAULT_BATCH_SIZE = 50;
 
 // ── Ring Buffer ────────────────────────────────────────────
 
+/** `synced` value for rows that cannot be decrypted with the current key. */
+const HELD = 2;
+
 export class EventBuffer {
   private db: any = null;
   private dbPath: string;
@@ -128,6 +131,23 @@ export class EventBuffer {
     const cols = this.db.pragma("table_info(events)") as Array<{ name: string }>;
     if (!cols.some((c) => c.name === "attempts")) {
       this.db.exec(`ALTER TABLE events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`);
+    }
+
+    // Rows held as undecryptable (see decryptRows) come back once the key
+    // that wrote them is in use again.
+    const held = this.db
+      .prepare(`SELECT encrypted_data FROM events WHERE synced = ${HELD} LIMIT 1`)
+      .get() as { encrypted_data: Buffer } | undefined;
+    if (held) {
+      try {
+        this.decryptEvent(held.encrypted_data);
+        const n = this.db
+          .prepare(`UPDATE events SET synced = 0 WHERE synced = ${HELD}`)
+          .run().changes;
+        process.stderr.write(`Memoria buffer: ${n} held event(s) decrypt again; released.\n`);
+      } catch {
+        // still the wrong key; they stay held
+      }
     }
   }
 
@@ -301,6 +321,7 @@ export class EventBuffer {
    */
   private decryptRows(rows: any[]): BufferedEvent[] {
     const out: BufferedEvent[] = [];
+    const undecryptable: number[] = [];
     for (const row of rows) {
       try {
         out.push({
@@ -311,10 +332,30 @@ export class EventBuffer {
           syncedAt: row.synced_at,
         });
       } catch (err) {
-        process.stderr.write(
-          `Memoria buffer: skipping undecryptable event row ${row.rowid}: ${(err as Error).message}\n`,
-        );
+        undecryptable.push(row.rowid);
+        if (undecryptable.length === 1) {
+          process.stderr.write(
+            `Memoria buffer: undecryptable event row ${row.rowid}: ${(err as Error).message}\n`,
+          );
+        }
       }
+    }
+    // Skipping them was not enough: unsynced and never failing an ingest,
+    // they stayed at the head of every importance-ordered batch (100 of
+    // them made every batch empty) and counted toward backpressure, which
+    // could pause polling for good. The usual cause is a changed master key
+    // (e.g. moving to MEMORIA_ENCRYPTION_KEY). They are held out of the
+    // queue, not deleted, and released at startup if they decrypt again.
+    if (undecryptable.length > 0 && this.db) {
+      const hold = this.db.prepare(`UPDATE events SET synced = ${HELD} WHERE rowid = ?`);
+      this.db.transaction(() => {
+        for (const rowid of undecryptable) hold.run(rowid);
+      })();
+      process.stderr.write(
+        `Memoria buffer: held ${undecryptable.length} undecryptable event(s) out of the ingest ` +
+          `queue. Was the collector master key changed? They are kept and released if the ` +
+          `original key is restored.\n`,
+      );
     }
     return out;
   }
@@ -433,14 +474,19 @@ export class EventBuffer {
   cleanup(): number {
     if (!this.db) return 0;
 
-    const cutoff = new Date(Date.now() - this.retentionMs).toISOString();
+    // In SQLite's own datetime() format: synced_at is written by
+    // datetime('now') ("YYYY-MM-DD HH:MM:SS"), and comparing it with an ISO
+    // string ("...T...Z") as text put every row synced on the cutoff date
+    // before the cutoff (" " sorts before "T"), deleting it up to a day early
+    // and shortening the buffer's id-dedup window.
+    const cutoffSec = Math.floor((Date.now() - this.retentionMs) / 1000);
 
     const result = this.db
       .prepare(
         `DELETE FROM events
-        WHERE synced = 1 AND synced_at < ?`,
+        WHERE synced = 1 AND synced_at < datetime(?, 'unixepoch')`,
       )
-      .run(cutoff);
+      .run(cutoffSec);
 
     // Also vacuum periodically to reclaim space
     if (result.changes > 100) {
@@ -466,8 +512,9 @@ export class EventBuffer {
     // synced rows are gone and we're STILL over capacity — i.e. the buffer is
     // full of un-ingested events because the sync/ingestion path has stalled.
     // That is real data loss, so account for it separately and loudly.
+    // Synced and held rows (synced <> 0) both go before any unsynced one.
     const syncedCount = (
-      this.db.prepare("SELECT COUNT(*) as cnt FROM events WHERE synced = 1").get() as {
+      this.db.prepare("SELECT COUNT(*) as cnt FROM events WHERE synced <> 0").get() as {
         cnt: number;
       }
     ).cnt;

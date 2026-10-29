@@ -35,7 +35,15 @@ export class CalendarAdapter implements SourceAdapter {
   };
 
   private db: any = null;
-  private checkpoint: string = ""; // ISO date of last polled event modification
+  /**
+   * What has been collected: the window's events by row id, each with a
+   * fingerprint of its modification date, start and title. Serialized as
+   * the checkpoint ("v2:" + JSON). Older versions stored an ISO
+   * modification-date cursor instead (see setCheckpoint).
+   */
+  private seen: Record<string, string> | null = null;
+  /** A pre-v2 cursor: on the next poll, emit only events modified since. */
+  private legacyCursor: string | null = null;
   private config!: AdapterConfig;
 
   async init(config: AdapterConfig): Promise<void> {
@@ -53,10 +61,6 @@ export class CalendarAdapter implements SourceAdapter {
     try {
       const Database = (await import("better-sqlite3")).default;
       this.db = new Database(cachePath, { readonly: true });
-
-      if (!this.checkpoint) {
-        this.checkpoint = new Date().toISOString();
-      }
     } catch (err: any) {
       throw new Error(
         `Cannot open Calendar database: ${err.message}. ` +
@@ -66,6 +70,15 @@ export class CalendarAdapter implements SourceAdapter {
     }
   }
 
+  /**
+   * Every poll reads the whole window and emits the events it has not
+   * collected in their current form. A modification-date cursor (the old
+   * design) missed events Calendar stores with no modification date, and
+   * events created far ahead that only later slid into the look-ahead
+   * window, and needed tie-breaking rules for events sharing a timestamp.
+   * The window is small (lookBehind + lookAhead days), so reading it whole
+   * is cheap; the seen set is pruned to it, so it stays small too.
+   */
   async poll(): Promise<RawEvent[]> {
     if (!this.db) return [];
 
@@ -80,46 +93,65 @@ export class CalendarAdapter implements SourceAdapter {
     const startCoreData = startDate.getTime() / 1000 - CORE_DATA_EPOCH;
     const endCoreData = endDate.getTime() / 1000 - CORE_DATA_EPOCH;
 
-    // Incremental filter. On the first poll (no checkpoint) this is null, so the
-    // WHERE clause `(? IS NULL OR ZMODIFIEDDATE > ?)` returns every event in the
-    // window — including never-modified ones whose ZMODIFIEDDATE is NULL (which
-    // a bare `ZMODIFIEDDATE > x` would drop). Afterwards it returns only events
-    // modified since the last poll. We checkpoint to poll-START (`now`, captured
-    // above) below: conservative, so an event modified during the query is
-    // simply re-seen next poll and deduped — never missed.
-    const modifiedSinceCoreData = this.checkpoint
-      ? new Date(this.checkpoint).getTime() / 1000 - CORE_DATA_EPOCH
-      : null;
-
-    let rows: any[];
-    try {
-      rows = this.db
-        .prepare(
-          `SELECT
-            ci.ZSTARTDATE as start_date,
-            ci.ZENDDATE as end_date,
-            ci.ZSUMMARY as title,
-            ci.ZLOCATION as location,
-            ci.ZNOTES as notes,
-            ci.ZALLDAY as all_day,
-            ci.ZMODIFIEDDATE as modified,
-            c.ZTITLE as calendar_name
-          FROM ZCALENDARITEM ci
-          LEFT JOIN ZCALENDAR c ON ci.ZCALENDAR = c.Z_PK
-          WHERE ci.ZSTARTDATE BETWEEN ? AND ?
-            AND (? IS NULL OR ci.ZMODIFIEDDATE > ?)
-          ORDER BY ci.ZSTARTDATE ASC
-          LIMIT 200`,
-        )
-        .all(startCoreData, endCoreData, modifiedSinceCoreData, modifiedSinceCoreData) as any[];
-    } catch {
-      // Table structure might differ between macOS versions
-      return [];
+    // ROWID rather than a named key column: every rowid table has it, and in
+    // a Core Data store it is the Z_PK. A query error (the schema differs
+    // between macOS versions) propagates to the daemon instead of looking
+    // like an empty calendar.
+    const LIMIT = 5000;
+    const rows = this.db
+      .prepare(
+        `SELECT
+          ci.ROWID as row_id,
+          ci.ZSTARTDATE as start_date,
+          ci.ZENDDATE as end_date,
+          ci.ZSUMMARY as title,
+          ci.ZLOCATION as location,
+          ci.ZNOTES as notes,
+          ci.ZALLDAY as all_day,
+          ci.ZMODIFIEDDATE as modified,
+          c.ZTITLE as calendar_name
+        FROM ZCALENDARITEM ci
+        LEFT JOIN ZCALENDAR c ON ci.ZCALENDAR = c.Z_PK
+        WHERE ci.ZSTARTDATE BETWEEN ? AND ?
+        ORDER BY ci.ZSTARTDATE ASC
+        LIMIT ${LIMIT}`,
+      )
+      .all(startCoreData, endCoreData) as any[];
+    if (rows.length >= LIMIT) {
+      process.stderr.write(
+        `Memoria calendar: more than ${LIMIT} events in the collection window; ` +
+          "the latest ones are not collected. Shorten lookAheadDays.\n",
+      );
     }
 
+    const previous = this.seen ?? {};
+    const legacyCutoff =
+      this.legacyCursor !== null
+        ? new Date(this.legacyCursor).getTime() / 1000 - CORE_DATA_EPOCH
+        : null;
+    const seen: Record<string, string> = {};
     const events: RawEvent[] = [];
 
     for (const row of rows) {
+      const key = String(row.row_id);
+      const fingerprint = `${row.modified ?? ""}|${row.start_date}|${row.title ?? ""}`;
+      seen[key] = fingerprint;
+      if (previous[key] === fingerprint) continue;
+      // Upgrading from a modification-date cursor: record without emitting
+      // only what that cursor provably collected, i.e. an event last
+      // modified before the cursor while it was already inside the
+      // look-ahead window. Events with no modification date, and events
+      // modified while still beyond the window, are exactly what the old
+      // cursor could miss, so they are emitted (an event it did collect
+      // after all is caught by the buffer and ingestion dedup if recent).
+      if (legacyCutoff !== null && Number.isFinite(legacyCutoff)) {
+        const provablySeen =
+          row.modified != null &&
+          row.modified < legacyCutoff &&
+          row.modified >= row.start_date - lookAhead * 86400;
+        if (provablySeen) continue;
+      }
+
       if (!row.title) continue;
       if (!includeAllDay && row.all_day) continue;
 
@@ -162,16 +194,30 @@ export class CalendarAdapter implements SourceAdapter {
       });
     }
 
-    this.checkpoint = now.toISOString();
+    this.seen = seen;
+    this.legacyCursor = null;
     return events;
   }
 
   getCheckpoint(): string {
-    return this.checkpoint;
+    return this.seen ? `v2:${JSON.stringify(this.seen)}` : (this.legacyCursor ?? "");
   }
 
   setCheckpoint(cursor: string): void {
-    this.checkpoint = cursor;
+    this.seen = null;
+    this.legacyCursor = null;
+    if (cursor.startsWith("v2:")) {
+      try {
+        const parsed = JSON.parse(cursor.slice(3));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          this.seen = parsed as Record<string, string>;
+        }
+      } catch {
+        // unreadable: start over with the whole window
+      }
+    } else if (cursor) {
+      this.legacyCursor = cursor;
+    }
   }
 
   async destroy(): Promise<void> {

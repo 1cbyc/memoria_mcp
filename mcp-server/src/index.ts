@@ -9,8 +9,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { MemoryStore } from "./store.js";
 import {
   DB_PATH,
-  getAllMemoryFiles,
-  reindexFile,
+  reindexAll,
   setupWatcher,
   setupPeriodicReindex,
   setupPeriodicOptimize,
@@ -18,14 +17,19 @@ import {
   registerTools,
   registerCollectorTools,
   destroyCollector,
+  resumeCollectorIfConfigured,
+  setupPrimaryTakeover,
   SERVER_DESCRIPTION,
 } from "./tools.js";
 
-const store = new MemoryStore(DB_PATH);
+// Shared: every Claude Code window and Claude Desktop session starts its own
+// stdio server on the same store. The first is the primary; the rest run as
+// secondaries (see MemoryStore).
+const store = new MemoryStore(DB_PATH, { shared: true });
 
 const server = new McpServer({
   name: "memoria",
-  version: "0.2.1",
+  version: "0.3.0",
   description: SERVER_DESCRIPTION,
 });
 
@@ -37,26 +41,43 @@ registerCollectorTools(server, store);
 let shuttingDown = false;
 
 async function main(): Promise<void> {
-  const files = getAllMemoryFiles();
   if (store.needsReindex) {
-    process.stderr.write("Memoria: full reindex triggered by provider change...\n");
+    process.stderr.write("Memoria: full reindex (embedding provider or index format changed)...\n");
   }
-  for (const f of files) {
-    // A stop signal during a long first index: stop here, before shutdown()
-    // closes the store under the next reindexFile.
-    if (shuttingDown) return;
-    await reindexFile(store, f);
-  }
+  // Per file: one failure is logged and skipped instead of exiting. A stop
+  // signal during a long first index stops before shutdown() closes the
+  // store under the next reindexFile. Files deleted while the server was
+  // down are dropped.
+  const indexed = await reindexAll(store, { shouldStop: () => shuttingDown });
   if (shuttingDown) return;
-  process.stderr.write(`Memoria MCP server started. Indexed ${files.length} files.\n`);
+  process.stderr.write(
+    `Memoria MCP server started. Indexed ${indexed.files} files` +
+      (indexed.failed.length ? ` (${indexed.failed.length} failed, see above).\n` : ".\n"),
+  );
 
   setupWatcher(store);
   setupPeriodicReindex(store);
   setupPeriodicOptimize(store); // no-op unless MEMORIA_AUTO_OPTIMIZE=true
   setupPeriodicCompile(store); // no-op unless MEMORIA_AUTO_COMPILE=true
+  setupPrimaryTakeover(store); // no-op in the primary
 
   const transport = new StdioServerTransport();
+  // Exit when the client goes away. Without this a server whose client died
+  // without sending a signal lived on (the file watcher keeps the event loop
+  // busy), holding the store lock for every later session.
+  // (Several of these fire for one disconnect; only signals escalate a
+  // second request to a forced exit.)
+  const clientGone = () => {
+    if (!shuttingDown) void shutdown();
+  };
+  transport.onclose = clientGone;
+  process.stdin.on("end", clientGone);
+  process.stdin.on("close", clientGone);
   await server.connect(transport);
+
+  // After connecting, so a slow source (an IMAP login) never delays the
+  // client's handshake. Errors are logged inside.
+  void resumeCollectorIfConfigured(store);
 }
 
 main().catch((err) => {

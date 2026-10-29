@@ -95,3 +95,22 @@ describe("initMasterKey strict mode", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("keyedContentHash (review 2026-10: no reversible fingerprints on disk)", () => {
+  it("is stable, keyed, and not the bare SHA-256", async () => {
+    const { keyedContentHash, contentHash } = await import("../collector/crypto.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "memoria-khash-"));
+    const envKey = process.env.MEMORIA_ENCRYPTION_KEY;
+    delete process.env.MEMORIA_ENCRYPTION_KEY;
+    try {
+      const h = keyedContentHash("PIN 4821", dir);
+      expect(h).toMatch(/^[0-9a-f]{64}$/);
+      expect(h).toBe(keyedContentHash("PIN 4821", dir));
+      expect(h).not.toBe(contentHash("PIN 4821"));
+      expect(h).not.toBe(keyedContentHash("PIN 4822", dir));
+    } finally {
+      if (envKey !== undefined) process.env.MEMORIA_ENCRYPTION_KEY = envKey;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

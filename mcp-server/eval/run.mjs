@@ -6,7 +6,7 @@
  * the shipped ranking formula actually retrieve well, and is each of its five
  * hand-chosen constants earning its place?
  *
- *   score     = 0.2 * recency + 0.3 * importance + 0.5 * relevance
+ *   score     = 0.1 * recency + 0.1 * importance + 0.8 * relevance
  *   relevance = 0.7 * vectorCosine + 0.3 * FTS5 BM25
  *
  * Usage:
@@ -134,8 +134,8 @@ function percentile(xs, p) {
 const CONFIGS = [
   {
     name: "shipped default",
-    note: "0.2/0.3/0.5, vector 0.7",
-    weights: { recency: 0.2, importance: 0.3, relevance: 0.5 },
+    note: "0.1/0.1/0.8, vector 0.7",
+    weights: { recency: 0.1, importance: 0.1, relevance: 0.8 },
     vectorMix: 0.7,
   },
   {

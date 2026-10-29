@@ -20,7 +20,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { contentHash, decrypt, encrypt, getMasterKey, initMasterKey } from "./crypto.js";
+import { decrypt, encrypt, getMasterKey, initMasterKey, keyedContentHash } from "./crypto.js";
 import type { RawEvent } from "./adapters/base.js";
 
 export interface ProvenanceRecord {
@@ -150,7 +150,9 @@ export function appendRawArchive(
       source: safeEvent.source,
       eventType: safeEvent.eventType,
       timestamp: safeEvent.timestamp,
-      contentHash: contentHash(originalContent),
+      // Keyed: a bare SHA-256 of local-only content (stored here in place of
+      // the content) could be reversed by guessing short secrets.
+      contentHash: keyedContentHash(originalContent, dataDir),
       privacyTier: tier,
     };
     // local-only: store the fingerprint only, never the content. Other

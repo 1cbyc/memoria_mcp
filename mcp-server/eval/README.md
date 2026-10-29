@@ -3,7 +3,7 @@
 Memoria publishes a ranking formula:
 
 ```
-score     = 0.2 · recency + 0.3 · importance + 0.5 · relevance
+score     = 0.1 · recency + 0.1 · importance + 0.8 · relevance
 relevance = 0.7 · vector cosine + 0.3 · FTS5 BM25
 ```
 
@@ -34,6 +34,61 @@ load-bearing detail), and **paraphrase** (reworded so keyword overlap does not
 carry the answer). A separate **unanswerable** set has no correct answer.
 
 ## Current results
+
+### 2026-10: recency made real, default re-weighted
+
+Until 2026-10 the index dated every memory by the time it was indexed, not
+by its frontmatter, so every document in this corpus had the same recency
+and the "temporal" group never exercised it (caveat 4 below understated
+this: the recency weight was a constant). Recency now comes from the
+memory's own `updated` date, and the shipped weights moved from
+0.2 / 0.3 / 0.5 to **0.1 / 0.1 / 0.8**.
+
+Run on the same corpus with `--hash` (the model download was not reachable
+from the environment that made the change; **re-run with MiniLM before
+quoting a MiniLM number**):
+
+```
+  configuration                 nDCG@10   R@20    MRR  stale
+  old default (0.2/0.3/0.5)        33.1   80.8   25.4      2
+  new default (0.1/0.1/0.8)        60.4   96.2   52.4      2
+  hybrid, no priors                68.3   96.2   63.9      3
+
+  nDCG@10 by query kind      temporal  hard-negative  paraphrase
+  old default                    76.7           27.2        27.4
+  new default                    57.3           51.9        63.2
+  hybrid, no priors              55.0           52.6        74.9
+```
+
+Keyword matching then moved from FTS5's implicit AND (every query word must
+appear in the chunk, so most natural-language queries matched nothing) to
+OR, with BM25 still ranking chunks that match more and rarer words first:
+
+```
+  configuration                 nDCG@10   R@20    MRR  stale
+  new default, AND                 60.4   96.2   52.4      2
+  new default, OR                  61.7   96.2   55.1      2
+  keyword only, AND                53.8   92.3   47.5      3
+  keyword only, OR                 66.5   88.5   59.7      3
+  hybrid, no priors, OR            69.9   92.3   65.7      3
+```
+
+Recall@20 falls a little for the keyword-heavy configurations (more weak
+matches compete for the candidate pool); nDCG and MRR rise everywhere.
+
+With real dates, the old weights buy the temporal queries (76.7) at a price
+of roughly 25 to 50 points everywhere else. Relevance scores fall in a
+narrow band while recency and importance span 0 to 1, so priors carrying
+half the weight decided most rankings. A sweep over recency 0 to 0.2,
+importance 0 to 0.3 and vector mix 0.5 to 0.85 ranked every
+configuration with priors totalling 0.2 or less above every configuration
+with 0.5. The new default keeps priors as tie-breakers rather than
+dropping them: this corpus's importance values are invented (caveat 3), so
+it cannot show what a real importance signal is worth, only that it must
+not outweigh relevance. The vector mix was left at 0.7 on purpose; hash
+vectors are lexical, so a hash sweep says nothing about the semantic half.
+
+### Before 2026-10 (recency constant, old weights)
 
 Run on 51 documents, 26 answerable queries, local MiniLM.
 

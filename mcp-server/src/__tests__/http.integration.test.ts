@@ -668,44 +668,160 @@ describe("sanitizeIngestMeta (review M6)", () => {
 
   it("/authorize refuses without approval when MEMORIA_AUTHORIZE_REQUIRE_APPROVAL=true (M5)", async () => {
     process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL = "true";
+    const q = {
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "st-1",
+    };
     try {
-      const r = await request(app).get("/authorize").query({
-        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
-        code_challenge: "abc",
-        code_challenge_method: "S256",
-      });
+      const r = await request(app).get("/authorize").query(q);
       expect(r.status).toBe(401);
-      const ok = await request(app).get("/authorize").set(auth).query({
-        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
-        code_challenge: "abc",
-        code_challenge_method: "S256",
-      });
+      // The API key approves programmatically.
+      const ok = await request(app).get("/authorize").set(auth).query(q);
       expect(ok.status).toBe(302);
-      // A dashboard login also satisfies the gate in a real browser via
-      // memoria_approve (Path=/authorize), captured at login above — no
-      // fresh login here, to stay under the auth rate limit.
+      // A dashboard login is NOT approval by itself: browsers send the Lax
+      // cookie on any cross-site navigation, so a page could otherwise
+      // trigger a code without the operator. It gets a consent page.
       expect(approveCookie).toMatch(/^memoria_approve=/);
-      // Actually present it to /authorize (distinct forwarded IP, so this
-      // call gets its own auth rate-limit bucket).
-      const viaCookie = await request(app)
+      const page = await request(app)
         .get("/authorize")
         .set("Cookie", approveCookie)
         .set("X-Forwarded-For", "10.9.8.7")
-        .query({
-          redirect_uri: "https://claude.ai/api/mcp/auth_callback",
-          code_challenge: "abc",
-          code_challenge_method: "S256",
-        });
-      expect(viaCookie.status).toBe(302);
+        .query(q);
+      expect(page.status).toBe(200);
+      expect(page.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+      expect(page.text).toContain("https://claude.ai");
+      const csrf = /name="csrf" value="([0-9a-f]+)"/.exec(page.text)![1];
+
+      const approve = (over: Record<string, string>, headers: Record<string, string> = {}) =>
+        request(app)
+          .post("/authorize")
+          .set("Cookie", approveCookie)
+          .set("X-Forwarded-For", "10.9.8.3")
+          .set(headers)
+          .type("form")
+          .send({ ...q, csrf, ...over });
+
+      // The page must not make browsers send `Origin: null` on its POST.
+      expect(page.headers["referrer-policy"]).toBe("same-origin");
+      // Cross-origin, missing or mismatched token, or tampered parameters fail.
+      expect((await approve({}, { Origin: "https://evil.example" })).status).toBe(403);
+      expect((await approve({ csrf: "" })).status).toBe(403);
+      expect((await approve({ redirect_uri: "https://claude.ai/other" })).status).toBe(403);
+      expect((await approve({ state: "attacker-state" })).status).toBe(403);
+      const noCookie = await request(app)
+        .post("/authorize")
+        .set("X-Forwarded-For", "10.9.8.2")
+        .type("form")
+        .send({ ...q, csrf });
+      expect(noCookie.status).toBe(403);
+
+      // The operator's click issues the code. Its Origin is the host the
+      // browser used, which need not be the configured public URL.
+      const done = await approve(
+        {},
+        { Host: "memoria.example:8443", Origin: "http://memoria.example:8443" },
+      );
+      expect(done.status).toBe(303);
+      const loc = new URL(done.headers.location);
+      expect(loc.origin + loc.pathname).toBe(q.redirect_uri);
+      expect(loc.searchParams.get("code")).toBeTruthy();
+      expect(loc.searchParams.get("state")).toBe("st-1");
+
       // ...and the approve cookie must NOT authorize /mcp.
       const mcp = await request(app)
         .post("/mcp")
         .set("Cookie", approveCookie)
         .send({ jsonrpc: "2.0", method: "tools/list", id: 1 });
       expect(mcp.status).toBe(401);
+      // ...nor the dashboard API: each cookie is honoured on its own path.
+      const dash = await request(app).get("/dashboard/api/stats").set("Cookie", approveCookie);
+      expect(dash.status).toBe(401);
     } finally {
       delete process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL;
     }
+  });
+
+  it("rejects a malformed PKCE challenge before storing anything", async () => {
+    const r = await request(app)
+      .get("/authorize")
+      .set("X-Forwarded-For", "10.9.8.1")
+      .query({
+        redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+        code_challenge: "x".repeat(10_000),
+        code_challenge_method: "S256",
+      });
+    expect(r.status).toBe(400);
+  });
+
+  it("an OAuth token cannot change source consent or settings on the dashboard API", async () => {
+    const tok = await request(app)
+      .post("/token")
+      .set("X-Forwarded-For", "10.9.7.1")
+      .type("form")
+      .send({
+        grant_type: "client_credentials",
+        client_id: "memoria",
+        client_secret: OAUTH_SECRET,
+      });
+    const bearer = { Authorization: `Bearer ${tok.body.access_token}` };
+    // Reading still works with the token...
+    expect((await request(app).get("/dashboard/api/stats").set(bearer)).status).toBe(200);
+    // ...but consent and credentials are the operator's.
+    const agree = await request(app).post("/dashboard/api/sources/email/agree").set(bearer);
+    expect(agree.status).toBe(403);
+    const cfg = await request(app)
+      .post("/dashboard/api/sources/email/configure")
+      .set(bearer)
+      .send({ host: "attacker.example", secure: false });
+    expect(cfg.status).toBe(403);
+  });
+
+  it("the approval gate also closes client_credentials, and stops advertising it", async () => {
+    // Without this the gate was decorative: the client secret alone minted a
+    // token through the other grant type.
+    process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL = "true";
+    try {
+      const r = await request(app)
+        .post("/token")
+        .set("X-Forwarded-For", "10.9.8.6")
+        .type("form")
+        .send({
+          grant_type: "client_credentials",
+          client_id: "memoria",
+          client_secret: OAUTH_SECRET,
+        });
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe("unauthorized_client");
+      expect(r.body.access_token).toBeUndefined();
+      const meta = await request(app).get("/.well-known/oauth-authorization-server");
+      expect(meta.body.grant_types_supported).toEqual(["authorization_code"]);
+      const reg = await request(app).post("/register").set("X-Forwarded-For", "10.9.8.4").send({});
+      expect(reg.status).toBe(201);
+      expect(reg.body.grant_types).toEqual(["authorization_code"]);
+    } finally {
+      delete process.env.MEMORIA_AUTHORIZE_REQUIRE_APPROVAL;
+    }
+    const meta = await request(app).get("/.well-known/oauth-authorization-server");
+    expect(meta.body.grant_types_supported).toContain("client_credentials");
+  });
+
+  it("the approval cookie is SameSite=Lax so a cross-site OAuth navigation carries it", async () => {
+    // Browsers withhold SameSite=Strict cookies on the top-level navigation
+    // from claude.ai to /authorize, so a Strict approve cookie could never
+    // satisfy the gate in a real flow. The dashboard cookie stays Strict.
+    const login = await request(app)
+      .post("/dashboard/login")
+      .set("X-Forwarded-For", "10.9.8.5")
+      .send({ key: KEY });
+    const cookies = login.headers["set-cookie"] as unknown as string[];
+    const approve = cookies.find((c) => c.startsWith("memoria_approve="))!;
+    const session = cookies.find((c) => c.startsWith("memoria_session="))!;
+    expect(approve).toContain("SameSite=Lax");
+    expect(approve).toContain("Path=/authorize");
+    expect(approve).toContain("HttpOnly");
+    expect(session).toContain("SameSite=Strict");
   });
 });
 
@@ -717,6 +833,153 @@ describe("normalizeTimestamp (2026-09 re-review, round 4)", () => {
     expect(normalizeTimestamp(Date.UTC(2026, 0, 2), now)).toBe("2026-01-02T00:00:00.000Z");
     for (const bad of ["24/09/2026", 1727186400000000, {}, [], null, undefined, true]) {
       expect(normalizeTimestamp(bad, now), String(bad)).toBe(now.toISOString());
+    }
+  });
+});
+
+describe("Streamable HTTP sessions and body parsing (review 2026-10)", () => {
+  const init = (ip: string) =>
+    request(app)
+      .post("/mcp")
+      .set(auth)
+      .set("X-Forwarded-For", ip)
+      .set("Accept", "application/json, text/event-stream")
+      .send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "t", version: "1" },
+        },
+      });
+
+  it("an unknown or expired session is 404 (the client's cue to re-initialize)", async () => {
+    const h = { ...auth, "mcp-session-id": "no-such-session" };
+    const post = await request(app)
+      .post("/mcp")
+      .set(h)
+      .set("X-Forwarded-For", "10.8.0.1")
+      .send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    expect(post.status).toBe(404);
+    expect((await request(app).get("/mcp").set(h).set("X-Forwarded-For", "10.8.0.1")).status).toBe(
+      404,
+    );
+    expect(
+      (await request(app).delete("/mcp").set(h).set("X-Forwarded-For", "10.8.0.1")).status,
+    ).toBe(404);
+    // No session id and not an initialize request is still a bad request.
+    const bare = await request(app)
+      .post("/mcp")
+      .set(auth)
+      .set("X-Forwarded-For", "10.8.0.1")
+      .send({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+    expect(bare.status).toBe(400);
+  });
+
+  it("at the session cap the idlest session is closed instead of refusing everyone", async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 11; i++) {
+      const r = await init(`10.8.1.${i}`);
+      expect(r.status).toBe(200);
+      ids.push(r.headers["mcp-session-id"]);
+    }
+    // The first session was the idlest; it was closed to make room.
+    const first = await request(app)
+      .post("/mcp")
+      .set({ ...auth, "mcp-session-id": ids[0] })
+      .set("X-Forwarded-For", "10.8.2.1")
+      .set("Accept", "application/json, text/event-stream")
+      .send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    expect(first.status).toBe(404);
+    for (const id of ids.slice(1)) {
+      await request(app)
+        .delete("/mcp")
+        .set({ ...auth, "mcp-session-id": id })
+        .set("X-Forwarded-For", "10.8.2.2");
+    }
+  });
+
+  it("does not parse a large body before authentication", async () => {
+    // 2MB of JSON: rejected by auth (401), not parsed (413/400) first.
+    const big = JSON.stringify({ pad: "x".repeat(2 * 1024 * 1024) });
+    for (const route of ["/mcp", "/ingest", "/dashboard/api/stats"]) {
+      const r = await request(app)
+        .post(route)
+        .set("Content-Type", "application/json")
+        .set("X-Forwarded-For", "10.8.3.1")
+        .send(big);
+      expect(r.status).toBe(401);
+    }
+    // Unauthenticated routes only take small bodies.
+    const reg = await request(app)
+      .post("/register")
+      .set("Content-Type", "application/json")
+      .set("X-Forwarded-For", "10.8.3.2")
+      .send(JSON.stringify({ pad: "x".repeat(100 * 1024) }));
+    expect(reg.status).toBe(413);
+  });
+
+  it("an authenticated /ingest still takes a multi-megabyte batch", async () => {
+    const events = Array.from({ length: 30 }, (_, i) => ({
+      id: `big-${i}`,
+      source: "bulk-test",
+      content: `Event ${i} ` + "y".repeat(100 * 1024),
+    }));
+    const r = await request(app)
+      .post("/ingest")
+      .set(auth)
+      .set("X-Forwarded-For", "10.8.3.3")
+      .send({ events });
+    expect(r.status).not.toBe(413);
+  });
+});
+
+describe("sessions re-review (2026-10)", () => {
+  it("a session id like __proto__ is an unknown session (404), not a 500", async () => {
+    for (const id of ["__proto__", "constructor", "toString"]) {
+      const r = await request(app)
+        .post("/mcp")
+        .set({ ...auth, "mcp-session-id": id })
+        .set("X-Forwarded-For", "10.7.0.1")
+        .send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      expect(r.status).toBe(404);
+    }
+    expect(({} as Record<string, unknown>).lastActivity).toBeUndefined();
+  });
+
+  it("an initialize the SDK rejects does not evict a live session", async () => {
+    const init = (ip: string, accept = "application/json, text/event-stream") =>
+      request(app)
+        .post("/mcp")
+        .set(auth)
+        .set("X-Forwarded-For", ip)
+        .set("Accept", accept)
+        .send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "t", version: "1" },
+          },
+        });
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) ids.push((await init(`10.7.1.${i}`)).headers["mcp-session-id"]);
+    const rejected = await init("10.7.2.1", "text/plain"); // the SDK answers 406
+    expect(rejected.status).toBe(406);
+    const first = await request(app)
+      .delete("/mcp")
+      .set({ ...auth, "mcp-session-id": ids[0] })
+      .set("X-Forwarded-For", "10.7.2.2");
+    expect(first.status).not.toBe(404); // still alive
+    for (const id of ids.slice(1)) {
+      await request(app)
+        .delete("/mcp")
+        .set({ ...auth, "mcp-session-id": id })
+        .set("X-Forwarded-For", "10.7.2.3");
     }
   });
 });

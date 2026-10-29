@@ -75,7 +75,11 @@ export function parseFrontmatter(content: string): {
 
   let metadata: Record<string, unknown> = {};
   try {
-    const parsed = load(match[1], { schema: FRONTMATTER_READ_SCHEMA });
+    // json: a repeated key takes its last value instead of failing the
+    // whole block. Git's union merge of a daily log written on two devices
+    // keeps both sides' differing header lines (importance: 3 and
+    // importance: 5), and a strict parse then dropped every field.
+    const parsed = load(match[1], { schema: FRONTMATTER_READ_SCHEMA, json: true });
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       metadata = parsed as Record<string, unknown>;
       // Normalize Date objects (YAML auto-parses ISO dates) back to ISO strings.
@@ -118,9 +122,35 @@ export function chunkMarkdown(content: string, filePath: string): Chunk[] {
   const frontmatterMatch = content.match(/^---\n[\s\S]*?\n---\n?/);
   const frontmatterLines = frontmatterMatch ? (frontmatterMatch[0].match(/\n/g) || []).length : 0;
 
+  // A single line longer than a chunk (pasted logs, minified JSON, a long
+  // paragraph without breaks) used to become one oversized chunk, which an
+  // embedding API with a token limit rejects. Such lines are cut into
+  // pieces at whitespace where possible; the pieces keep the line's number.
+  const segments: Array<{ text: string; newLine: boolean }> = [];
   for (const line of lines) {
-    lineNum++;
-    currentChunk += (currentChunk ? "\n" : "") + line;
+    if (line.length <= TARGET_CHARS) {
+      segments.push({ text: line, newLine: true });
+      continue;
+    }
+    let rest = line;
+    let first = true;
+    while (rest.length > TARGET_CHARS) {
+      const space = rest.lastIndexOf(" ", TARGET_CHARS);
+      let cut = space > TARGET_CHARS / 2 ? space : TARGET_CHARS;
+      // Never between the two halves of a surrogate pair (an emoji, say):
+      // a lone half is not valid Unicode.
+      const unit = rest.charCodeAt(cut - 1);
+      if (unit >= 0xd800 && unit <= 0xdbff) cut -= 1;
+      segments.push({ text: rest.slice(0, cut), newLine: first });
+      rest = rest.slice(cut).replace(/^ /, "");
+      first = false;
+    }
+    if (rest) segments.push({ text: rest, newLine: first });
+  }
+
+  for (const { text: line, newLine } of segments) {
+    if (newLine) lineNum++;
+    currentChunk += (currentChunk ? (newLine ? "\n" : " ") : "") + line;
 
     if (currentChunk.length >= TARGET_CHARS) {
       chunks.push({

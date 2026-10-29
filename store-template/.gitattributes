@@ -6,6 +6,14 @@
 # This is the single most important line in a synced Memoria store.
 memories/daily/*.md merge=union
 
+# MEMORY_INDEX.md is generated: Memoria rewrites it from the memory files on
+# every write and sweep. Two devices regenerating it always conflict, and a
+# conflict here used to stall sync for good; union keeps the merge clean and
+# the next regeneration makes the result exact again. (The pull hook also
+# resolves conflicts in generated files by itself, for stores set up before
+# this line existed.)
+memories/MEMORY_INDEX.md merge=union
+
 # Everything else takes the normal three-way merge: core memories are edited,
 # not appended, so a genuine conflict there deserves a human.
 *.md text eol=lf
