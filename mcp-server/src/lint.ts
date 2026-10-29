@@ -119,6 +119,8 @@ const KNOWN_TOP_DIRS = new Set([
   "feedback",
   "references",
   "sessions",
+  // memory_compile files `type: pattern` here (tools.ts TYPE_DIR).
+  "patterns",
 ]);
 
 function findUnknownDirs(

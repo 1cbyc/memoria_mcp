@@ -335,7 +335,7 @@ writeMem(
 );
 
 writeMem(
-  "reflection/q2-themes.md",
+  "sessions/q2-themes.md",
   {
     name: "Q2 themes",
     description: "Synthesized themes from recent work",

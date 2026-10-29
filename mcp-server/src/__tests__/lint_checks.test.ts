@@ -99,6 +99,18 @@ beforeAll(async () => {
     },
     "A file at the memories root.",
   );
+  // Where memory_compile files a `type: pattern` memory — documented, not stray.
+  writeMemory(
+    "patterns/retry.md",
+    {
+      name: "Retry with backoff",
+      description: "pattern",
+      type: "pattern",
+      importance: 5,
+      updated: "2026-06-08",
+    },
+    "Retry transient failures with exponential backoff.",
+  );
 
   tools = await import("../tools.js");
   ({ runLint } = await import("../lint.js"));
@@ -146,7 +158,7 @@ describe("lint: unknown directories", () => {
   it("does not flag documented directories", async () => {
     const r = await runLint(store, MEM, tools.getAllMemoryFiles, tools.getRelativePath);
     const dirs = r.unknownDirs.map((u) => u.dir);
-    for (const known of ["daily", "project", "decisions", "user"]) {
+    for (const known of ["daily", "project", "decisions", "user", "patterns"]) {
       expect(dirs).not.toContain(known);
     }
   });

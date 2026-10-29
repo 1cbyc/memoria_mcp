@@ -19,6 +19,16 @@ const OUT = path.join(repoRoot, "demo-store");
 const PORT = process.env.PORT || "3110";
 const KEY = process.env.MEMORIA_API_KEY || "demo-key-123";
 
+// 0. Dependencies first. Without them the build prints hundreds of type errors
+// (and still writes dist/), so a retry skipped the build and died with
+// ERR_MODULE_NOT_FOUND instead of saying what was missing.
+if (!fs.existsSync(path.join(mcpDir, "node_modules", "express"))) {
+  console.error(
+    `Dependencies are not installed. Run this first:\n\n  cd ${mcpDir}\n  npm install\n`,
+  );
+  process.exit(1);
+}
+
 // 1. Ensure the server is built.
 if (!fs.existsSync(path.join(mcpDir, "dist", "http.js"))) {
   console.log("Building mcp-server (dist/http.js missing)…");

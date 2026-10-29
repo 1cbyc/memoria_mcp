@@ -262,6 +262,20 @@ start** (see below); access counts and last reads are kept.
   `local-only` events before clustering; the meta screen also classifies
   non-scalar values (arrays/objects) so a shaped `meta.subject` cannot
   smuggle a secret into a fused label.
+- The HTTP server reported success on a busy port: Express 5 hands a listen
+  error to the callback, which ignored it, so the server printed
+  "listening" and exited 0 with nothing serving. It now names the address
+  and exits 1.
+- `npm run demo` without `npm install` printed hundreds of type errors, and
+  a retry died with `ERR_MODULE_NOT_FOUND`. It now says to run
+  `npm install` first; the README demo steps include it.
+- `memory_lint` reported `patterns/` (where `memory_compile` files
+  `type: pattern`) as an unknown directory, and the demo data wrote a
+  reflection to `reflection/` instead of `sessions/`, so lint flagged
+  Memoria's own output.
+- README: removed a leftover line saying `OPENAI_API_KEY` alone switches to
+  OpenAI embeddings, and replaced the claim that hybrid search outperforms
+  either signal alone, which the retrieval eval does not support.
 
 ## [0.2.1] — 2026-09-24
 

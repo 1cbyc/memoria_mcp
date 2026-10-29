@@ -1394,7 +1394,19 @@ async function main(): Promise<void> {
 
   // Bind to 0.0.0.0 when BIND_ALL=true (for cloud/Docker), else localhost only
   const host = process.env.BIND_ALL === "true" ? "0.0.0.0" : "127.0.0.1";
-  httpServer = app.listen(PORT, host, () => {
+  httpServer = app.listen(PORT, host, (err?: Error) => {
+    // Express 5 hands a listen failure (port in use, no permission) to this
+    // callback instead of throwing. Ignoring it printed "listening" and then
+    // exited 0 with no server, which looks like success to scripts and Docker.
+    if (err) {
+      process.stderr.write(
+        `Memoria: cannot listen on ${host}:${PORT}: ${err.message}. ` +
+          `Is another server using the port? Set PORT to choose another.\n`,
+      );
+      tokenDb.close();
+      store.close();
+      process.exit(1);
+    }
     process.stderr.write(`Memoria HTTP server listening on http://${host}:${PORT}/mcp\n`);
     // Resume enabled collector sources; errors are logged inside.
     void resumeCollectorIfConfigured(store);

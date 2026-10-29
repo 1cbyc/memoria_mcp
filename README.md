@@ -172,7 +172,11 @@ claude mcp add memoria -s user -- npx -y @agrippa87/memoria-mcp
 
 ### Try it on fake data (30 seconds)
 
+From a source checkout ([Option B](#option-b-build-from-source)):
+
 ```bash
+cd memoria_mcp/mcp-server
+npm install        # skip if you already ran it
 npm run demo
 # → generates a throwaway ./demo-store with ~29 cross-linked memories
 # → open http://127.0.0.1:3110/dashboard   (key: demo-key-123)
@@ -198,7 +202,7 @@ or add to `~/.claude.json` / your project's `.claude/settings.local.json`:
 }
 ```
 
-The store defaults to `~/.memoria` (`MEMORIA_DIR` overrides it). The first `memory_write` creates the directory layout. `OPENAI_API_KEY` in `env` switches to OpenAI embeddings.
+The store defaults to `~/.memoria` (`MEMORIA_DIR` overrides it). The first `memory_write` creates the directory layout. Embeddings stay local by default: `OPENAI_API_KEY` on its own does not switch providers; OpenAI embeddings also need `MEMORIA_EMBEDDINGS=openai` in `env`.
 
 > **Why `scripts/mcp-start.mjs` and not `dist/index.js`:** the wrapper runs
 > `tsc` before serving (compiler output redirected to stderr — stdout is the
@@ -670,7 +674,8 @@ $MEMORIA_DIR/
 │   ├── decisions/             # Architectural/product decisions
 │   ├── feedback/              # How Claude should behave
 │   ├── references/            # Pointers to external resources
-│   └── sessions/              # Session summaries and reviews
+│   ├── patterns/              # Recurring patterns (memory_compile, type: pattern)
+│   └── sessions/              # Session summaries, reviews and reflections
 └── data/                      # Derived + runtime state (git-ignore this)
     ├── memoria.sqlite         # FTS5 + vector index (rebuildable)
     ├── event-buffer.sqlite    # Encrypted collector ring buffer
@@ -876,7 +881,7 @@ These are the known open items after the October 2026 review; [issues](https://g
 ## Design Decisions
 
 - **File-based over database-first**: Markdown files are human-readable, git-friendly, and survive tool changes. SQLite is a derived index.
-- **Hybrid search over keyword-only**: Vector embeddings capture semantic meaning; FTS5 BM25 captures exact terms. Combined they outperform either alone.
+- **Hybrid search over keyword-only**: Vector embeddings capture meaning; FTS5 BM25 keeps exact terms (names, error strings) that vectors can blur. The [retrieval eval](mcp-server/eval/README.md) is early and has not yet shown the mix beating vector-only search; it exists so the weights are measured rather than assumed.
 - **Encrypted ring buffer**: Events are encrypted before touching SQLite, so even if the database file is accessed, content remains protected.
 - **User agreement before collection**: No source can be enabled without explicit consent. This is enforced at the registry level, not just the UI.
 - **Auto-install dependencies**: Reduces friction for enabling sources. The user agrees, and the system handles npm installs automatically.
