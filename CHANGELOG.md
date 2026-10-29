@@ -54,6 +54,14 @@ start** (see below); access counts and last reads are kept.
   instances on one store by design (Cloud Run rollouts) set
   `MEMORIA_LOCK_TAKEOVER=true`, as `deploy/gcp/cloudbuild.yaml` now does.
 
+### Added
+
+- `server.json`, so Memoria can be published to the
+  [official MCP registry](https://registry.modelcontextprotocol.io) under the
+  `io.github.Agripp87/memoria-mcp` name, and `mcpName` in
+  `mcp-server/package.json`, which is what the registry checks to prove the npm
+  package owns that name.
+
 ### Security
 
 - The `/authorize` approval gate could be bypassed: `client_credentials`

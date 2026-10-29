@@ -139,8 +139,9 @@ its own: nothing that can push a tag to this repository can release to npm
 without the maintainer's second factor as well.
 
 1. On a branch: bump `version` in `mcp-server/package.json` (and the `version`
-   strings in `src/index.ts`, `src/http.ts`, `.claude-plugin/plugin.json` and
-   `.claude-plugin/marketplace.json`), and move the `[Unreleased]` section of
+   strings in `src/index.ts`, `src/http.ts`, `.claude-plugin/plugin.json`,
+   `.claude-plugin/marketplace.json` and `server.json`), and move the
+   `[Unreleased]` section of
    [CHANGELOG.md](CHANGELOG.md) under a dated version heading.
 2. Merge it to `main` once CI is green.
 3. Tag the merge commit and push the tag:
@@ -179,3 +180,35 @@ throwaway pre-release version with `--dry-run`.
 A local `npm publish` still works for the account owner with 2FA, but should be
 the exception — a release through the workflow is the one that carries
 provenance.
+
+### Publishing to the MCP registry (maintainer)
+
+[`server.json`](server.json) at the repository root is the entry for the
+[official MCP registry](https://registry.modelcontextprotocol.io). It is not
+part of the npm release, so its `version` is bumped by hand alongside
+`mcp-server/package.json` (step 1 above) and must match it exactly.
+
+The registry verifies that the npm package really belongs to the server name
+before accepting a publish: it fetches
+`https://registry.npmjs.org/@agrippa87/memoria-mcp/<server.json version>` and
+compares that version's `mcpName` field with the `name` in `server.json`.
+`mcpName` is set in `mcp-server/package.json`, so **publish to the registry only
+after the npm release carrying it is live** — the version in `server.json` must
+name an already-published npm version.
+
+Validate before publishing; neither command needs credentials:
+
+```bash
+mcp-publisher validate                                               # reads ./server.json
+
+curl -s -X POST https://registry.modelcontextprotocol.io/v0/validate \
+  -H 'Content-Type: application/json' --data-binary @server.json     # {"valid":true,"issues":[]}
+```
+
+Then authenticate and publish (the name is under the `io.github.Agripp87/`
+namespace, so GitHub auth is the one that works):
+
+```bash
+mcp-publisher login github
+mcp-publisher publish
+```

@@ -1,0 +1,89 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Agripp87/memoria-mcp",
+  "title": "Memoria",
+  "description": "Persistent, plain-text memory for agents: markdown you own, hybrid search, self-maintenance.",
+  "version": "0.3.0",
+  "repository": {
+    "url": "https://github.com/Agripp87/memoria_mcp",
+    "source": "github",
+    "id": "1346226861",
+    "subfolder": "mcp-server"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@agrippa87/memoria-mcp",
+      "version": "0.3.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "MEMORIA_DIR",
+          "description": "Root directory of the memory store. Defaults to ~/.memoria locally (or /data/memoria in Docker).",
+          "format": "filepath",
+          "isRequired": false
+        },
+        {
+          "name": "MEMORIA_EMBEDDINGS",
+          "description": "Embedding provider: auto (local MiniLM if installed, else hash; never remote), openai (explicit opt-in: sends content to OpenAI), minilm or hash.",
+          "default": "auto",
+          "choices": ["auto", "openai", "minilm", "hash"]
+        }
+      ]
+    },
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@agrippa87/memoria-mcp",
+      "version": "0.3.0",
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--package",
+          "value": "@agrippa87/memoria-mcp"
+        },
+        {
+          "type": "positional",
+          "valueHint": "memoria-mcp-http"
+        }
+      ],
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:3100/mcp"
+      },
+      "environmentVariables": [
+        {
+          "name": "MEMORIA_API_KEY",
+          "description": "Bearer token authenticating /mcp, /ingest and /dashboard/api. Required for the HTTP transport.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "MEMORIA_OAUTH_CLIENT_SECRET",
+          "description": "OAuth 2.1 client secret for remote clients (claude.ai). Required when BIND_ALL=true; keep it distinct from the API key.",
+          "isSecret": true
+        },
+        {
+          "name": "MEMORIA_ENCRYPTION_KEY",
+          "description": "AES-256-GCM master key (64 hex chars) for the collector's encrypted buffer and credential store. Required when BIND_ALL=true.",
+          "isSecret": true
+        },
+        {
+          "name": "MEMORIA_PUBLIC_URL",
+          "description": "External URL of this server. Pins the OAuth discovery metadata so it is never derived from the Host header. Required when exposed."
+        },
+        {
+          "name": "MEMORIA_DIR",
+          "description": "Root directory of the memory store. Defaults to ~/.memoria locally (or /data/memoria in Docker).",
+          "format": "filepath",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
